@@ -1,3 +1,4 @@
+import argparse
 import os
 
 
@@ -9,9 +10,14 @@ def run_cmd(cmd):
 
 
 if __name__ == "__main__":
-    rates = [1.0, 0.8, 0.6, 0.4, 0.2]
-    duration = 1000
-    estimator = "oracle"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--duration", type=int, required=True)
+    parser.add_argument('--len-estimator', type=str, choices=['oracle', 'power2', 'constant'], required=True)
+    args = parser.parse_args()
+
+    rates = [0.10, 0.20, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+    duration = args.duration
+    len_estimator = args.len_estimator
     for rate in rates:
-        cmd = f"python benchmark/benchmark_chatbot.py --len-estimator {estimator} --dataset sharegpt_clean_lang_10k_opt_tokenized.pkl --model facebook/opt-13b --request-rate {rate} --duration {duration} --n1 1.0 --use-dummy"
+        cmd = f"python benchmark/benchmark_chatbot.py --len-estimator {len_estimator} --dataset sharegpt_clean_lang_10k_opt_tokenized.pkl --model facebook/opt-13b --request-rate {rate} --duration {duration} --n1 1.0 --use-dummy"
         run_cmd(cmd)
