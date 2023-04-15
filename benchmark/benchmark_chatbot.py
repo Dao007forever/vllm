@@ -52,6 +52,7 @@ def main(args: argparse.Namespace):
         cpu_memory=get_cpu_memory(),
         len_estimator=args.len_estimator,
         collect_stats=True,
+        do_memory_analysis=args.do_memory_analysis,
     )
 
     # Create a frontend.
@@ -256,6 +257,9 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, help='path to dataset', required=True)
     parser.add_argument('--request-rate', type=float, help='reqs/sec', required=True)
     parser.add_argument('--duration', type=int, help='duration in seconds', required=True)
+    parser.add_argument('--do-memory-analysis', action='store_true',
+        help='do memory analysis (This will lower the throughput. Use this only for analysis.)')
+    parser.add_argument('--timeout', type=int, help='time out in seconds', default=None)
 
     parser.add_argument('--n1', type=float, help='ratio of requests with n=1', default=0.0)
     parser.add_argument('--n2', type=float, help='ratio of requests with n=2', default=0.0)
@@ -290,6 +294,7 @@ if __name__ == '__main__':
             f'{model_name}-tp{args.tensor_parallel_size}',
             sample_dir,
             f'orca-{args.len_estimator}',
+            f'block{args.block_size}',
             f'req-rate-{args.request_rate}',
             f'seed{args.seed}',
             f'duration-{args.duration}',
