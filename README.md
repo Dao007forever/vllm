@@ -14,7 +14,9 @@ pip install -e .
 ## Run all experiments (Orca)
 
 ```bash
-python3 run_all_chatbot.py --duration 3600
+python3 run_all_chatbot.py --duration 3600 --len-estimator oracle
+python3 run_all_chatbot.py --duration 3600 --len-estimator power2
+python3 run_all_chatbot.py --duration 3600 --len-estimator constant
 ```
 
 The results will be saved to `~/exp`
