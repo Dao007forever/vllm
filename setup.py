@@ -49,7 +49,7 @@ for i in range(device_count):
     compute_capabilities.add(major * 10 + minor)
 # If no GPU is available, add all supported compute capabilities.
 if not compute_capabilities:
-    compute_capabilities = {70, 75, 80, 86, 90}
+    compute_capabilities = {70, 75, 80, 86} #tle: remove 90 so we can use 11.7
 # Add target compute capabilities to NVCC flags.
 for capability in compute_capabilities:
     NVCC_FLAGS += ["-gencode", f"arch=compute_{capability},code=sm_{capability}"]
@@ -61,10 +61,9 @@ if nvcc_cuda_version < Version("11.0"):
 if 86 in compute_capabilities and nvcc_cuda_version < Version("11.1"):
     raise RuntimeError(
         "CUDA 11.1 or higher is required for GPUs with compute capability 8.6.")
-# tle: Allow using 11.7
-#if 90 in compute_capabilities and nvcc_cuda_version < Version("11.8"):
-#    raise RuntimeError(
-#        "CUDA 11.8 or higher is required for GPUs with compute capability 9.0.")
+if 90 in compute_capabilities and nvcc_cuda_version < Version("11.8"):
+    raise RuntimeError(
+        "CUDA 11.8 or higher is required for GPUs with compute capability 9.0.")
 
 # Use NVCC threads to parallelize the build.
 if nvcc_cuda_version >= Version("11.2"):
