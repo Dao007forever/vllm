@@ -61,9 +61,10 @@ if nvcc_cuda_version < Version("11.0"):
 if 86 in compute_capabilities and nvcc_cuda_version < Version("11.1"):
     raise RuntimeError(
         "CUDA 11.1 or higher is required for GPUs with compute capability 8.6.")
-if 90 in compute_capabilities and nvcc_cuda_version < Version("11.8"):
-    raise RuntimeError(
-        "CUDA 11.8 or higher is required for GPUs with compute capability 9.0.")
+# tle: Allow using 11.7
+#if 90 in compute_capabilities and nvcc_cuda_version < Version("11.8"):
+#    raise RuntimeError(
+#        "CUDA 11.8 or higher is required for GPUs with compute capability 9.0.")
 
 # Use NVCC threads to parallelize the build.
 if nvcc_cuda_version >= Version("11.2"):
