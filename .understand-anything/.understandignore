@@ -1,0 +1,157 @@
+# .understandignore — aggressive scope for vLLM's core architecture
+# Goal: focus on the v1 engine, entrypoints, config, distributed scheduler,
+# and model_executor base classes. Exclude the long tail of repetitive
+# model/layer/kernel implementations and vendored dependencies.
+#
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Built-in defaults already exclude: node_modules/, .git/, dist/, build/, *.lock,
+# *.min.js, etc.
+
+# --- Top-level non-library directories ---
+tests/
+benchmarks/
+examples/
+docs/
+scripts/
+tools/
+cmake/
+docker/
+requirements/
+csrc/
+storage_1/
+storage_2/
+
+# --- Caches, build artifacts, IDE state ---
+.buildkite/
+.gemini/
+.github/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+vllm.egg-info/
+__pycache__/
+
+# --- Vendored / generated ---
+vllm/third_party/
+vllm/vllm_flash_attn/
+
+# --- Repeating per-model / per-layer / per-kernel implementations ---
+# Keep ONLY the registry, base interfaces, and the loader entry points.
+vllm/model_executor/models/
+!vllm/model_executor/models/__init__.py
+!vllm/model_executor/models/registry.py
+!vllm/model_executor/models/interfaces.py
+!vllm/model_executor/models/interfaces_base.py
+!vllm/model_executor/models/utils.py
+
+vllm/model_executor/layers/
+!vllm/model_executor/layers/__init__.py
+!vllm/model_executor/layers/linear.py
+!vllm/model_executor/layers/vocab_parallel_embedding.py
+!vllm/model_executor/layers/layernorm.py
+!vllm/model_executor/layers/activation.py
+!vllm/model_executor/layers/rotary_embedding.py
+!vllm/model_executor/layers/sampler.py
+!vllm/model_executor/layers/logits_processor.py
+
+vllm/model_executor/kernels/
+vllm/model_executor/warmup/
+
+# --- Attention backends: keep the abstraction, drop the dozens of variants ---
+vllm/v1/attention/
+!vllm/v1/attention/__init__.py
+!vllm/v1/attention/backends/
+vllm/v1/attention/backends/
+!vllm/v1/attention/backends/__init__.py
+!vllm/v1/attention/backends/utils.py
+
+# --- Worker variants: keep the core, drop platform-specific shards ---
+vllm/v1/worker/
+!vllm/v1/worker/__init__.py
+!vllm/v1/worker/gpu_worker.py
+!vllm/v1/worker/gpu_model_runner.py
+!vllm/v1/worker/worker_base.py
+!vllm/v1/worker/utils.py
+
+# --- KV offload variants: keep one ---
+vllm/v1/kv_offload/
+!vllm/v1/kv_offload/__init__.py
+!vllm/v1/kv_offload/abstract.py
+!vllm/v1/kv_offload/factory.py
+
+vllm/v1/simple_kv_offload/
+
+# --- Spec decode and pool variants ---
+vllm/v1/spec_decode/
+!vllm/v1/spec_decode/__init__.py
+!vllm/v1/spec_decode/metadata.py
+
+# --- Heavy long-tail subsystems unrelated to core scheduling ---
+vllm/benchmarks/
+vllm/profiler/
+vllm/tracing/
+vllm/usage/
+vllm/ray/
+vllm/reasoning/
+vllm/tool_parsers/
+vllm/tokenizers/
+vllm/assets/
+vllm/triton_utils/
+vllm/parser/
+vllm/ir/
+vllm/kernels/
+vllm/transformers_utils/configs/
+vllm/transformers_utils/processors/
+vllm/transformers_utils/tokenizers/
+vllm/multimodal/
+!vllm/multimodal/__init__.py
+!vllm/multimodal/base.py
+!vllm/multimodal/registry.py
+!vllm/multimodal/inputs.py
+
+vllm/lora/
+!vllm/lora/__init__.py
+!vllm/lora/request.py
+!vllm/lora/models.py
+!vllm/lora/worker_manager.py
+
+# --- Entrypoints: keep OpenAI server core, drop alt protocols ---
+vllm/entrypoints/anthropic/
+vllm/entrypoints/mcp/
+vllm/entrypoints/sagemaker/
+vllm/entrypoints/pooling/
+vllm/entrypoints/cli/
+!vllm/entrypoints/cli/__init__.py
+!vllm/entrypoints/cli/main.py
+!vllm/entrypoints/cli/serve.py
+vllm/entrypoints/serve/
+!vllm/entrypoints/serve/__init__.py
+
+# --- C extensions and binary blobs ---
+*.so
+*.abi3.so
+*.pyi
+
+# --- Top-level scratch / repro files ---
+head_of_line_repro.py
+collect_env.py
+.gitignore
+.dockerignore
+.clang-format
+.coveragerc
+.git-blame-ignore-revs
+.markdownlint.yaml
+.pre-commit-config.yaml
+.readthedocs.yaml
+.shellcheckrc
+.yapfignore
+codecov.yml
+mkdocs.yaml
+MANIFEST.in
+DCO
+
+# --- Compiled binary blobs and caches that may sneak in ---
+*.pyc
+*.so.*
+*.cu.cpp
