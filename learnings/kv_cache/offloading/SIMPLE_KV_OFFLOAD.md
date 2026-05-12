@@ -143,6 +143,20 @@ with the same group-aware block hash before the copy starts. The GPU block is
 `touch()`ed so the allocator cannot reuse it while the asynchronous store reads
 from it.
 
+That extra reference is the handoff between request lifetime and transfer
+lifetime. Without it, the owning request could finish, `free_blocks()` could put
+the GPU block back on the free queue, and a later allocation could evict its
+hash and overwrite the same physical slot before the GPU-to-CPU DMA actually
+reads it. The CPU block would then be registered under the old hash but contain
+bytes from a different request. `touch()` makes the transfer itself a temporary
+owner of the source block; store completion releases that ownership.
+
+Other requests can still share the touched block if they hit the same prefix
+hash. `touch()` does not remove the block from the prefix-cache hash map or make
+it private to the transfer. It only prevents allocator-style reuse: a block with
+positive `ref_cnt` is not an eviction candidate and cannot be handed out as a
+fresh slot for different KV bytes.
+
 ### 3. GPU To CPU Copy
 
 `build_connector_meta()` packs all store pairs for the scheduler step into flat
@@ -219,7 +233,12 @@ gpu_ext_start = n_computed_g - num_external_blocks_for_group
 
 Null CPU blocks are skipped because they do not correspond to real KV bytes.
 The real CPU and GPU blocks are touched to pin both sides while the async load is
-in flight, and `build_connector_meta()` emits:
+in flight. This is the same transfer-lifetime rule in the opposite direction:
+the CPU source block must not be evicted and reused before the CPU-to-GPU copy
+reads it, and the GPU destination block must not be freed or reused before the
+copy fills it. The CPU source can still serve other same-hash load hits while
+it is touched; it just cannot be evicted as scratch space. `build_connector_meta()`
+then emits:
 
 ```text
 load_event = M
@@ -243,7 +262,9 @@ can hit the normal local GPU prefix cache without going to CPU.
 normal scheduler is still allowed to free request blocks immediately. In-flight
 stores and loads are safe because Simple CPU offload has already added temporary
 `touch()` references to the exact blocks involved in the DMA. Completion paths
-release those references.
+release those references. This keeps the scheduler fast and local: it does not
+need to delay request cleanup just because a background transfer is still using
+some of the request's blocks.
 
 If a request is preempted, worker-side `handle_preemptions()` synchronizes all
 in-flight transfer events before blocks can be reused.
