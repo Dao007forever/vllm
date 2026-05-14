@@ -77,6 +77,7 @@ def _make_store_sending_thread(
 def _make_store_recving_thread(
     store: MagicMock,
     *,
+    tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
@@ -96,7 +97,7 @@ def _make_store_recving_thread(
         store=store,
         token_databases=[token_database],
         block_size=16,
-        tp_rank=0,
+        tp_rank=tp_rank,
         ready_event=threading.Event(),
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
@@ -592,6 +593,66 @@ def test_recv_thread_records_partial_failure_metrics(monkeypatch):
     assert stats.data["load_get"][0]["num_failed_keys"] == 1
 
 
+def test_store_recving_thread_reports_failed_block_ids(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -5, -7]
+    thread = _make_store_recving_thread(
+        store, disk_offload_buffer_budget_bytes=None
+    )
+
+    thread._handle_request(
+        _make_load_req(
+            "req-a",
+            [b"a0", b"a1", b"a2"],
+            token_len=48,
+        )
+    )
+
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == set()
+
+
+def test_store_recving_thread_reports_failed_block_ids_after_rotation(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -5, 256]
+    thread = _make_store_recving_thread(
+        store, tp_rank=1, disk_offload_buffer_budget_bytes=None
+    )
+
+    thread._handle_request(
+        _make_load_req(
+            "req-a",
+            [b"a0", b"a1", b"a2"],
+            token_len=48,
+        )
+    )
+
+    assert thread.get_and_clear_block_ids_with_load_errors() == {2}
+
+
+def test_store_recving_thread_reports_attempted_blocks_on_exception(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = RuntimeError("boom")
+    thread = _make_store_recving_thread(
+        store, disk_offload_buffer_budget_bytes=None
+    )
+
+    thread._handle_request(
+        _make_load_req(
+            "req-a",
+            [b"a0", b"a1", b"a2"],
+            token_len=48,
+        )
+    )
+
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
+
+
 def test_recv_thread_uses_ratio_scaled_budget_for_first_pass_split():
     store = MagicMock()
     store.batch_get_into_multi_buffers.side_effect = [
@@ -711,21 +772,26 @@ def test_recv_thread_skips_split_when_budget_holds_all_keys():
 
 
 def test_recv_thread_reports_unsplittable_key_larger_than_budget():
+    # Non-zero tp_rank exercises the rotation: the oversized key may not sit
+    # at the original request's first block. Every block must still be marked
+    # invalid, since none are loaded.
     store = MagicMock()
     thread = _make_store_recving_thread(
         store,
+        tp_rank=2,
         disk_offload_buffer_budget_bytes=_DISK_OFFLOAD_BUDGET_TOO_SMALL,
     )
 
     req = _make_load_req(
         "req-a",
-        [b"a0"],
-        token_len=16,
+        [b"a0", b"a1", b"a2"],
+        token_len=48,
     )
 
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 0
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
@@ -1096,6 +1162,16 @@ def _make_bare_worker(
         hash_block_size=block_size,
     )
     return worker
+
+
+def test_store_worker_get_block_ids_with_load_errors_delegates_to_recv_thread():
+    recv_thread = MagicMock()
+    recv_thread.get_and_clear_block_ids_with_load_errors.return_value = {3, 4}
+    worker = _make_bare_worker()
+    worker.kv_recv_thread = recv_thread
+
+    assert worker.get_block_ids_with_load_errors() == {3, 4}
+    recv_thread.get_and_clear_block_ids_with_load_errors.assert_called_once_with()
 
 
 def test_lookup_partial_prefix_returns_first_hit_length():
