@@ -402,3 +402,19 @@ def test_full_external_hit_still_loads_when_local_cache_has_aligned_prefix():
     load_spec = scheduler.load_specs["req-0"]
     assert load_spec.vllm_cached_tokens == 32
     assert load_spec.kvpool_cached_tokens == 48
+
+
+def test_request_finished_after_preemption_without_tracker_is_noop():
+    scheduler = _make_bare_scheduler()
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(44)),
+        block_hashes=[b"h0", b"h1"],
+        prefill_end_tokens=48,
+    )
+
+    scheduler.build_connector_meta(_make_preemption_scheduler_output())
+
+    assert "req-0" not in scheduler._request_trackers
+    request = SimpleNamespace(request_id="req-0")
+    assert scheduler.request_finished(request, ([0, 1],)) == (False, None)
