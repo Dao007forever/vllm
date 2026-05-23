@@ -369,13 +369,16 @@ class _StubLookupClient:
         return self._hit_tokens
 
 
-def test_full_external_hit_loads_full_final_block():
-    # A full prompt hit should load the whole final KV block. The core
-    # scheduler will move num_computed_tokens from num_tokens to num_tokens - 1
-    # after the async recv finishes, so only the final token is recomputed.
+def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
+    # When the external store hits the entire prompt, scheduler must leave at
+    # least one token uncomputed for sampling but stay on a block boundary.
+    # Otherwise the recv-side load mask floors token_len to
+    # (num_tokens-1)//block_size, the tail partial chunk is dropped, and -- if
+    # the local cache covers the aligned prefix -- key_list ends up empty
+    # (ZeroDivisionError in the recv thread's `tp_rank % len(key_list)`).
     scheduler = _make_bare_scheduler()
     scheduler.load_async = True
-    scheduler.client = _StubLookupClient(hit_tokens=48)
+    scheduler.client = _StubLookupClient(hit_tokens=48)  # full hit on 48-token prompt
 
     request = SimpleNamespace(
         request_id="req-0",
@@ -387,17 +390,21 @@ def test_full_external_hit_loads_full_final_block():
         request, num_computed_tokens=16
     )
 
-    assert need_to_allocate == 32
+    # 47 // 16 * 16 == 32 tokens left in external store after reserving the
+    # sub-block tail for sampling. 32 - 16 (local) == 16 to load.
+    assert need_to_allocate == 16
     assert load_async is True
     load_spec = scheduler.load_specs["req-0"]
     assert load_spec.vllm_cached_tokens == 16
-    assert load_spec.kvpool_cached_tokens == 48
+    assert load_spec.kvpool_cached_tokens == 32
+    assert load_spec.kvpool_cached_tokens % 16 == 0
 
 
-def test_full_external_hit_still_loads_when_local_cache_has_aligned_prefix():
-    # If the local cache has [0, 32) and the store has [0, 48), we still need
-    # to load [32, 48). Skipping the load would leave the final block missing
-    # before the scheduler recomputes token 47.
+def test_full_external_hit_with_full_local_hit_skips_load():
+    # When local prefix cache already covers the block-aligned external hit,
+    # there is nothing for the connector to load. The pre-fix behavior would
+    # have scheduled a 15-token load that the recv thread couldn't translate
+    # into any block-aligned key.
     scheduler = _make_bare_scheduler()
     scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=48)
@@ -412,11 +419,9 @@ def test_full_external_hit_still_loads_when_local_cache_has_aligned_prefix():
         request, num_computed_tokens=32
     )
 
-    assert need_to_allocate == 16
-    assert load_async is True
-    load_spec = scheduler.load_specs["req-0"]
-    assert load_spec.vllm_cached_tokens == 32
-    assert load_spec.kvpool_cached_tokens == 48
+    assert need_to_allocate == 0
+    assert load_async is False
+    assert "req-0" not in scheduler.load_specs
 
 
 def test_request_finished_after_preemption_without_tracker_is_noop():
