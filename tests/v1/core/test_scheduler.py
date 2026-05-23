@@ -3967,6 +3967,47 @@ def test_delayed_kv_connector_free_keeps_scheduler_active():
     assert not scheduler.has_finished_requests()
 
 
+def test_full_remote_hit_recomputes_only_last_token_after_recv():
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        use_kv_connector=mock_kv(matched_tokens=48, is_async=True),
+    )
+    request = create_requests(num_requests=1, num_tokens=48)[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == 48
+    assert scheduler_output.scheduled_new_reqs == []
+    assert scheduler_output.num_scheduled_tokens == {}
+
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        kv_connector_output=KVConnectorOutput(finished_recving={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+    assert request.request_id in scheduler.finished_recving_kv_req_ids
+
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert len(scheduler_output.scheduled_new_reqs) == 1
+    scheduled_req = scheduler_output.scheduled_new_reqs[0]
+    assert scheduled_req.req_id == request.request_id
+    assert scheduled_req.num_computed_tokens == 47
+    assert scheduler_output.num_scheduled_tokens[request.request_id] == 1
+    # schedule() advances the live request counter after constructing the
+    # output, but the model runner receives the 47-token prefix above and
+    # computes the single scheduled token.
+    assert request.num_computed_tokens == 48
+
+
 # ==============================================================================
 # Variable-length encoder cross-attention block allocation tests
 # ==============================================================================

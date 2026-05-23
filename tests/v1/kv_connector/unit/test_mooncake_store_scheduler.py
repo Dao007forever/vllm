@@ -344,3 +344,61 @@ def test_from_request_tracker_no_load_saves_normally():
     assert req_meta.can_save is True
     assert req_meta.load_spec is None
     assert tracker.num_saved_tokens == 48
+
+
+class _StubLookupClient:
+    def __init__(self, hit_tokens: int) -> None:
+        self._hit_tokens = hit_tokens
+
+    def lookup(self, token_len: int, block_hashes: list[bytes]) -> int:
+        return self._hit_tokens
+
+
+def test_full_external_hit_loads_full_final_block():
+    # A full prompt hit should load the whole final KV block. The core
+    # scheduler will move num_computed_tokens from num_tokens to num_tokens - 1
+    # after the async recv finishes, so only the final token is recomputed.
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=48)
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=16
+    )
+
+    assert need_to_allocate == 32
+    assert load_async is True
+    load_spec = scheduler.load_specs["req-0"]
+    assert load_spec.vllm_cached_tokens == 16
+    assert load_spec.kvpool_cached_tokens == 48
+
+
+def test_full_external_hit_still_loads_when_local_cache_has_aligned_prefix():
+    # If the local cache has [0, 32) and the store has [0, 48), we still need
+    # to load [32, 48). Skipping the load would leave the final block missing
+    # before the scheduler recomputes token 47.
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=48)
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=32
+    )
+
+    assert need_to_allocate == 16
+    assert load_async is True
+    load_spec = scheduler.load_specs["req-0"]
+    assert load_spec.vllm_cached_tokens == 32
+    assert load_spec.kvpool_cached_tokens == 48

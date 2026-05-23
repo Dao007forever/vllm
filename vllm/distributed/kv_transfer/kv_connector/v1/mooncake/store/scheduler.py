@@ -98,9 +98,6 @@ class MooncakeStoreScheduler:
 
         num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
 
-        if num_external_hit_tokens == request.num_tokens:
-            num_external_hit_tokens -= 1
-
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
         else:
@@ -341,10 +338,6 @@ class MooncakeStoreScheduler:
                 if not load_spec:
                     continue
                 num_tokens_to_compute = load_spec.kvpool_cached_tokens
-                if (num_tokens_to_compute % self._block_size != 0) and (
-                    num_tokens_to_compute == unfinished_req.num_tokens - 1
-                ):
-                    num_tokens_to_compute = num_tokens_to_compute + 1
                 request_tracker = RequestTracker(
                     req_id=request_id,
                     token_len=num_tokens_to_compute,
