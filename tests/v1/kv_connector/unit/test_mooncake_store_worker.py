@@ -239,6 +239,7 @@ def _patch_worker_runtime(monkeypatch, *, local_ip: str = "10.0.0.7") -> None:
     monkeypatch.setattr(worker, "get_pcp_group", lambda: single_rank_group)
     monkeypatch.setattr(worker, "get_dcp_group", lambda: single_rank_group)
     monkeypatch.setattr(worker, "get_ip", lambda: local_ip)
+    monkeypatch.setattr(worker, "LookupKeyServer", lambda *args, **kwargs: MagicMock())
 
 
 def test_default_local_buffer_size_matches_pr40900():

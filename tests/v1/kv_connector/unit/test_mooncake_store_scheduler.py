@@ -44,6 +44,21 @@ def _make_scheduler_output(*, scheduled_spec_tokens: list[int] | None):
     )
 
 
+def _make_preemption_scheduler_output():
+    return SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids={"req-0"},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[],
+            num_computed_tokens=[],
+        ),
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+    )
+
+
 def _add_unfinished_request(
     scheduler: MooncakeStoreScheduler,
     *,
