@@ -125,9 +125,18 @@ class KVCacheBlock:
     _block_hash: BlockHashWithGroupId | None = None
 
     # Used to construct a doubly linked list for free blocks.
-    # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
+    # These two attributes should only be manipulated by FreeKVCacheBlockQueue
+    # (LRU mode) or BuddyFreeKVCacheBlockQueue (buddy mode). A block lives in
+    # exactly one queue at a time, so the pointers don't conflict.
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
+
+    # Buddy-mode bookkeeping: when this block heads a buddy chunk of order k,
+    # it spans base-block ids [block_id, block_id + 2**k). For LRU mode and
+    # for non-head base blocks, chunk_order stays 0 (a single base block).
+    # Set by BuddyFreeKVCacheBlockQueue on alloc/split/coalesce; read by
+    # append/remove to route to the correct per-order LRU.
+    chunk_order: int = 0
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
@@ -614,7 +623,11 @@ def resolve_kv_cache_block_sizes(
     # Mamba groups with block_size != cache_config.block_size
     # (mamba_cache_mode != "align") break divisibility; back off to the
     # scheduler block size.
-    if any(
+    # In buddy-decoupled hybrid mode, attn keeps its small kernel-natural
+    # block_size while mamba uses chunk-aligned block_size; we still want
+    # prefix-cache hashing at attn's fine granularity, so don't back off.
+    decoupled = kv_cache_config.base_page_bytes is not None
+    if not decoupled and any(
         isinstance(g.kv_cache_spec, MambaSpec)
         and g.kv_cache_spec.block_size != cache_config.block_size
         for g in groups
@@ -1296,11 +1309,62 @@ def get_kv_cache_config_from_groups(
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        assert group_size > 0, "group_size must be greater than 0"
+
+        import os as _os
+        _buddy_decouple = (
+            _os.environ.get("VLLM_USE_BUDDY_BLOCK_POOL", "").strip().lower()
+            in ("1", "true")
+        )
+        # Buddy-decoupled hybrid mode: groups may have different page sizes.
+        # Pick base_page = smallest group page; per-group chunk_order rounds up
+        # native page to a power-of-2 multiple of base_page. Tensor slabs are
+        # sized in base units so attn (with small block_size) keeps fine
+        # prefix-caching granularity without inflating mamba's storage.
+        page_sizes = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
+        decouple_active = _buddy_decouple and len(set(page_sizes)) > 1
+        if decouple_active:
+            from math import ceil, log2
+            base_page = min(page_sizes)
+            # Per-group chunk_order = ceil(log2(ratio)) so 2**order >= ratio.
+            max_overhang_bytes = 0
+            for g in kv_cache_groups:
+                ratio = g.kv_cache_spec.page_size_bytes / base_page
+                g.chunk_order = max(0, ceil(log2(ratio))) if ratio > 1 else 0
+                # The strided kernel view reads page_size_bytes at offset
+                # block_id * base_page, so the last usable block_id is
+                # num_blocks - (page_size_bytes / base_page). Tensors must
+                # have room for that overhang on the tail.
+                overhang = g.kv_cache_spec.page_size_bytes - base_page
+                if overhang > max_overhang_bytes:
+                    max_overhang_bytes = overhang
+            # num_blocks counts base units. The buddy address space is one
+            # block_id per base unit; each layer-tuple slab holds
+            # num_blocks * base_page bytes plus max_overhang for safe strided
+            # reads at the tail.
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, base_page
+            )
+            tensor_size_bytes = base_page * num_blocks + max_overhang_bytes
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=tensor_size_bytes, shared_by=shared_by)
+                )
+            return KVCacheConfig(
+                num_blocks=num_blocks,
+                kv_cache_tensors=kv_cache_tensors,
+                kv_cache_groups=kv_cache_groups,
+                base_page_bytes=base_page,
+            )
 
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
-        assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(
             vllm_config, group_size, available_memory, page_size
         )
@@ -1669,7 +1733,17 @@ def get_kv_cache_groups(
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    # In buddy-decoupled mode, groups keep their native page sizes; the buddy
+    # allocator handles per-group block sizes by issuing variable-order chunks
+    # over a fine-grained base address space. See base_page_bytes handling in
+    # get_kv_cache_config_from_groups.
+    import os as _os
+    _buddy_decouple = (
+        _os.environ.get("VLLM_USE_BUDDY_BLOCK_POOL", "").strip().lower()
+        in ("1", "true")
+    )
+    if not _buddy_decouple:
+        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
@@ -1790,6 +1864,25 @@ def _max_memory_usage_bytes_from_groups(
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    page_sizes = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
+    if len(set(page_sizes)) > 1:
+        # Buddy-decoupled hybrid: per-group native pages differ. Sum each
+        # group's blocks_needed at its own page_size; per-base-block cost
+        # below is group_size * base_page, so we count base-blocks per group.
+        base_page = min(page_sizes)
+        base_blocks_needed = 0
+        from math import ceil, log2
+        for g in kv_cache_groups:
+            ratio = g.kv_cache_spec.page_size_bytes / base_page
+            order = max(0, ceil(log2(ratio))) if ratio > 1 else 0
+            chunk_size_in_base = 1 << order
+            logical_blocks = cdiv(
+                g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                g.kv_cache_spec.page_size_bytes,
+            )
+            base_blocks_needed += logical_blocks * chunk_size_in_base
+        return group_size * base_page * base_blocks_needed
+
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
     )
@@ -2066,9 +2159,17 @@ def get_kv_cache_configs(
         kv_cache_config.num_blocks = min_num_blocks
 
         # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        if kv_cache_config.base_page_bytes is not None:
+            # Decoupled hybrid: tensor.size = num_blocks * base_page + overhang.
+            # Preserve the overhang; shrink only the base-blocks portion.
+            base_page = kv_cache_config.base_page_bytes
+            for tensor in kv_cache_config.kv_cache_tensors:
+                overhang = tensor.size - num_blocks_old * base_page
+                tensor.size = min_num_blocks * base_page + overhang
+        else:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

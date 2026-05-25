@@ -1,0 +1,1138 @@
+[
+  {
+    "model": "tiiuae/falcon-mamba-7b",
+    "buddy": "0",
+    "prefix_caching": false,
+    "num_gpu_blocks": 3618,
+    "n_groups": 1,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 311296,
+        "real_page_size_bytes": 311296,
+        "page_size_padded": null,
+        "n_layers": 64
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      }
+    ],
+    "unique_tensor_bytes": 72081211392,
+    "total_kv_bytes": 72081211392,
+    "total_kv_bytes_unpadded": 72081211392
+  },
+  {
+    "model": "tiiuae/falcon-mamba-7b",
+    "buddy": "0",
+    "prefix_caching": true,
+    "num_gpu_blocks": 3618,
+    "n_groups": 1,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "MambaSpec",
+        "block_size_tokens": 16,
+        "page_size_bytes": 311296,
+        "real_page_size_bytes": 311296,
+        "page_size_padded": null,
+        "n_layers": 64
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      }
+    ],
+    "unique_tensor_bytes": 72081211392,
+    "total_kv_bytes": 72081211392,
+    "total_kv_bytes_unpadded": 72081211392
+  },
+  {
+    "model": "tiiuae/falcon-mamba-7b",
+    "buddy": "1",
+    "prefix_caching": false,
+    "num_gpu_blocks": 3618,
+    "n_groups": 1,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 311296,
+        "real_page_size_bytes": 311296,
+        "page_size_padded": null,
+        "n_layers": 64
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      }
+    ],
+    "unique_tensor_bytes": 72081211392,
+    "total_kv_bytes": 72081211392,
+    "total_kv_bytes_unpadded": 72081211392
+  },
+  {
+    "model": "tiiuae/falcon-mamba-7b",
+    "buddy": "1",
+    "prefix_caching": true,
+    "num_gpu_blocks": 3618,
+    "n_groups": 1,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "MambaSpec",
+        "block_size_tokens": 16,
+        "page_size_bytes": 311296,
+        "real_page_size_bytes": 311296,
+        "page_size_padded": null,
+        "n_layers": 64
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      },
+      {
+        "size": 1126268928,
+        "n_layers_sharing": 1
+      }
+    ],
+    "unique_tensor_bytes": 72081211392,
+    "total_kv_bytes": 72081211392,
+    "total_kv_bytes_unpadded": 72081211392
+  }
+]

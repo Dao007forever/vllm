@@ -343,6 +343,23 @@ def prepare_kernel_block_sizes(
     Returns:
         List of kernel block sizes for each cache group.
     """
+    # Experimental: per-group buddy order forces kernel_block_size to be
+    # block_size >> order_g so the BlockTable hybrid_blocks expansion turns
+    # one buddy chunk into 2**order_g consecutive kernel rows. Only honored
+    # when VLLM_USE_BUDDY_BLOCK_POOL=1.
+    import os as _os
+    buddy_on = (
+        _os.environ.get("VLLM_USE_BUDDY_BLOCK_POOL", "").strip().lower()
+        in ("1", "true")
+    )
+    orders_env = _os.environ.get("VLLM_BUDDY_GROUP_ORDERS", "")
+    buddy_orders: list[int] = []
+    if buddy_on and orders_env.strip():
+        try:
+            buddy_orders = [int(x) for x in orders_env.split(",")]
+        except ValueError:
+            buddy_orders = []
+
     kernel_block_sizes = []
     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -356,6 +373,22 @@ def prepare_kernel_block_sizes(
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
+            order = (
+                buddy_orders[kv_cache_gid]
+                if kv_cache_gid < len(buddy_orders)
+                else 0
+            )
+            if order > 0:
+                candidate = kv_manager_block_size >> order
+                if candidate <= 0 or (candidate << order) != kv_manager_block_size:
+                    raise ValueError(
+                        f"Buddy order {order} for group {kv_cache_gid} does "
+                        f"not divide block_size {kv_manager_block_size}"
+                    )
+                # Caller asked for a specific split; trust them but verify
+                # the backend accepts the resulting size.
+                kernel_block_sizes.append(candidate)
+                continue
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -156,30 +157,52 @@ class BlockPool:
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        # Experimental: swap the LRU free-queue for a buddy-allocator-backed
+        # one. Prefix caching coexists with buddy mode via an eviction
+        # callback: when the buddy queue splits a cached chunk (alloc walks
+        # up and needs a smaller piece) or coalesces two cached chunks (free
+        # merges siblings into a larger chunk), the affected chunks' hash
+        # entries are dropped from the cache map before the structural
+        # change. Touch/remove already work without a hash op because they
+        # operate on the block whose chunk_order is known.
+        self._buddy_mode = (
+            os.environ.get("VLLM_USE_BUDDY_BLOCK_POOL", "").strip().lower()
+            in ("1", "true")
+        )
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
+        # State the eviction callback reads — set BEFORE the queue is built.
+        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        self.enable_kv_cache_events = enable_kv_cache_events
+        self.kv_event_queue: list[KVCacheEvent] = []
+        self.metrics_collector = metrics_collector
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        if self._buddy_mode:
+            from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
 
-        # Cache for block lookup
-        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+            self._buddy_max_order = int(
+                os.environ.get("VLLM_BUDDY_MAX_ORDER", "0") or "0"
+            )
+            self.free_block_queue = BuddyFreeKVCacheBlockQueue(
+                self.blocks,
+                max_order=self._buddy_max_order,
+                on_evict=self._maybe_evict_cached_block,
+            )
+        else:
+            self._buddy_max_order = 0
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
-
-        self.enable_kv_cache_events = enable_kv_cache_events
-        self.kv_event_queue: list[KVCacheEvent] = []
-
-        self.metrics_collector = metrics_collector
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -329,6 +352,57 @@ class BlockPool:
                     group_idx=kv_cache_group_id,
                 )
             )
+
+    def get_new_chunks(self, order: int, num_chunks: int) -> list[KVCacheBlock]:
+        """Allocate ``num_chunks`` chunks of ``2**order`` base blocks each.
+
+        Returns one ``KVCacheBlock`` per chunk, identified by the starting
+        base-block id. The chunk reserves ``2**order`` consecutive base ids
+        starting from that id; callers that index per-base-id (current vLLM
+        managers) only use the start id and waste the remaining ``2**order - 1``
+        ids in their per-group cache tensor — true memory savings need cache
+        memory unification, which is a separate iteration.
+
+        Only available when ``VLLM_USE_BUDDY_BLOCK_POOL=1``.
+        """
+        if not self._buddy_mode:
+            if order != 0:
+                raise RuntimeError(
+                    "get_new_chunks(order > 0) requires "
+                    "VLLM_USE_BUDDY_BLOCK_POOL=1"
+                )
+            return self.get_new_blocks(num_chunks)
+        if order < 0 or order > self._buddy_max_order:
+            raise ValueError(
+                f"order {order} out of range [0, {self._buddy_max_order}]"
+            )
+        ret: list[KVCacheBlock] = []
+        for _ in range(num_chunks):
+            block = self.free_block_queue.alloc_chunk(order=order)
+            # The chunk may carry a stale hash from a prior cached owner
+            # (pop-from-LRU path doesn't trigger the on_evict callback —
+            # only split and coalesce do). Drop it before reuse, mirroring
+            # what get_new_blocks does after popleft_n.
+            if self.enable_caching:
+                self._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_allocated(block)
+            ret.append(block)
+        return ret
+
+    def free_chunks(self, chunks: list[KVCacheBlock]) -> None:
+        """Return chunks previously allocated by ``get_new_chunks``."""
+        if not self._buddy_mode:
+            raise RuntimeError(
+                "free_chunks requires VLLM_USE_BUDDY_BLOCK_POOL=1"
+            )
+        for block in chunks:
+            assert block.ref_cnt > 0
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                self.free_block_queue.free_chunk(block.block_id)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.

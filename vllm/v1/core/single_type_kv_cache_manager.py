@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -43,6 +44,7 @@ class SingleTypeKVCacheManager(ABC):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         max_admission_blocks_per_request: int | None = None,
+        chunk_order: int = 0,
     ) -> None:
         """
         Initializes the SingleTypeKVCacheManager.
@@ -81,6 +83,35 @@ class SingleTypeKVCacheManager(ABC):
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
+
+        # Per-group buddy allocation order. The caller (HybridKVCacheCoordinator
+        # / coordinator setup) passes the chunk_order computed in
+        # get_kv_cache_config_from_groups under decoupled hybrid mode. When 0,
+        # the buddy treats this group as 1 base block per logical block.
+        # VLLM_BUDDY_GROUP_ORDERS env var still works as a manual override for
+        # attention specs (legacy testing path).
+        buddy_on = (
+            os.environ.get("VLLM_USE_BUDDY_BLOCK_POOL", "").strip().lower()
+            in ("1", "true")
+        )
+        orders_env = os.environ.get("VLLM_BUDDY_GROUP_ORDERS", "")
+        from vllm.v1.kv_cache_interface import AttentionSpec
+        if (
+            buddy_on
+            and orders_env.strip()
+            and isinstance(kv_cache_spec, AttentionSpec)
+        ):
+            try:
+                parsed = [int(x) for x in orders_env.split(",")]
+            except ValueError:
+                parsed = []
+            self._buddy_order = (
+                parsed[kv_cache_group_id]
+                if kv_cache_group_id < len(parsed)
+                else chunk_order
+            )
+        else:
+            self._buddy_order = chunk_order
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -233,12 +264,20 @@ class SingleTypeKVCacheManager(ABC):
 
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
-            allocated_blocks = self.block_pool.get_new_blocks(
-                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+            allocated_blocks = self.block_pool.get_new_chunks(
+                self._buddy_order,
+                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
-                self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+                # For buddy order > 0, BlockTable's hybrid_blocks expansion
+                # multiplies the kv_manager id by 2**order to reach the start
+                # kernel row; the buddy returns the kernel row directly, so
+                # translate by right-shifting before publishing the id.
+                order = self._buddy_order
+                self.new_block_ids.extend(
+                    b.block_id >> order for b in allocated_blocks
+                )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -263,10 +302,13 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_chunks(
+                self._buddy_order, num_new_blocks
+            )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
-                self.new_block_ids.extend(b.block_id for b in new_blocks)
+                order = self._buddy_order
+                self.new_block_ids.extend(b.block_id >> order for b in new_blocks)
             return new_blocks
 
     def take_new_block_ids(self) -> list[int]:
@@ -1078,7 +1120,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= 1
                 else:
                     assert num_new_blocks <= self.num_speculative_blocks + 1
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_chunks(
+                    self._buddy_order, num_new_blocks
+                )
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]

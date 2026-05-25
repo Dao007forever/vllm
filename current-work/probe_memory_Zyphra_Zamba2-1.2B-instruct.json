@@ -1,0 +1,462 @@
+[
+  {
+    "model": "Zyphra/Zamba2-1.2B-instruct",
+    "buddy": "0",
+    "prefix_caching": false,
+    "num_gpu_blocks": 10668,
+    "n_groups": 8,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "FullAttentionSpec",
+        "block_size_tokens": 80,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": null,
+        "n_layers": 6
+      },
+      {
+        "i": 1,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 6
+      },
+      {
+        "i": 2,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 6
+      },
+      {
+        "i": 3,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 6
+      },
+      {
+        "i": 4,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      },
+      {
+        "i": 5,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      },
+      {
+        "i": 6,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      },
+      {
+        "i": 7,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 4
+      }
+    ],
+    "unique_tensor_bytes": 83896565760,
+    "total_kv_bytes": 615241482240,
+    "total_kv_bytes_unpadded": 615241482240
+  },
+  {
+    "model": "Zyphra/Zamba2-1.2B-instruct",
+    "buddy": "0",
+    "prefix_caching": true,
+    "num_gpu_blocks": 3331,
+    "n_groups": 8,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "FullAttentionSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": null,
+        "n_layers": 6
+      },
+      {
+        "i": 1,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 6
+      },
+      {
+        "i": 2,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 6
+      },
+      {
+        "i": 3,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 6
+      },
+      {
+        "i": 4,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      },
+      {
+        "i": 5,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      },
+      {
+        "i": 6,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      },
+      {
+        "i": 7,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 4
+      }
+    ],
+    "unique_tensor_bytes": 83827359744,
+    "total_kv_bytes": 614733971456,
+    "total_kv_bytes_unpadded": 614733971456
+  },
+  {
+    "model": "Zyphra/Zamba2-1.2B-instruct",
+    "buddy": "1",
+    "prefix_caching": false,
+    "num_gpu_blocks": 10668,
+    "n_groups": 8,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "FullAttentionSpec",
+        "block_size_tokens": 80,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": null,
+        "n_layers": 6
+      },
+      {
+        "i": 1,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 6
+      },
+      {
+        "i": 2,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 6
+      },
+      {
+        "i": 3,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 6
+      },
+      {
+        "i": 4,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      },
+      {
+        "i": 5,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      },
+      {
+        "i": 6,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      },
+      {
+        "i": 7,
+        "spec": "MambaSpec",
+        "block_size_tokens": 4096,
+        "page_size_bytes": 1310720,
+        "real_page_size_bytes": 1310720,
+        "page_size_padded": 1310720,
+        "n_layers": 5
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13982760960,
+        "n_layers_sharing": 4
+      }
+    ],
+    "unique_tensor_bytes": 83896565760,
+    "total_kv_bytes": 615241482240,
+    "total_kv_bytes_unpadded": 615241482240
+  },
+  {
+    "model": "Zyphra/Zamba2-1.2B-instruct",
+    "buddy": "1",
+    "prefix_caching": true,
+    "num_gpu_blocks": 3331,
+    "n_groups": 8,
+    "page_size_padded_bytes": 0,
+    "sum_group_page_size_bytes": 0,
+    "total_kv_bytes_padded": 0,
+    "per_group_footprint_bytes": 0,
+    "padding_waste_bytes": 0,
+    "groups": [
+      {
+        "i": 0,
+        "spec": "FullAttentionSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": null,
+        "n_layers": 6
+      },
+      {
+        "i": 1,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 6
+      },
+      {
+        "i": 2,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 6
+      },
+      {
+        "i": 3,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 6
+      },
+      {
+        "i": 4,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      },
+      {
+        "i": 5,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      },
+      {
+        "i": 6,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      },
+      {
+        "i": 7,
+        "spec": "MambaSpec",
+        "block_size_tokens": 256,
+        "page_size_bytes": 4194304,
+        "real_page_size_bytes": 4194304,
+        "page_size_padded": 4194304,
+        "n_layers": 5
+      }
+    ],
+    "kv_cache_tensors": [
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 8
+      },
+      {
+        "size": 13971226624,
+        "n_layers_sharing": 4
+      }
+    ],
+    "unique_tensor_bytes": 83827359744,
+    "total_kv_bytes": 614733971456,
+    "total_kv_bytes_unpadded": 614733971456
+  }
+]

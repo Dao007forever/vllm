@@ -73,6 +73,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
+                chunk_order=kv_cache_group.chunk_order,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )

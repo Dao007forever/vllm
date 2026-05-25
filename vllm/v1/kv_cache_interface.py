@@ -832,6 +832,12 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Buddy-decoupled mode: how many base blocks one logical block of this
+    # group spans (log2). 0 means 1 base block per group block (the default).
+    # For mamba in decoupled hybrid mode, this is ceil(log2(spec.page_size /
+    # base_page_bytes)) so a mamba allocation consumes 2**chunk_order
+    # consecutive base blocks from the shared address space.
+    chunk_order: int = 0
 
 
 @dataclass
@@ -841,10 +847,23 @@ class KVCacheConfig:
     """
 
     num_blocks: int
-    """The number of KV cache blocks"""
+    """The number of KV cache blocks.
+
+    In buddy-decoupled hybrid mode, this is the number of *base* blocks; one
+    base block is base_page_bytes bytes per layer-tuple slab. A logical
+    block of group g spans 2**g.chunk_order base blocks.
+    """
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
+    """The kv cache groups of the model."""
+    base_page_bytes: int | None = None
+    """When set: buddy-decoupled hybrid layout is in effect. Each tensor slab
+    is sized as num_blocks * base_page_bytes per layer, with first-dim stride
+    base_page_bytes. Each group's spec.page_size_bytes is the *logical* per-
+    block byte count (the kernel-visible size). The buddy allocates chunks of
+    2**group.chunk_order base blocks per logical block. When None: legacy
+    uniform-page layout (stride = spec.page_size_bytes / page_size_padded)."""
     """
     The kv cache groups of the model.
     For models with only one type of attention, there is only one group that

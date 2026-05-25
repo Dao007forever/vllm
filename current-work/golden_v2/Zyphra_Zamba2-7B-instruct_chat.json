@@ -1,0 +1,143 @@
+{
+  "model": "Zyphra/Zamba2-7B-instruct",
+  "chat": true,
+  "prompts": [
+    "The capital of France is",
+    "Compute 17 * 23. Show the result as a single integer.",
+    "Write a Python function `is_prime(n)` that returns True iff n is prime.\n\ndef is_prime(n):\n",
+    "Alice has 3 apples. Bob gives her 5 more, then she eats 2. How many apples does Alice have? Answer with just the number.",
+    "The secret word is 'platypus'. Remember it. Now write one sentence about the weather. Then on a new line repeat the secret word.",
+    "List three primary colors, one per line, no other text."
+  ],
+  "outputs": [
+    {
+      "text": "Paris!",
+      "token_ids": [
+        3916,
+        278,
+        28808,
+        2
+      ]
+    },
+    {
+      "text": "391",
+      "token_ids": [
+        28770,
+        28774,
+        28740,
+        2
+      ]
+    },
+    {
+      "text": "def is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True",
+      "token_ids": [
+        1270,
+        349,
+        28730,
+        9302,
+        28732,
+        28711,
+        1329,
+        13,
+        2287,
+        513,
+        307,
+        5042,
+        28705,
+        28740,
+        28747,
+        13,
+        5390,
+        604,
+        8250,
+        13,
+        2287,
+        354,
+        613,
+        297,
+        2819,
+        28732,
+        28750,
+        28725,
+        716,
+        28732,
+        28711,
+        348,
+        28734,
+        28723,
+        28782,
+        28731,
+        648,
+        28705,
+        28740,
+        1329,
+        13,
+        5390,
+        513,
+        307,
+        1239,
+        613,
+        859,
+        28705,
+        28734,
+        28747,
+        13,
+        17422,
+        604,
+        8250,
+        13,
+        2287,
+        604,
+        6110,
+        2
+      ]
+    },
+    {
+      "text": "Alice has 6 apples.",
+      "token_ids": [
+        2707,
+        535,
+        659,
+        28705,
+        28784,
+        979,
+        2815,
+        28723,
+        2
+      ]
+    },
+    {
+      "text": "The weather today is sunny and warm.\n\nplatypus",
+      "token_ids": [
+        1014,
+        8086,
+        3154,
+        349,
+        4376,
+        1780,
+        304,
+        6100,
+        28723,
+        13,
+        13,
+        452,
+        270,
+        1416,
+        381,
+        2
+      ]
+    },
+    {
+      "text": "Red\nBlue\nYellow",
+      "token_ids": [
+        7516,
+        13,
+        17596,
+        13,
+        28802,
+        4149,
+        2
+      ]
+    }
+  ]
+}
