@@ -1,8 +1,15 @@
 # vLLM V1 KV cache memory layout — findings
 
-Companion to `UNIFORM_BLOCK.md` and `BUDDY.md`. This document captures the actually-true memory model in V1, which I had wrong in earlier iterations. It is a reference for what's shared vs. partitioned, what's normalized to enable sharing, and where the waste lives.
+Companion to `UNIFORM_BLOCK.md`, `BUDDY.md`, and `decoupled_hybrid_pages.md`.
+This document captures the actually-true memory model in V1, which I had
+wrong in earlier iterations. It is a reference for what's shared vs.
+partitioned, what's normalized to enable sharing, and where the waste lives.
 
-Source: paths and line numbers refer to the `exp/malloc` branch.
+Source: paths and line numbers refer to the `exp/malloc-wt` branch.
+
+> Note: the action items at the bottom (§6) have since been implemented; see
+> `decoupled_hybrid_pages.md` for the design that landed and the validated
+> end-to-end numbers.
 
 ## TL;DR
 
@@ -121,7 +128,23 @@ Both require:
 3. **Variable attention metadata**: the attention kernel reads `2^order_g` consecutive rows per block-table entry, masking by per-token validity.
 4. **Buddy free list** (the work in `BUDDY.md`): supplies variable-size chunks from the shared pool.
 
-(4) is in place. (1) is a small change to `SingleTypeKVCacheManager`. (2) is what I deleted and need to restore. (3) is the largest open piece.
+All four are now in place for the **cross-group** case (see
+`decoupled_hybrid_pages.md`):
+
+- (1) `KVCacheGroupSpec.chunk_order` is computed per-group in
+  `kv_cache_utils.py` and passed via `HybridKVCacheCoordinator` to each
+  `SingleTypeKVCacheManager`.
+- (2) The strided per-group view over a single column slab gives one
+  block-table entry access to `2**chunk_order` consecutive base rows. The
+  block-table itself still records start ids only.
+- (3) Attention kernels gather across `2**chunk_order` base rows by reading
+  through the strided view; no per-token mask is needed because each entry
+  represents a contiguous, fully-owned chunk.
+- (4) The buddy free list (`BUDDY.md`) supplies the variable-size chunks.
+
+The remaining open piece is **within-group** heterogeneity (mixing orders
+inside a single group, e.g., per request) — tracked under Stage 5 of
+`TEST_PLAN.md`.
 
 ## 5. Reasons I had this wrong earlier
 
@@ -130,12 +153,36 @@ Two mistakes worth recording:
 1. I assumed "per-group" meant separate tensors. It doesn't — vLLM column-packs across groups by default, and the per-group separation only kicks in for `HiddenStateCacheSpec` / `MambaSpec` / hybrid-disabled fallback.
 2. I framed the gating refactor as "Jenga-style memory unification" (one byte buffer + per-group views). That's not actually needed for the common case (paged attention with heterogeneous per-token sizes), because vLLM's existing normalization already shares memory across groups. The remaining issue is the **padding** in (2b) and the **block-size token-coarseness** in (2a), both of which are downstream of choosing one common page — and both of which buddy + variable block_size address without touching the underlying tensor layout.
 
-## 6. Action items
+## 6. Action items (status as of `exp/malloc-wt` HEAD)
 
-- Restore the Stage 1–3 variable-slot-mapping work from git.
-- Then generalize attention metadata to read multiple rows per block-table entry (Stage 5).
-- Wire `SingleTypeKVCacheManager` to allocate at each group's `order_g` based on `native_page / common_page` ratio (currently always 0).
-- Verify with the harness: when a hybrid group's order > 0, slot mapping and attention should both produce correct outputs.
+- ~~Restore the Stage 1–3 variable-slot-mapping work from git.~~ Replaced by
+  a different mechanism: per-group strided views over a shared
+  base-page-indexed slab. No per-entry order metadata needed because each
+  group has a single static `chunk_order`. See
+  `decoupled_hybrid_pages.md` §5.
+- ~~Generalize attention metadata to read multiple rows per block-table
+  entry.~~ Handled by the strided view: the kernel sees a stride of
+  `base_page` and an inner shape sized to the group's native page, so each
+  block-table entry implicitly covers `2**chunk_order` base rows.
+- ~~Wire `SingleTypeKVCacheManager` to allocate at each group's `order_g`.~~
+  Done via `KVCacheGroupSpec.chunk_order`, plumbed through
+  `HybridKVCacheCoordinator`.
+- ~~Verify with the harness.~~ Done — bit-identical outputs on Zamba2-1.2B,
+  Zamba2-7B, Falcon-Mamba-7B; +186% to +316% max concurrency. See
+  `decoupled_hybrid_pages.md` §6.
+
+**Deferred**: within-group heterogeneity (Stage 5 in `TEST_PLAN.md`) —
+letting one group mix orders per allocation. Within a single group all
+layers share one per-token byte cost, so this is not a memory win. We
+briefly thought it was needed to close the +9× MLA kernel-cost regression
+seen on Kimi-Linear-48B at `bs=16` + `TRITON_MLA`, but the same bench at
+`bs=64` with the default `FLASHINFER_MLA` backend already shows buddy
+**+22% throughput** on top of a 50× capacity gain — see
+`bench_kimi_linear_result.json` and `decoupled_hybrid_pages.md` §6.1. The
+gap that within-group mixing would have addressed is therefore just the
+small-`bs` × non-tile-tuned-backend corner, not the recommended
+configuration. Revisit only if a workload appears where small `bs` is
+forced by external constraints.
 
 ## Code-reference index
 

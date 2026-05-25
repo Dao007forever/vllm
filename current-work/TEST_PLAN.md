@@ -98,20 +98,56 @@ Required checks:
 - Add longer prompts (>1024 tokens) to exercise the K/V gather path more heavily — current 6-prompt set stays well under 100 tokens output, which under-tests this surface.
 
 ### Stage 4 — Buddy allocator (DONE)
-See `BUDDY.md` for the full state. Coverage:
-- 17 unit tests (`tests/v1/core/test_buddy_block_pool.py`).
-- 6 harness golden combinations (buddy off; buddy on with max_order 0, 4; buddy on with per-group orders 0, 1).
-- All pass byte-identical against Stage 0 golden.
-- Plumbing is in; **does not yet deliver real memory savings** because KV cache memory is per-group. Memory unification is the next stage.
+See `BUDDY.md` for the allocator state and `decoupled_hybrid_pages.md` for
+the layout that consumes it. Coverage:
+- 25 unit tests (`tests/v1/core/test_buddy_block_pool.py`) — covers
+  multi-order alloc/free, coalescing, `remove()`, and the eviction-callback
+  paths exercised when prefix caching coexists with buddy.
+- 3 slot-mapping tests (`tests/v1/worker/test_variable_block_slot_mapping.py`).
+- Harness golden: bit-identical outputs across Qwen3-0.6B, Zamba2-1.2B,
+  Zamba2-7B, Falcon-Mamba-7B against Stage 0 baseline. Goldens recorded
+  under `current-work/golden/` and `current-work/golden_v2/`.
+- **Now delivers cross-group memory savings** via the decoupled hybrid-page
+  layout (`base_page` + per-group `chunk_order`). Validated +186% / +316%
+  max concurrency on Zamba2-1.2B / 7B with prefix caching on. The earlier
+  "no real savings" status was for the original
+  shared-id-space-only design; the current implementation reinterprets the
+  buddy as a base-page address space and adds per-group strided views over
+  one column slab.
 
-### Stage 5 — Within-group heterogeneity enabled (the actual feature)
-A workload is added that uses **different block sizes within a single KV cache group**.
+### Stage 5 — Within-group heterogeneity (deferred; motivator unclear after Kimi-Linear bench)
+**Cross-group** heterogeneity is delivered by Stage 4 — each group picks one
+static `chunk_order` based on its native page size, and that delivers the
+measured +186%/+316% concurrency win.
 
-Required checks:
-- Stage 1 checks (homogeneous-block control case still passes).
-- New test: skewed-length batch on Qwen3-0.6B with a mix of 64-token and 1024-token requests, run twice — once with uniform `block_size=16`, once with variable block sizes — and verify:
-  1. Outputs match between the two configurations (correctness invariant).
-  2. KV-cache memory usage is lower in the variable-size case (the actual feature win).
+**Within-group** mixing (allowing one group's allocations to vary in order
+per-request) does **not** have a clean motivator after running the
+Kimi-Linear bench more carefully. The previous "+9× regression →
+within-group mixing fixes it" framing was an artifact of running at
+`block_size=16` on `TRITON_MLA`. With `block_size=64` and the default
+`FLASHINFER_MLA` backend, buddy already wins **+22% throughput** on
+Kimi-Linear-48B at the same 50× capacity gain — see
+`bench_kimi_linear_result.json` and `decoupled_hybrid_pages.md` §6.1.
+
+So the remaining gap that within-group mixing would address is just the
+`bs=16` regime — a regime that's not the default and not the recommended
+configuration on MLA hybrids. Inside a single group all layers still share
+one per-token byte cost, so there's no per-layer memory motivator;
+secondary motivations (block-table compactness, fragmentation, allocator
+throughput) are real but small and unmeasured.
+
+Net: keep this deferred. Revisit only if a concrete workload (e.g., a
+hybrid with `bs` pinned small for an external reason) demonstrates a
+measurable win that per-group block_size + backend tuning can't already
+deliver.
+
+If revisited, the surface change is:
+- Per-block-table-entry order metadata (or `cu_block_lens` per row).
+- Slot-mapping kernel takes order from metadata, not from a constexpr.
+- Attention K/V gather generalized to read variable-stride entries.
+- Test: skewed-length batch on a non-hybrid model (e.g., Qwen3-0.6B) with
+  a mix of 64-token and 1024-token requests; correctness vs. uniform;
+  measure any throughput / fragmentation delta.
 
 ## Tooling gaps to address later
 

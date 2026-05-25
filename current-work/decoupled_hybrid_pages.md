@@ -200,6 +200,68 @@ Non-hybrid models (Qwen3-0.6B)    no change            no change           —
                                    already have the same page size)
 ```
 
+### MLA-based hybrids (Kimi-Linear-48B): block_size + backend matters
+
+The Zamba2 wins above are capacity-driven (`+N%` *max concurrency*, same
+per-request kernel cost). MLA-based hybrids add a knob: MLA decode cost
+scales with `cdiv(context_len, block_size)`, so very small `block_size`
+combined with a non-tile-tuned backend can erase the buddy win.
+
+Kimi-Linear-48B has 7 MLA layers (page ~18 KiB at `bs=16`) and 20 KDA
+layers (page ~2 MiB). Same 16-prompt × 256-token bench at 8K context, 1×
+GB200, `mamba_cache_mode='align'`:
+
+```
+              backend       bs   num_blocks   gen     throughput
+baseline      TRITON_MLA    16        3,033   2.09 s   1,514 tok/s
+buddy         TRITON_MLA    16      587,869  17.93 s     172 tok/s    ×0.11
+baseline      FLASHINFER    64        2,955   2.08 s   1,520 tok/s
+buddy         FLASHINFER    64      147,195   1.84 s   1,859 tok/s    ×1.22
+```
+
+Two things are happening:
+
+1. **MLA decode iterations per request.** At `bs=16`, an 8K-context
+   request makes the decode kernel walk 512 block_table entries per query
+   per layer; at `bs=64`, 128 entries. At baseline's effective inflated
+   `bs ≈ 1920`, only 4–5 entries. The buddy lets MLA stay at its
+   kernel-natural small bs, so the iteration count is set by `bs`, not
+   inflation.
+2. **Backend amortization.** `TRITON_MLA` is the portable fallback and
+   handles small `bs` poorly. `FLASHINFER_MLA` (default on SM10) is tuned
+   for `bs ∈ {32, 64, 128, …}` with proper tile reuse, and at `bs=64`
+   amortizes per-block overhead well enough that the buddy's 50× capacity
+   gain becomes a net throughput gain too.
+
+The buddy is therefore **block_size- and backend-sensitive** on MLA
+hybrids. Recommended config for Kimi-Linear-style models:
+
+- `block_size ≥ 64` (so FlashInfer-MLA's `block_num × block_size % 128 == 0`
+  tile constraint is easy to satisfy and decode iterations are kept
+  manageable).
+- Default attention backend (do not force `TRITON_MLA`).
+- `VLLM_USE_BUDDY_BLOCK_POOL=1`, `VLLM_BUDDY_MAX_ORDER` ≥ the largest
+  per-group `chunk_order` (4 for Kimi-Linear at bs=64).
+
+At `bs=16` on this model the buddy is a workload-dependent trade-off (good
+for high-concurrency, bad for cold single-batch throughput on
+`TRITON_MLA`). At `bs=64` on FlashInfer the buddy is a clean win on both
+axes.
+
+Higher block sizes now run end-to-end after the reshape fix
+(`BUDDY_PROFILING_RESHAPE_BUG.md`). Verified at `bs=128`:
+
+```
+              backend       bs   num_blocks    gen     throughput
+baseline      FLASHINFER   128        3,003   13.70 s     227.8 tok/s
+buddy         FLASHINFER   128       74,177   13.10 s     261.0 tok/s   ×1.15
+```
+
+Capacity gain is ×24.7 here, but throughput at `bs=128` is much lower
+than at `bs=64` (1,859 tok/s) — large per-block granularity hurts decode
+parallelism. `bs=64` remains the recommended setting; `bs=128` is now
+*correct* but not preferred.
+
 ## 7. Code touchpoints
 
 ```

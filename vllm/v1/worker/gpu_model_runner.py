@@ -6976,15 +6976,23 @@ class GPUModelRunner(
                     ]
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
-                    if (
+                    # Strided view is only needed when adjacent block indices
+                    # don't sit on adjacent kernel-block-sized strides in
+                    # memory: either (a) page-size padding inserts unused
+                    # bytes between blocks (`page_size_padded` set), or (b)
+                    # buddy-decoupled mode with chunk_order > 0 makes
+                    # adjacent indices overlap. For chunk_order == 0 attn
+                    # groups under buddy, the layout is contiguous and a
+                    # plain .view() is correct (and what baseline-attn uses
+                    # outside buddy mode).
+                    needs_strided_view = (
                         kv_cache_spec.page_size_padded is not None
-                        or base_page_bytes is not None
-                    ):
-                        # Strided view to handle either page-size padding (pad
-                        # UP, page_size_padded set) or buddy-decoupled mode (pad
-                        # DOWN, base_page_bytes < page_size_bytes; adjacent
-                        # indices overlap, but the buddy guarantees only
-                        # 2**chunk_order-aligned indices are handed out).
+                        or (
+                            base_page_bytes is not None
+                            and base_page_bytes < kv_cache_spec.page_size_bytes
+                        )
+                    )
+                    if needs_strided_view:
                         # NOTE: This assumes kv_cache_shape[0] == num_blocks
                         # (i.e. the first physical dimension is the block
                         # index), which holds for MLA backends but NOT for
@@ -7000,7 +7008,12 @@ class GPUModelRunner(
                             stride=tuple(strides),
                         )
                     else:
-                        # No padding — safe to use a contiguous view.
+                        # Contiguous view. Under buddy mode the slab may
+                        # have a max-overhang tail beyond what this group's
+                        # kernel view needs; trim before .view().
+                        view_numel = torch.Size(kv_cache_shape).numel()
+                        if raw_tensor.numel() != view_numel:
+                            raw_tensor = raw_tensor.narrow(0, 0, view_numel)
                         kv_cache = raw_tensor.view(kv_cache_shape)
                     kv_caches[layer_name] = kv_cache.permute(*inv_order)
 
