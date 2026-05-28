@@ -105,7 +105,12 @@ class BuddyFreeKVCacheBlockQueue:
                 f"len(blocks)={n} too small for max_order={max_order} "
                 f"(need at least {chunk})"
             )
-        for start in range(0, aligned_n, chunk):
+        # ``_link_tail`` puts uncached blocks at the LRU HEAD (so they pop
+        # first), which means each insert pushes earlier inserts back. Seed
+        # in REVERSE id order so that block 0 ends up at the head — this
+        # preserves the NULL_BLOCK_ID = 0 invariant: the very first popleft
+        # (which BlockPool consumes as the null block) returns id 0.
+        for start in range(aligned_n - chunk, -1, -chunk):
             head = blocks[start]
             head.chunk_order = max_order
             self._link_tail(head, max_order)
@@ -119,14 +124,36 @@ class BuddyFreeKVCacheBlockQueue:
 
     # ----------------------- LRU linked-list helpers ------------------------
     def _link_tail(self, block: KVCacheBlock, order: int) -> None:
-        """Insert ``block`` at the MRU end of order ``order``."""
-        tail = self._tails[order]
-        prev = tail.prev_free_block
-        assert prev is not None
-        prev.next_free_block = block
-        block.prev_free_block = prev
-        block.next_free_block = tail
-        tail.prev_free_block = block
+        """Insert ``block`` at the MRU end of order ``order``.
+
+        Cached blocks (``block_hash is not None``) go to the TAIL — they age
+        out via LRU and are evicted last. Uncached blocks go to the HEAD so
+        they are popped first, preserving cached chunks. Combined with the
+        coalesce-skip rule in ``append``, this means the order-K LRU layout
+        is: ``[uncached newest → ... → uncached oldest][cached oldest → ...
+        → cached newest]``. The head's hash state tells us in O(1) whether
+        any uncached chunk exists at this order — used by ``alloc_chunk``
+        to prefer splitting a higher-order uncached chunk over evicting a
+        same-order cached one.
+        """
+        if block.block_hash is None:
+            # Uncached: link at HEAD so it pops first.
+            head = self._heads[order]
+            nxt = head.next_free_block
+            assert nxt is not None
+            head.next_free_block = block
+            block.prev_free_block = head
+            block.next_free_block = nxt
+            nxt.prev_free_block = block
+        else:
+            # Cached: link at TAIL (MRU end) for LRU eviction.
+            tail = self._tails[order]
+            prev = tail.prev_free_block
+            assert prev is not None
+            prev.next_free_block = block
+            block.prev_free_block = prev
+            block.next_free_block = tail
+            tail.prev_free_block = block
 
     def _unlink(self, block: KVCacheBlock) -> None:
         """Unlink ``block`` from whatever per-order LRU it's currently in."""
@@ -185,11 +212,31 @@ class BuddyFreeKVCacheBlockQueue:
             raise ValueError(
                 f"order {order} out of range [0, {self._max_order}]"
             )
-        # Walk up to find the smallest available chunk >= requested order.
+        # Pass 1: prefer an UNCACHED chunk to avoid evicting a cached one.
+        # Because _link_tail puts uncached blocks at the HEAD of each order's
+        # LRU, checking the head's hash is an O(1) test for "any uncached
+        # chunk available at this order". We walk up looking for the smallest
+        # order whose head is uncached.
         src = order
-        while src <= self._max_order and self._heads[src].next_free_block is \
-                self._tails[src]:
+        while src <= self._max_order:
+            head = self._heads[src].next_free_block
+            if (
+                head is not self._tails[src]
+                and head.block_hash is None
+            ):
+                break
             src += 1
+        if src > self._max_order:
+            # Pass 2: no uncached chunk anywhere. Fall back to evicting the
+            # LRU-head cached chunk at the smallest non-empty order.
+            src = order
+            while src <= self._max_order:
+                if (
+                    self._heads[src].next_free_block
+                    is not self._tails[src]
+                ):
+                    break
+                src += 1
         if src > self._max_order:
             # Fall back to tail blocks for order-0 requests only — tail
             # ids aren't aligned for higher orders.
@@ -205,11 +252,12 @@ class BuddyFreeKVCacheBlockQueue:
             )
         block = self._pop_head(src)
         assert block is not None
-        # If we are splitting, the parent chunk's cached identity (a hash
-        # for 2**src tokens of content) no longer holds — the low half
-        # becomes a smaller chunk, the high halves are fresh buddies.
-        # Drop the parent's hash before reorganising memory.
-        if src > order and self._on_evict is not None and block.block_hash is not None:
+        # If the popped chunk is cached, drop its hash before reusing the
+        # memory. This covers both same-order eviction (src == order, no
+        # uncached found) and the older split-on-cached case (src > order
+        # — should be rare with the uncached-first pass but possible if a
+        # higher-order chunk got cached somehow).
+        if self._on_evict is not None and block.block_hash is not None:
             self._on_evict(block)
         # Split src -> order: at each level, the high-half buddy goes into
         # its order's LRU tail; the low half continues down.
@@ -275,16 +323,15 @@ class BuddyFreeKVCacheBlockQueue:
                 or buddy.chunk_order != order
             ):
                 break
-            # Coalescing — the merged chunk is a new entity with no hash.
-            # Drop the hashes of both contributors. ``self`` (blocks_by_id[bid])
-            # has its hash dropped on the FIRST iteration only; on later
-            # iterations, the merged chunk's hash was already evicted.
-            if self._on_evict is not None:
-                cur = self._blocks_by_id[bid]
-                if cur.block_hash is not None:
-                    self._on_evict(cur)
-                if buddy.block_hash is not None:
-                    self._on_evict(buddy)
+            # Preserve cached identity: if either contributor holds a cache
+            # hash, coalescing would discard a valid prefix-cache entry. Stop
+            # and leave both in their order's LRU. They can still be reused
+            # individually; coalescing resumes once both sides are uncached.
+            cur = self._blocks_by_id[bid]
+            if self._on_evict is not None and (
+                cur.block_hash is not None or buddy.block_hash is not None
+            ):
+                break
             self._unlink(buddy)
             bid = min(bid, buddy_id)
             order += 1

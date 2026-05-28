@@ -313,18 +313,22 @@ def test_on_evict_fires_when_splitting_cached_chunk() -> None:
     q = BuddyFreeKVCacheBlockQueue(
         blocks, max_order=4, on_evict=lambda b: (evicted.append(b), True)[1]
     )
-    # Simulate a cached order-2 chunk sitting in the LRU: alloc + append.
-    head = q.alloc_chunk(order=2)
-    # Pretend the BlockPool registered a hash for it.
+    # Drain the pool so head's buddy is allocated (still held by caller) and
+    # no coalesce will happen on append. After this, order-2 LRU is empty.
+    head = q.alloc_chunk(order=2)              # blocks[0..3]
+    _other = q.alloc_chunk(order=2)             # blocks[4..7] — head's buddy
+    _hi = q.alloc_chunk(order=3)                # blocks[8..15]
+    # Pretend the BlockPool registered a hash for head.
     head._block_hash = "FAKE_HASH_FOR_HEAD"  # noqa: SLF001
     q.append(head)
-    # head re-entered the LRU at some order >= 2 with its hash intact.
+    # head sits alone in order-2 LRU (its buddy is still allocated, so
+    # coalescing has nothing to do). Hash preserved.
     assert head.block_hash is not None
     assert head in q.get_all_free_blocks()
     evicted.clear()
 
-    # Now ask for order 0. The only free chunk is at head's order; the
-    # queue must walk up, pop head, evict its hash, then split down.
+    # Now ask for order 0. The only free chunk is head at order 2; the
+    # queue walks up, pops head, evicts its hash, then splits down.
     leaf = q.alloc_chunk(order=0)
     assert leaf.chunk_order == 0
     assert evicted == [head], (
@@ -332,8 +336,9 @@ def test_on_evict_fires_when_splitting_cached_chunk() -> None:
     )
 
 
-def test_on_evict_fires_for_both_contributors_on_coalesce() -> None:
-    """append that coalesces two cached siblings evicts both hashes."""
+def test_coalesce_skipped_when_cached_hash_present() -> None:
+    """append that would coalesce two cached siblings instead keeps both
+    individually cached. Coalescing resumes once a sibling is uncached."""
     from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
@@ -345,20 +350,41 @@ def test_on_evict_fires_for_both_contributors_on_coalesce() -> None:
     # Two order-2 buddies: chunks at start ids 0 and 4 (0 ^ 4 = 4 → buddies).
     a = q.alloc_chunk(order=2)
     b = q.alloc_chunk(order=2)
-    # They should be buddies at order 2 (covering [0..3] and [4..7]).
     assert {a.block_id, b.block_id} == {0, 4}
     a._block_hash = "HASH_A"  # noqa: SLF001
     b._block_hash = "HASH_B"  # noqa: SLF001
-    # Free a first — sits in order-2 LRU with its hash. No coalesce yet
-    # because b is still allocated.
+    # Free a — sits in order-2 LRU with its hash; b still allocated.
     q.append(a)
     assert evicted == [], "no coalesce → no eviction"
     assert a.block_hash == "HASH_A"
-    # Free b — buddy of a at order 2. Coalesce fires; both hashes evicted.
+    # Free b — would normally coalesce with a, but both are cached. Skip
+    # coalescing; both remain in order-2 LRU with hashes intact.
     q.append(b)
-    evicted_ids = {blk.block_id for blk in evicted}
-    assert evicted_ids == {a.block_id, b.block_id}, (
-        f"expected both contributors evicted on coalesce, got {evicted}"
+    assert evicted == [], (
+        f"expected no eviction (cache preserved), got {evicted}"
+    )
+    assert a.block_hash == "HASH_A" and b.block_hash == "HASH_B"
+    free = q.get_all_free_blocks()
+    # a and b remain individually in the free pool at order 2 (no coalesce).
+    cached_free = [blk for blk in free if blk.block_id in {a.block_id, b.block_id}]
+    assert {blk.block_id for blk in cached_free} == {a.block_id, b.block_id}
+    assert all(blk.chunk_order == 2 for blk in cached_free)
+
+    # Once a's hash is dropped (e.g. BlockPool evicted via LRU), the next
+    # append against b should be able to coalesce them.
+    a._block_hash = None  # noqa: SLF001
+    # Simulate b being re-touched by allocator (alloc + free) — the alloc
+    # path is what would trigger coalescing in a real workload. Simplest
+    # exercise: remove b and re-append; with a now uncached, append(b)
+    # coalesces them into an order-3 chunk.
+    q.remove(b)
+    b._block_hash = None  # noqa: SLF001
+    q.append(b)
+    free = q.get_all_free_blocks()
+    # After hashes are cleared, coalescing cascades all the way up: a+b → 3,
+    # and that buddies with the leftover order-3 chunk [8..15] → 4.
+    assert len(free) == 1 and free[0].chunk_order == 4, (
+        f"expected full coalesce after hashes cleared, got {free}"
     )
 
 
@@ -401,6 +427,85 @@ def test_remove_then_reappend_preserves_chunk_order() -> None:
     q.append(head)
     # And the queue still accounts for it correctly.
     assert q.num_free_blocks == 16
+
+
+def test_alloc_prefers_splitting_uncached_over_evicting_cached() -> None:
+    """alloc_chunk should split a higher-order uncached chunk rather than
+    evict a same-order cached chunk when the requested order is non-empty
+    but its head is cached."""
+    from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    blocks = [KVCacheBlock(i) for i in range(16)]
+    evicted: list[KVCacheBlock] = []
+    q = BuddyFreeKVCacheBlockQueue(
+        blocks, max_order=4, on_evict=lambda b: (evicted.append(b), True)[1]
+    )
+    # Carve out two cached order-2 chunks (siblings won't coalesce).
+    a = q.alloc_chunk(order=2)
+    b = q.alloc_chunk(order=2)
+    a._block_hash = "HASH_A"  # noqa: SLF001
+    b._block_hash = "HASH_B"  # noqa: SLF001
+    q.append(a)
+    q.append(b)
+    # order-2 LRU now has two cached chunks. order-4 LRU still has fresh
+    # max-order chunk(s) — the rest of the pool was untouched.
+    assert evicted == []
+    assert a.block_hash == "HASH_A" and b.block_hash == "HASH_B"
+
+    # Ask for order 2. Old policy would pop a's LRU head (cached) and evict.
+    # New policy: prefer splitting an uncached higher-order chunk.
+    new_chunk = q.alloc_chunk(order=2)
+    assert evicted == [], (
+        f"expected no eviction (uncached higher-order available), got {evicted}"
+    )
+    assert a.block_hash == "HASH_A" and b.block_hash == "HASH_B"
+    assert new_chunk.chunk_order == 2
+    # And the chunk we got should be fresh — not a or b.
+    assert new_chunk.block_id not in {a.block_id, b.block_id}
+
+
+def test_alloc_falls_back_to_evict_when_no_uncached() -> None:
+    """When every order >= requested has only cached chunks, alloc evicts
+    the LRU-head cached chunk at the requested order."""
+    from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    blocks = [KVCacheBlock(i) for i in range(8)]
+    evicted: list[KVCacheBlock] = []
+    q = BuddyFreeKVCacheBlockQueue(
+        blocks, max_order=3, on_evict=lambda b: (evicted.append(b), True)[1]
+    )
+    # Allocate the whole pool as two cached order-2 chunks.
+    a = q.alloc_chunk(order=2)
+    b = q.alloc_chunk(order=2)
+    a._block_hash = "HASH_A"  # noqa: SLF001
+    b._block_hash = "HASH_B"  # noqa: SLF001
+    q.append(a)
+    q.append(b)
+    # All free chunks are cached. Asking for order 2 must evict.
+    assert evicted == []
+    new_chunk = q.alloc_chunk(order=2)
+    assert len(evicted) == 1, f"expected exactly one eviction, got {evicted}"
+    # The evicted block is the LRU-head of order 2 (a, freed first).
+    assert evicted[0].block_id == a.block_id
+    # b retains its hash.
+    assert b.block_hash == "HASH_B"
+
+
+def test_initial_pool_null_block_id_zero() -> None:
+    """First popleft after init must return block_id 0 (NULL_BLOCK_ID
+    invariant). Uncached-at-head seeding reverses insert order to preserve
+    this."""
+    from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    blocks = [KVCacheBlock(i) for i in range(32)]
+    q = BuddyFreeKVCacheBlockQueue(blocks, max_order=3)
+    first = q.popleft()
+    assert first.block_id == 0, (
+        f"NULL_BLOCK_ID = 0 invariant broken: popleft returned {first.block_id}"
+    )
 
 
 def test_allocated_chunks_dont_overlap() -> None:

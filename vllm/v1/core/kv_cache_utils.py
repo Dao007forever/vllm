@@ -1317,16 +1317,32 @@ def get_kv_cache_config_from_groups(
             in ("1", "true")
         )
         # Buddy-decoupled hybrid mode: groups may have different page sizes.
-        # Pick base_page = smallest group page; per-group chunk_order rounds up
-        # native page to a power-of-2 multiple of base_page. Tensor slabs are
-        # sized in base units so attn (with small block_size) keeps fine
-        # prefix-caching granularity without inflating mamba's storage.
-        page_sizes = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
-        decouple_active = _buddy_decouple and len(set(page_sizes)) > 1
+        # Anchor base_page to the smallest ATTENTION group's page. Attention
+        # groups go through the kernel-block-expansion strided view (which
+        # requires uniform per-block strides), so they must end up at
+        # chunk_order = 0; any non-zero chunk_order on an attn group would
+        # mean the kernel pages within one logical block aren't laid out at
+        # a uniform stride and the strided view can't represent it.
+        # Non-attention (e.g. mamba) groups handle stride independently in
+        # their own reshape branch and tolerate base_page > their native
+        # page (they pay a one-time per-block over-allocation equal to the
+        # gap). This mirrors what baseline does post-`_align_hybrid_block_
+        # size`: pick the larger natural page as the uniform anchor and pad
+        # the smaller side up.
+        from math import ceil, log2
+        attn_page_sizes = [
+            g.kv_cache_spec.page_size_bytes
+            for g in kv_cache_groups
+            if not isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        all_page_sizes = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
+        decouple_active = _buddy_decouple and len(set(all_page_sizes)) > 1
         if decouple_active:
-            from math import ceil, log2
-            base_page = min(page_sizes)
+            base_page = min(attn_page_sizes) if attn_page_sizes else min(all_page_sizes)
             # Per-group chunk_order = ceil(log2(ratio)) so 2**order >= ratio.
+            # Groups whose native page is smaller than base_page collapse to
+            # chunk_order = 0 (they over-allocate by `base_page - native` per
+            # block; that's the "pad mamba up" cost).
             max_overhang_bytes = 0
             for g in kv_cache_groups:
                 ratio = g.kv_cache_spec.page_size_bytes / base_page
@@ -1334,7 +1350,8 @@ def get_kv_cache_config_from_groups(
                 # The strided kernel view reads page_size_bytes at offset
                 # block_id * base_page, so the last usable block_id is
                 # num_blocks - (page_size_bytes / base_page). Tensors must
-                # have room for that overhang on the tail.
+                # have room for that overhang on the tail. Groups whose
+                # native page is <= base_page contribute zero overhang.
                 overhang = g.kv_cache_spec.page_size_bytes - base_page
                 if overhang > max_overhang_bytes:
                     max_overhang_bytes = overhang

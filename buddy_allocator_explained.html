@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Buddy Allocator &amp; Decoupled Hybrid Pages</title>
+<style>
+  :root {
+    --bg:#0f1117; --panel:#171a23; --panel2:#1d212c; --ink:#e6e9ef; --muted:#9aa3b2;
+    --line:#2a2f3c; --attn:#4f8cff; --attn-bg:#16233f; --mamba:#ff9d4f; --mamba-bg:#3a2814;
+    --good:#3fb950; --bad:#f85149; --accent:#bd93f9; --code:#c9d1d9;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap { max-width:980px; margin:0 auto; padding:48px 24px 96px; }
+  h1 { font-size:30px; line-height:1.2; margin:0 0 8px; letter-spacing:-.5px; }
+  h2 { font-size:22px; margin:48px 0 14px; padding-top:14px; border-top:1px solid var(--line); letter-spacing:-.3px; }
+  h3 { font-size:16px; margin:26px 0 8px; color:var(--accent); }
+  p  { color:var(--ink); }
+  .sub { color:var(--muted); font-size:15px; margin:0 0 28px; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px;
+         background:var(--panel2); color:var(--code); padding:1px 6px; border-radius:5px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px 22px; margin:16px 0; }
+  .tag { display:inline-block; font-size:11px; font-weight:600; letter-spacing:.4px; text-transform:uppercase;
+         padding:3px 9px; border-radius:20px; vertical-align:middle; }
+  .tag-attn { background:var(--attn-bg); color:var(--attn); border:1px solid #2b4a82; }
+  .tag-mamba{ background:var(--mamba-bg); color:var(--mamba); border:1px solid #6e4a1f; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:760px){ .grid2 { grid-template-columns:1fr; } }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+  th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.4px; }
+  td:first-child { color:var(--muted); white-space:nowrap; }
+  .good { color:var(--good); } .bad { color:var(--bad); } .muted{ color:var(--muted); }
+
+  /* page diagrams */
+  .legend { display:flex; gap:18px; flex-wrap:wrap; margin:6px 0 18px; font-size:13px; color:var(--muted); }
+  .legend span { display:inline-flex; align-items:center; gap:7px; }
+  .sw { width:14px; height:14px; border-radius:3px; display:inline-block; }
+  .row { display:flex; align-items:stretch; gap:4px; margin:6px 0; flex-wrap:wrap; }
+  .blk { border-radius:4px; font-size:11px; font-family:ui-monospace,monospace;
+         display:flex; align-items:center; justify-content:center; color:#fff; height:38px; }
+  .b-attn { background:linear-gradient(180deg,#4f8cff,#3b6fd4); }
+  .b-mamba{ background:linear-gradient(180deg,#ff9d4f,#d4793b); }
+  .b-pad  { background:repeating-linear-gradient(45deg,#2a2f3c,#2a2f3c 5px,#222732 5px,#222732 10px); color:var(--muted); border:1px dashed #3a4150; }
+  .b-base { background:transparent; border:1px dashed #3a4150; color:var(--muted); }
+  .axis { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace; margin-top:2px; }
+  .note { font-size:13px; color:var(--muted); margin-top:8px; }
+  .callout { border-left:3px solid var(--accent); background:#191426; padding:12px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+  .callout.warn { border-left-color:var(--bad); background:#241518; }
+  .callout.ok   { border-left-color:var(--good); background:#13231a; }
+  pre { background:#0b0d12; border:1px solid var(--line); border-radius:10px; padding:14px 16px; overflow:auto;
+        font-family:ui-monospace,monospace; font-size:12.5px; color:var(--code); line-height:1.5; }
+  pre .c { color:#6e7681; } pre .k { color:#ff7b72; } pre .s { color:#a5d6ff; } pre .f { color:#d2a8ff; }
+  .kpi { display:flex; gap:10px; flex-wrap:wrap; margin:12px 0; }
+  .kpi div { flex:1; min-width:120px; background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .kpi b { font-size:20px; display:block; }
+  .kpi small { color:var(--muted); }
+  .footer { color:var(--muted); font-size:13px; margin-top:48px; border-top:1px solid var(--line); padding-top:16px; }
+  .arrow { color:var(--accent); font-weight:700; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Buddy Allocator &amp; Decoupled Hybrid Pages</h1>
+  <p class="sub">How <code>VLLM_USE_BUDDY_BLOCK_POOL=1</code> changes KV-cache allocation for hybrid models
+  (full attention&nbsp;+&nbsp;mamba/linear), and why it helps prefix caching.</p>
+
+  <div class="callout">
+    <b>One-sentence summary.</b> Baseline forces every KV-cache group to share one block size and one
+    padded page, so the small-page group (full attention) gets inflated up to the big-page group (mamba state).
+    The buddy mode <em>decouples</em> them: each group keeps its native page, and a buddy allocator manages a
+    single base-page address space so the groups can have different block sizes and block counts.
+  </div>
+
+  <h2>1. The two groups, and why their pages differ</h2>
+  <p>A hybrid model like Kimi-Linear has two kinds of KV-cache layers:</p>
+
+  <div class="grid2">
+    <div class="panel">
+      <span class="tag tag-attn">Full attention (MLA)</span>
+      <p>Stores a per-token KV slab. Page size <b>grows linearly with block size</b>:
+      <code>page = block_size &times; bytes_per_token</code>. A 64-token block is a small page;
+      caching works at block granularity, so a small block means fine-grained prefix reuse.</p>
+    </div>
+    <div class="panel">
+      <span class="tag tag-mamba">Mamba / linear (KDA)</span>
+      <p>Stores a <b>fixed-size recurrent state</b> (~530&nbsp;KB/layer for Kimi-Linear), independent of block size.
+      Here <code>block_size</code> is the <em>snapshot interval</em>: one full state is written every
+      <code>block_size</code> tokens. Bigger block = fewer snapshots = less memory.</p>
+    </div>
+  </div>
+
+  <p>The tension: the mamba native page (fixed, large) is much bigger than a small full-attention page.
+  The allocator has to reconcile two groups whose natural page sizes differ by orders of magnitude.</p>
+
+  <h2>2. Baseline: couple everything into one uniform pool</h2>
+  <p>Baseline can only build a <b>uniform</b> block pool — every group shares one block size and one page size.
+  To make the small full-attention page line up with the large mamba page, it
+  <b>inflates the attention block</b> until its page is &ge; the mamba page
+  (<code>vllm/platforms/interface.py</code> &middot; <code>_align_hybrid_block_size</code>), then pads the
+  smaller side up to a common page.</p>
+
+  <div class="legend">
+    <span><i class="sw b-attn"></i> full-attn page</span>
+    <span><i class="sw b-mamba"></i> mamba state</span>
+    <span><i class="sw b-pad"></i> padding (wasted)</span>
+  </div>
+
+  <div class="panel">
+    <p class="note">Kimi-Linear, user <code>--block-size 64</code> &rarr; attn inflated to <b>512 tokens</b> so the
+    attn page matches the mamba native page. Both groups now use block_size&nbsp;512.</p>
+    <div class="row">
+      <div class="blk b-attn" style="width:100%">1 attention block = 512 tokens (one coarse cache unit)</div>
+    </div>
+    <div class="row">
+      <div class="blk b-mamba" style="width:100%">1 mamba block = 512-token snapshot interval (page already this big)</div>
+    </div>
+    <div class="axis">&rarr; ~2,685 large blocks total. A prompt shorter than 512 tokens never fills a block, so it is <span class="bad">never cached</span>.</div>
+  </div>
+
+  <div class="callout warn">
+    <b>The cost.</b> The block size is welded to the mamba page. Tiny prompts fall below the 512-token caching
+    granularity and get a 0% hit. You cannot make attention finer without also making every mamba snapshot
+    finer (and vice-versa) — there is one knob for both.
+  </div>
+
+  <h2>3. Buddy: decouple the pages, share one address space</h2>
+  <p>Buddy mode lets each group keep its <b>native</b> page. Instead of one uniform page, the allocator defines a
+  <b>base page</b> and measures every group's page as a number of base pages — its <code>chunk_order</code>
+  (<code>2**chunk_order</code> base pages per block). A buddy allocator then splits/merges power-of-two runs of
+  base pages out of one shared address space.</p>
+
+  <div class="legend">
+    <span><i class="sw b-base"></i> base page (the unit)</span>
+    <span><i class="sw b-attn"></i> full-attn block</span>
+    <span><i class="sw b-mamba"></i> mamba block</span>
+    <span><i class="sw b-pad"></i> over-allocation</span>
+  </div>
+
+  <div class="panel">
+    <p class="note"><b>base_page = smallest attention group page</b> (the 64-token MLA page). Attention is the unit.</p>
+    <div class="row">
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+      <div class="blk b-attn" style="width:11%">attn</div>
+    </div>
+    <div class="axis">Full attention: page == base_page &rarr; <b>chunk_order&nbsp;0</b>. Stays at 64 tokens &rarr; many fine blocks (~17k–149k).</div>
+    <div class="row" style="margin-top:14px">
+      <div class="blk b-mamba" style="width:44%">mamba state (native ~530 KB)</div>
+      <div class="blk b-pad" style="width:11%">pad</div>
+    </div>
+    <div class="axis">Mamba: native page &gt; base_page &rarr; rounds up to <b>2<sup>order</sup></b> base pages (<b>chunk_order&nbsp;N</b>),
+    over-allocating the gap. Block count is now <span class="good">independent</span> of attention's.</div>
+  </div>
+
+  <h3>What each group gets out of it</h3>
+  <table>
+    <tr><th>Property</th><th>Full attention (MLA)</th><th>Mamba / linear (KDA)</th></tr>
+    <tr><td>Block size</td><td>stays at <code>--block-size</code> (e.g. 64)</td><td>independent: <code>mamba_block_size</code></td></tr>
+    <tr><td>chunk_order</td><td><b>always 0</b> (page == base_page)</td><td>&ge; 0, rounds native page up to power-of-two base pages</td></tr>
+    <tr><td>Block count</td><td class="good">many small blocks</td><td>few large blocks, decoupled from attn count</td></tr>
+    <tr><td>Prefix caching</td><td class="good">fine-grained; tiny prompts cacheable</td><td>at <code>mamba_block_size</code> boundaries (mode-dependent)</td></tr>
+    <tr><td>Padding cost</td><td>none</td><td>one-time per-block over-allocation = <code>page − base_page</code> rounded to a power of two</td></tr>
+  </table>
+
+  <div class="callout ok">
+    <b>Why attn must be chunk_order 0.</b> Attention layers read through a kernel-block-expansion strided view that
+    assumes a uniform per-block stride. If an attention group landed at chunk_order&nbsp;&gt;&nbsp;0, the kernel
+    pages inside one logical block would no longer sit at a uniform stride and the view couldn't represent them.
+    Anchoring <code>base_page</code> to the smallest attention page guarantees every attention group collapses to
+    chunk_order&nbsp;0. Mamba handles its own stride in a separate reshape branch and tolerates
+    <code>base_page</code> &gt; its native page.
+  </div>
+
+  <h2>4. How allocation works (the code path)</h2>
+  <p><code>vllm/v1/core/kv_cache_utils.py</code> — when <code>VLLM_USE_BUDDY_BLOCK_POOL=1</code> and groups have
+  more than one distinct page size:</p>
+
+<pre><span class="c"># 1. Anchor the unit to the smallest ATTENTION page (not min of all groups).</span>
+attn_page_sizes = [g.page_size_bytes <span class="k">for</span> g <span class="k">in</span> groups <span class="k">if not</span> isinstance(g, MambaSpec)]
+base_page = <span class="f">min</span>(attn_page_sizes)
+
+<span class="c"># 2. Each group's chunk_order = ceil(log2(page / base_page)), so 2**order &gt;= ratio.</span>
+<span class="c">#    Groups with page &lt;= base_page collapse to 0 (they pad up by the gap).</span>
+<span class="k">for</span> g <span class="k">in</span> groups:
+    ratio = g.page_size_bytes / base_page
+    g.chunk_order = <span class="f">max</span>(<span class="s">0</span>, ceil(log2(ratio))) <span class="k">if</span> ratio &gt; <span class="s">1</span> <span class="k">else</span> <span class="s">0</span>
+    overhang = <span class="f">max</span>(overhang, g.page_size_bytes - base_page)
+
+<span class="c"># 3. num_blocks counts BASE units. One block_id per base page.</span>
+num_blocks = get_num_blocks(available_memory, base_page)
+
+<span class="c"># 4. Each layer-tuple slab = num_blocks * base_page, plus a tail overhang so the</span>
+<span class="c">#    strided read of a big (mamba) page at the last block_id stays in bounds.</span>
+tensor_size = base_page * num_blocks + max_overhang_bytes</pre>
+
+  <p>The address space is one <code>block_id</code> per base page. The buddy allocator hands out runs of
+  <code>2**chunk_order</code> contiguous base pages and merges them back on free
+  (<code>VLLM_BUDDY_MAX_ORDER</code> caps the largest run). Attention blocks are single base pages; a mamba block
+  is a power-of-two run that covers its state plus the padding gap.</p>
+
+  <h3>The page-size inversion fix (Option B)</h3>
+  <div class="callout warn">
+    <b>Bug:</b> at large user batch sizes the MLA page can grow <em>past</em> the mamba native page
+    (e.g. bs&nbsp;512: MLA 589,824&nbsp;B &gt; mamba 542,720&nbsp;B). An earlier version picked
+    <code>base_page = min(all pages)</code>, which then chose the <em>mamba</em> page and forced MLA to
+    chunk_order&nbsp;1 — breaking the uniform-stride requirement and crashing with an out-of-bounds
+    <code>setStorage</code>.<br><br>
+    <b>Fix:</b> anchor <code>base_page</code> to the smallest <em>attention</em> page and let mamba pad up.
+    Attention always lands at chunk_order&nbsp;0. This mirrors what baseline already does post-inflation
+    (larger natural page becomes the anchor, smaller side pads up) — buddy just applies it per-group instead
+    of globally.
+  </div>
+
+  <h2>5. Interaction with <code>mamba_cache_mode</code></h2>
+  <p>The mode controls how much of the mamba state is snapshotted for prefix reuse
+  (<code>MambaSpec.max_memory_usage_bytes</code>):</p>
+  <table>
+    <tr><th>Mode</th><th>Mamba block size</th><th>Mamba memory</th><th>What is prefix-cached</th></tr>
+    <tr><td><code>none</code></td><td>= max_model_len (1 block)</td><td>1 page / seq</td><td>nothing — state recomputed</td></tr>
+    <tr><td><code>align</code></td><td><b>forced = attn block</b></td><td><code>~2 pages / seq</code> (bounded)</td><td>attention KV only; mamba recomputed</td></tr>
+    <tr><td><code>all</code></td><td><b>coarse, chunk-aligned</b></td><td><code>cdiv(max_len, mamba_bs) &times; page</code></td><td>attention KV <b>and</b> mamba snapshots</td></tr>
+  </table>
+
+  <div class="callout">
+    <b>Why decoupling makes <code>all</code> usable.</b> In baseline, <code>all</code> still inflates the attn block
+    to ~512 (coupled) <em>and</em> grows the mamba snapshot pool — you pay more memory and still can't cache tiny
+    prompts. In buddy mode, attention stays at 64 (fine caching) while mamba snapshots at the coarse
+    <code>lcm(chunk_size, kernel_align)</code> boundary, and <code>--mamba-block-size</code> directly controls the
+    snapshot count <code>cdiv(max_len, mamba_bs)</code> — so you dial mamba memory down to whatever headroom the
+    attention pool can spare. Baseline has no such lever; both block sizes are welded together.
+  </div>
+
+  <h2>6. Net effect (measured)</h2>
+  <div class="kpi">
+    <div><b class="good">+36 pp</b><small>prefix-cache hit, tiny-prompt workload (attn now caches sub-512 prompts)</small></div>
+    <div><b>≈49&times;</b><small>more blocks at bs=64 (148,763 vs 3,003) for slightly less memory</small></div>
+    <div><b class="muted">≈ baseline</b><small>throughput at bs=512 (within run-to-run noise)</small></div>
+  </div>
+  <p class="note">The win is concentrated where baseline's coarse block size hurts — small prompts and
+  high prefix reuse. Where the working set already fits in baseline's coarse blocks, the two converge:
+  extra blocks are unused headroom, not extra hits.</p>
+
+  <div class="footer">
+    Source: <code>vllm/v1/core/kv_cache_utils.py</code> (allocation),
+    <code>vllm/platforms/interface.py</code> (block-size selection),
+    <code>vllm/v1/kv_cache_interface.py</code> (MambaSpec memory),
+    <code>vllm/v1/core/single_type_kv_cache_manager.py</code> (mamba prefix-cache hit logic).
+    Toggle: <code>VLLM_USE_BUDDY_BLOCK_POOL=1</code>, <code>VLLM_BUDDY_MAX_ORDER</code>.
+  </div>
+
+</div>
+</body>
+</html>
