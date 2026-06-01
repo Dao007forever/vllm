@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Expert Parallelism (EP) &mdash; vLLM Parallelism</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .moe-flow {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin: 14px 0;
+  }
+  .moe-stage {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .moe-stage.com { background: var(--red-soft); border-color: #e0b3ae; }
+  .moe-stage.com strong { color: var(--red); }
+  .moe-stage.exp { background: var(--blue-soft); border-color: #a6c8df; }
+  .moe-stage.exp strong { color: var(--blue); }
+  .expmap { display:grid; grid-template-columns: repeat(4, 1fr); gap:4px; margin: 10px 0;}
+  .expmap .er { padding: 8px 6px; border: 1px solid var(--border); border-radius: 6px; text-align:center; font-family: monospace; font-size: 0.82em; background: var(--panel); }
+  .expmap .er.r0 { border-left: 4px solid var(--blue); }
+  .expmap .er.r1 { border-left: 4px solid var(--green); }
+  .expmap .er.r2 { border-left: 4px solid var(--amber); }
+  .expmap .er.r3 { border-left: 4px solid var(--red); }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">parallelism/</a> &rsaquo; <strong>EP</strong> &mdash;
+    Expert Parallelism
+  </div>
+
+  <h1>Expert Parallelism (EP)</h1>
+  <p class="subtitle">
+    The right way to scale MoE models. Each rank owns a <em>subset of the
+    experts</em>, not a slice of every expert. Tokens travel to their chosen
+    expert's rank via All2All. Without EP, a 256-expert MoE wastes most of every
+    rank's memory on experts that won't be activated on this rank's tokens.
+  </p>
+
+  <section class="tldr">
+    <strong>One-line model</strong>
+    <p>
+      <em>TP shards a layer; EP shards an expert population.</em> An MoE block
+      with <code>E</code> experts and <code>EP=N</code> places <code>E/N</code>
+      experts on each rank. Tokens are routed by an All2All to their owners,
+      compute happens locally, and a reverse All2All combines results.
+    </p>
+  </section>
+
+  <div class="nav">
+    <ol>
+      <li><a href="#why">Why EP instead of TP for MoE</a></li>
+      <li><a href="#layout">Layout: where experts live</a></li>
+      <li><a href="#flow">The MoE forward, end to end</a></li>
+      <li><a href="#a2a">All2All backends</a></li>
+      <li><a href="#imbalance">The imbalance problem and EPLB</a></li>
+      <li><a href="#dp-coupling">EP + DP coupling</a></li>
+      <li><a href="#elastic">Elastic EP</a></li>
+      <li><a href="#config">Config and code pointers</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why">Why EP instead of TP for MoE</h2>
+
+  <p>
+    A typical MoE layer has many experts (e.g. DeepSeek-V3 has 256), but each
+    token activates only top-<code>k</code> (often <code>k=8</code>). So most of
+    the MLP weights are <em>not used</em> for any given token. There are two ways
+    to spread the work:
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <strong>TP over MoE (the naive way)</strong>
+      <p>
+        Shard every expert's MLP weights across <code>N</code> ranks
+        (column/row split). Every rank stores <code>1/N</code> of every expert.
+        Each token's chosen expert still runs on all <code>N</code> ranks
+        (one shard each).
+      </p>
+      <p>
+        Memory: <code>E &times; W / N</code> per rank.<br>
+        Comm: one AllReduce per token, per layer.<br>
+        Wasted FLOPs: every rank does work for every token, even ones whose
+        expert is "mostly idle" on this rank.
+      </p>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <strong>EP (the right way)</strong>
+      <p>
+        Give each rank <code>E/N</code> <em>whole</em> experts. Each token's
+        expert is on exactly one rank; that rank does the whole MLP for the
+        token.
+      </p>
+      <p>
+        Memory: <code>E &times; W / N</code> per rank (same).<br>
+        Comm: 2 All2All per layer instead of AllReduce.<br>
+        FLOPs: each token only computed once, on the right rank.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    The wins are <strong>FLOP efficiency</strong> (you don't activate experts that
+    no one routed to) and <strong>bandwidth shape</strong>: All2All bytes scale
+    with the number of <em>active</em> tokens, not the number of experts. AllReduce
+    over a TP'd MoE always pays for every expert.
+  </p>
+
+  <div class="callout info">
+    <strong>The set-MoE-on-fire test.</strong> With 256 experts and top-8, only
+    <code>~3%</code> of expert weights matter for any given token. TP can't tell
+    the difference; EP can. That's the whole reason EP exists.
+  </div>
+
+  <h2 id="layout">Layout: where experts live</h2>
+
+  <p>
+    The placement strategy is configurable
+    (<span class="fileref">expert_placement_strategy</span> in
+    <span class="fileref">parallel.py</span>:164):
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>linear (default)</h3>
+      <p>
+        Contiguous experts to contiguous ranks. With <code>E=8</code> and
+        <code>EP=4</code>:
+      </p>
+      <div class="expmap">
+        <div class="er r0">rank 0<br>e0, e1</div>
+        <div class="er r1">rank 1<br>e2, e3</div>
+        <div class="er r2">rank 2<br>e4, e5</div>
+        <div class="er r3">rank 3<br>e6, e7</div>
+      </div>
+      <p class="subtitle">
+        Good locality. Bad for models with expert-grouping patterns &mdash; if
+        adjacent experts get correlated activation, one rank becomes a hot spot.
+      </p>
+    </div>
+    <div class="box">
+      <h3>round_robin</h3>
+      <p>
+        Stride-N placement. With <code>E=8, EP=4</code>:
+      </p>
+      <div class="expmap">
+        <div class="er r0">rank 0<br>e0, e4</div>
+        <div class="er r1">rank 1<br>e1, e5</div>
+        <div class="er r2">rank 2<br>e2, e6</div>
+        <div class="er r3">rank 3<br>e3, e7</div>
+      </div>
+      <p class="subtitle">
+        Spreads grouped experts across ranks. Used for grouped-expert models like
+        Mixtral when EPLB is not enabled.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="flow">The MoE forward, end to end</h2>
+
+  <p>
+    Walk through a single MoE block on <code>EP=4</code>. Assume rank 0 starts
+    with batch <code>X_0</code> shape <code>[B/N, H]</code> (one DP shard's
+    worth of tokens), top-<code>k</code> = 2.
+  </p>
+
+  <div class="moe-flow">
+    <div class="moe-stage">
+      <strong>1. Router</strong> &mdash; local on each rank<br>
+      Linear projection <code>X_0 &middot; W_r</code> &rarr; gates
+      <code>[B/N, E]</code>. Top-<code>k</code> selection picks 2 expert IDs per
+      token. Routing decisions are local; no comm.
+    </div>
+    <div class="moe-stage com">
+      <strong>2. All2All Dispatch</strong><br>
+      Sort tokens by (chosen_expert &rarr; owning_rank). Build per-destination
+      buckets. <code>all_to_all_single</code> sends each token to its expert's rank.
+      <br>
+      <em>Volume per rank</em>: <code>(k &middot; B / N) &middot; H</code> &mdash;
+      independent of <code>E</code>.
+    </div>
+    <div class="moe-stage exp">
+      <strong>3. Expert MLP</strong> &mdash; local on each rank<br>
+      Each rank receives a bucketed batch <code>[T_local, H]</code> where
+      <code>T_local</code> is the sum of all incoming tokens for the
+      <code>E/N</code> experts it owns. Runs the standard MoE GEMM (often a fused
+      group-gemm kernel).
+    </div>
+    <div class="moe-stage com">
+      <strong>4. All2All Combine</strong><br>
+      Reverse dispatch: send each token's result back to its origin rank.
+      Multiply by the router's gating weight and sum the top-<code>k</code>
+      contributions (now collocated again).
+    </div>
+    <div class="moe-stage">
+      <strong>5. Residual + LayerNorm</strong> &mdash; local on each rank<br>
+      The output is added to the residual stream just like a dense MLP.
+    </div>
+  </div>
+
+  <p>
+    The total comm is two All2All per MoE layer, with payload proportional to
+    <code>k &times; B</code>, not <code>E</code> or any weight dimension. The
+    expert matmul itself is purely local.
+  </p>
+
+  <h2 id="a2a">All2All backends</h2>
+
+  <p>
+    vLLM supports several All2All implementations, picked via
+    <code>--all2all-backend</code>:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Backend</th><th>How it works</th><th>When to use</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>allgather_reducescatter</code> (default)</td>
+        <td>
+          Emulate All2All with AllGather followed by ReduceScatter. Pure NCCL,
+          no special build required.
+        </td>
+        <td>
+          The safe everywhere-fallback. Higher latency at scale but works on any
+          hardware NCCL works on.
+        </td>
+      </tr>
+      <tr>
+        <td><code>deepep_high_throughput</code></td>
+        <td>
+          DeepEP NVLink-optimized kernels. Bulk-tokens path, peer-to-peer with
+          IPC handles, no NCCL collective.
+        </td>
+        <td>
+          Single-node NVLink, large batches (prefill-heavy workloads). Highest
+          throughput.
+        </td>
+      </tr>
+      <tr>
+        <td><code>deepep_low_latency</code></td>
+        <td>
+          DeepEP RDMA-optimized for small messages. Fewer staging buffers, lower
+          per-token overhead.
+        </td>
+        <td>
+          Decode-heavy (small batches), multi-node with InfiniBand/RoCE.
+        </td>
+      </tr>
+      <tr>
+        <td><code>mori</code></td>
+        <td>AMD's MoE All2All kernels.</td>
+        <td>MI300-class hardware.</td>
+      </tr>
+      <tr>
+        <td><code>nixl_ep</code></td>
+        <td>NIXL / RIXL-based send-recv with staging buffers.</td>
+        <td>Disaggregated deployments using NIXL.</td>
+      </tr>
+      <tr>
+        <td><code>flashinfer_nvlink_{one,two}_sided</code></td>
+        <td>FlashInfer kernels for MN-NVL fabric (multi-node NVLink).</td>
+        <td>GB200/MN-NVL pods.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Source: <span class="fileref">vllm/config/parallel.py</span>:174-183 lists
+    the enum; <span class="fileref">vllm/distributed/device_communicators/all2all.py</span>
+    has the manager classes (<code>AgRsAll2AllManager</code>,
+    <code>DeepEPHTAll2AllManager</code>, etc.).
+  </p>
+
+  <h2 id="imbalance">The imbalance problem and EPLB</h2>
+
+  <p>
+    Real routers don't pick experts uniformly. Some experts get 3&times; more
+    tokens than others; some are essentially dead. The slow rank sets the pace,
+    so MoE throughput is limited by the <em>busiest</em> expert's rank.
+  </p>
+
+  <div class="callout warn">
+    <strong>The imbalance tax</strong>: with 256 experts and naive placement, the
+    99th-percentile load on the busiest rank can be 2&ndash;3&times; the average.
+    All other ranks idle, waiting for the slow one to finish its expert MLP.
+  </div>
+
+  <h3>EPLB: Expert-parallel load balancer</h3>
+
+  <p>
+    Set <code>enable_eplb=True</code> (requires <code>enable_expert_parallel=True</code>):
+  </p>
+
+  <ol>
+    <li>
+      Maintain online statistics of per-expert token counts.
+    </li>
+    <li>
+      Periodically re-compute a placement that flattens the histogram.
+    </li>
+    <li>
+      Migrate expert <em>weights</em> point-to-point using a separate
+      <code>EPLB</code> communication group (so it doesn't contend with the
+      forward-pass All2All). Backend is selectable:
+      <code>torch_nccl</code>, <code>torch_gloo</code>, <code>nixl</code>,
+      <code>pynccl</code>.
+    </li>
+    <li>
+      Update the routing table so future tokens hit the new owners.
+    </li>
+  </ol>
+
+  <p>
+    See <span class="fileref">vllm/distributed/eplb/</span>. The dedicated group
+    <code>_EPLB</code> is initialised alongside <code>_EP</code> in
+    <span class="fileref">parallel_state.py</span>.
+  </p>
+
+  <h2 id="dp-coupling">EP + DP coupling</h2>
+
+  <p>
+    EP scope = TP-group &times; DP-group, when both are enabled.
+    Reason: the All2All operates over the full set of tokens in flight, and that
+    set spans DP. The MoE forward pass is one of the few places where DP ranks
+    must coordinate (see <a href="DP.html#moe">DP &mdash; MoE coupling</a>).
+  </p>
+
+  <p>
+    The product determines the EP world size. For
+    <code>DP=16, TP=4</code> on DeepSeek-V3:
+  </p>
+
+  <pre><code>EP_world_size = DP &times; TP = 16 &times; 4 = 64
+experts_per_rank = E / EP_world_size = 256 / 64 = 4</code></pre>
+
+  <p>
+    Each of the 64 ranks owns 4 of the 256 experts. The All2All operates over
+    all 64 ranks; the AllReduce-style sync used by TP within a DP replica is
+    <em>not</em> active inside the MoE layer.
+  </p>
+
+  <h2 id="elastic">Elastic EP</h2>
+
+  <p>
+    <code>enable_elastic_ep=True</code> uses <em>stateless</em> NCCL groups for
+    DP/EP. The motivation: in a long-running serving deployment, you may need to
+    add or remove DP replicas at runtime (scale up under load, scale down at
+    night) without restarting the existing replicas.
+  </p>
+
+  <ul>
+    <li>
+      Group membership is published via a coordinator
+      (<span class="fileref">stateless_coordinator.py</span>), backed by a
+      TCPStore.
+    </li>
+    <li>
+      Workers re-form NCCL communicators on every membership change.
+    </li>
+    <li>
+      Requires <code>enable_eplb=True</code> because experts have to be
+      <em>migrated</em> to/from the joining/leaving rank.
+    </li>
+  </ul>
+
+  <h2 id="config">Config and code pointers</h2>
+
+  <pre><code># Basic EP for a MoE model
+vllm serve deepseek-ai/DeepSeek-V3 \
+  --tensor-parallel-size 4 \
+  --data-parallel-size 16 \
+  --enable-expert-parallel
+
+# With EPLB
+vllm serve ... \
+  --enable-expert-parallel \
+  --enable-eplb \
+  --all2all-backend deepep_high_throughput
+
+# Save disk I/O on load by only reading local expert weights
+vllm serve ... --enable-ep-weight-filter</code></pre>
+
+  <ul>
+    <li>
+      <span class="fileref">vllm/config/parallel.py</span>:151
+      &mdash; <code>enable_expert_parallel</code>, EPLB config,
+      <code>all2all_backend</code>, placement strategy.
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/parallel_state.py</span>:1267
+      &mdash; <code>_EP</code> group; <code>_EPLB</code> for migration traffic.
+    </li>
+    <li>
+      <span class="fileref">vllm/model_executor/layers/fused_moe/layer.py</span>:73
+      &mdash; <code>FusedMoE</code> top-level module that integrates router,
+      dispatch, expert MLP, and combine.
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/device_communicators/all2all.py</span>
+      &mdash; one manager class per backend, each implementing the same
+      dispatch/combine interface.
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/eplb/</span> &mdash; EPLB policy
+      and weight-migration code.
+    </li>
+  </ul>
+
+  <h2>Next</h2>
+
+  <p>
+    Read <a href="CP.html">CP.html</a> for context parallel (long-context
+    decode/prefill), or <a href="PP.html">PP.html</a> for pipeline parallel
+    (multi-node serving).
+  </p>
+
+</main>
+</body>
+</html>

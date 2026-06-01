@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MTP/EAGLE: need and shift in SWA retention</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  :root {
+    --ink: #191919;
+    --swa: #286a46;
+    --swa-soft: #e8f4ed;
+    --proof: #68498f;
+    --proof-soft: #f0eaf7;
+    --boundary: #1d5f8f;
+    --boundary-soft: #e8f2fa;
+    --skip: #d8d9d2;
+    --skip-text: #62645f;
+  }
+
+  .formula-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 8px;
+    margin: 16px 0;
+  }
+
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+
+  .stat strong {
+    display: block;
+    font-size: 1.25rem;
+    line-height: 1.2;
+  }
+
+  .stat span {
+    color: var(--muted);
+    font-size: 0.86em;
+  }
+
+  .chart {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin: 16px 0;
+    padding: 14px;
+    overflow-x: auto;
+  }
+
+  .chart h3 {
+    margin-top: 0;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 5px;
+  }
+
+  .segment-row {
+    display: grid;
+    grid-template-columns: repeat(15, minmax(52px, 1fr)) minmax(52px, 1fr);
+    gap: 5px;
+    min-width: 900px;
+    margin-top: 10px;
+  }
+
+  .block {
+    min-height: 76px;
+    border: 1px solid var(--skip);
+    border-radius: 6px;
+    background: #fafafa;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 7px 6px;
+    position: relative;
+  }
+
+  .block .id {
+    font-family: "SF Mono", Monaco, monospace;
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .block .range,
+  .block .note {
+    color: var(--skip-text);
+    font-size: 0.78em;
+    line-height: 1.25;
+  }
+
+  .block.cached {
+    background: var(--swa-soft);
+    border-color: #8fc2a3;
+  }
+
+  .block.proof {
+    background: var(--proof-soft);
+    border-color: #bca6d6;
+  }
+
+  .block.partial {
+    background: var(--amber-soft);
+    border-style: dashed;
+    border-color: #e3c88a;
+  }
+
+  .block.boundary-left {
+    box-shadow: inset 4px 0 0 var(--boundary);
+  }
+
+  .block.boundary-right {
+    box-shadow: inset -4px 0 0 var(--boundary);
+  }
+
+  .block.returned {
+    outline: 2px solid var(--boundary);
+    outline-offset: 2px;
+  }
+
+  .segment-labels {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(208px, 1fr));
+    gap: 20px;
+    min-width: 900px;
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 0.84em;
+    font-family: "SF Mono", Monaco, monospace;
+  }
+
+  .segment-labels span {
+    border-top: 2px solid var(--border);
+    padding-top: 5px;
+    text-align: center;
+  }
+
+  .axis {
+    display: grid;
+    grid-template-columns: repeat(17, minmax(49px, 1fr));
+    gap: 5px;
+    min-width: 900px;
+    margin-top: 8px;
+    color: var(--muted);
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.78em;
+  }
+
+  .axis span {
+    text-align: left;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    margin: 12px 0 0;
+    color: var(--muted);
+    font-size: 0.86em;
+  }
+
+  .key {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    display: inline-block;
+  }
+
+  .swatch.cached { background: var(--swa-soft); border-color: #8fc2a3; }
+  .swatch.proof { background: var(--proof-soft); border-color: #bca6d6; }
+  .swatch.boundary { background: var(--boundary-soft); border-color: var(--boundary); }
+  .swatch.skipped { background: #fafafa; }
+
+  .number-line {
+    min-width: 900px;
+    margin-top: 12px;
+  }
+
+  .track {
+    position: relative;
+    height: 80px;
+    border-bottom: 3px solid var(--ink);
+    margin: 0 10px;
+  }
+
+  .marker {
+    position: absolute;
+    bottom: -8px;
+    transform: translateX(-50%);
+    width: 2px;
+    height: 28px;
+    background: var(--ink);
+  }
+
+  .marker strong {
+    position: absolute;
+    top: 31px;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.82em;
+  }
+
+  .pin {
+    position: absolute;
+    bottom: 24px;
+    transform: translateX(-50%);
+    border-radius: 999px;
+    padding: 4px 9px;
+    font-size: 0.82em;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    background: var(--panel);
+  }
+
+  .pin.boundary {
+    color: var(--boundary);
+    border-color: #9fc3dd;
+    background: var(--boundary-soft);
+  }
+
+  .pin.proof {
+    color: var(--proof);
+    border-color: #bca6d6;
+    background: var(--proof-soft);
+  }
+
+  .pin.prompt {
+    color: var(--amber);
+    border-color: #e3c88a;
+    background: var(--amber-soft);
+  }
+
+  .comparison {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .comparison th:first-child,
+  .comparison td:first-child {
+    width: 22%;
+  }
+
+  .mini-code {
+    font-size: 0.9em;
+  }
+
+  @media (max-width: 860px) {
+    .formula-grid,
+    .stat-row {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    PRs:
+    <a href="https://github.com/vllm-project/vllm/pull/43447">#43447</a> (selective SWA retention) &middot;
+    <a href="https://github.com/vllm-project/vllm/pull/44082">#44082</a> (cache the MTP/EAGLE lookahead block) &middot;
+    <a href="https://github.com/vllm-project/vllm/pull/17137">#17137</a> (origin of the EAGLE drop)
+  </div>
+
+  <h1>MTP/EAGLE: <code>need</code> and <code>shift</code></h1>
+  <p class="subtitle">
+    A visual walk-through of why sparse SWA prefix-cache retention keeps a
+    wider tail when MTP/EAGLE is enabled. Parameters are adapted from the PR
+    test (<code>block_size=8</code>, <code>alignment_tokens=32</code>,
+    <code>retention_interval=0</code>, a <code>127</code>-token prompt), with
+    <code>sliding_window=16</code> so the window spans two blocks and the
+    tail-versus-anchor distinction is visible (the test itself uses
+    <code>sliding_window=8</code>, the degenerate one-block case).
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      MTP/EAGLE drafting heads take the target model's <em>hidden states</em> as
+      input, but the prefix cache only stores K/V &mdash; never hidden states.
+      So on a full cache hit the last block must be <em>recomputed</em> to
+      regenerate that hidden state, which means the cache hit has to give one
+      block back. Under sparse SWA retention you cannot simply lop the last
+      block off, because the returned hit must stay on an aligned boundary.
+      The fix is to match one extra block <em>past</em> the boundary and then
+      drop it: <code>need += 1</code> and <code>shift = 1</code>. The returned
+      prefix length is unchanged; a block was sacrificed to force the recompute.
+    </p>
+  </section>
+
+  <div class="stat-row">
+    <div class="stat"><strong>8</strong><span>SWA block size</span></div>
+    <div class="stat"><strong>32</strong><span>cache-hit alignment</span></div>
+    <div class="stat"><strong>16</strong><span>sliding window (2 blocks)</span></div>
+    <div class="stat"><strong>127</strong><span>prompt tokens</span></div>
+    <div class="stat"><strong>96</strong><span>latest replay boundary</span></div>
+  </div>
+
+  <div class="formula-grid">
+    <div class="box">
+      <h3>Normal SWA</h3>
+<pre class="mini-code"><code>need = cdiv(sliding_window - 1, block_size)
+     = cdiv(16 - 1, 8)
+     = 2
+
+shift = 0</code></pre>
+      <p>
+        Retain the two SWA blocks before each aligned replay boundary. A returned
+        96-token prefix needs the window tail ending at token 96 (blocks 10-11).
+      </p>
+    </div>
+
+    <div class="box">
+      <h3>MTP/EAGLE SWA</h3>
+<pre class="mini-code"><code>need = cdiv(sliding_window - 1, block_size) + 1
+     = 2 + 1
+     = 3
+
+shift = 1</code></pre>
+      <p>
+        Retain the two normal tail blocks plus one lookahead/proof block. Lookup
+        matches through token 104, then drops that extra block and returns 96.
+      </p>
+    </div>
+  </div>
+
+  <section class="callout info">
+    <strong>Reading the two knobs: <code>need</code> = width, <code>shift</code> = position</strong>
+    <p>
+      <code>need</code> is how many <em>contiguous cached blocks</em> must sit at
+      the match's right edge for the hit to count. SWA can only resume at a
+      position if the KV of the previous <code>sliding_window&nbsp;&minus;&nbsp;1</code>
+      tokens is still present, and that spans
+      <code>cdiv(sliding_window&nbsp;&minus;&nbsp;1, block_size)</code> blocks &mdash;
+      the <em>width</em> of the retained run. Here a 16-token window spans two
+      8-token blocks, so it is <code>2</code> (<code>cdiv(15, 8) = 2</code>); a
+      window equal to the block size would make it 1, and a 33-token window would
+      make it 4. EAGLE/MTP adds <code>+&nbsp;1</code> for the sacrificial block.
+    </p>
+    <p>
+      <code>shift</code> is <em>where</em> that run's right edge sits relative to
+      the aligned boundary: <code>0</code> puts it on the last block ending
+      <em>at</em> the boundary (<code>b11</code> &rarr; 96); <code>1</code> pushes
+      it one block <em>past</em> the boundary (<code>b12</code> &rarr; 104), which is
+      then dropped back to 96.
+    </p>
+  </section>
+
+  <section class="callout good">
+    <strong>So does SWA cache more blocks at the end? Yes &mdash; but the hit doesn't grow</strong>
+    <p>
+      Three things retain or store more under EAGLE/MTP: <code>need&nbsp;+=&nbsp;1</code>
+      keeps one extra block per boundary (<code>{b10,&nbsp;b11,&nbsp;b12}</code> instead of
+      <code>{b10,&nbsp;b11}</code>); <code>shift&nbsp;=&nbsp;1</code> places that extra block
+      <em>after</em> the boundary; and the coordinator writes it into the hash map
+      too, caching <code>aligned_num_computed_tokens&nbsp;+&nbsp;block_size</code>
+      for EAGLE groups so the lookahead block actually exists on replay.
+    </p>
+    <p>
+      What does <em>not</em> change is the returned prefix length. <code>b12</code>
+      is matched and then dropped, so the served hit is still 96 tokens in both
+      modes. The net is <strong>more blocks retained and stored, identical prefix
+      returned</strong> &mdash; the extra block exists only so the
+      drop-for-recompute can land back on an aligned boundary.
+    </p>
+  </section>
+
+  <h2>1. Why a block gets dropped at all</h2>
+
+  <p>
+    This is the piece that the <code>need</code>/<code>shift</code> arithmetic
+    hides. MTP and EAGLE are <strong>speculative-decoding drafters</strong>: a
+    small head runs on top of the target model and proposes the next few tokens
+    so they can be verified in one step. That head is autoregressive on the
+    target's <strong>last-layer hidden state</strong> &mdash; to draft the token
+    after position <code>t</code>, it needs the hidden state the target produced
+    <em>at</em> position <code>t</code>. (DeepSeek-style MTP heads behave the
+    same way for cache purposes, which is why they share this code path.)
+  </p>
+
+  <section class="callout bad">
+    <strong>The prefix cache does not store hidden states</strong>
+    <p>
+      A KV-cache block holds only the per-layer <em>keys and values</em> for its
+      tokens. It never holds the final hidden states that the drafting head
+      consumes. So when an entire prompt is served from cached K/V, the forward
+      pass that <em>would</em> have produced the seed hidden state never runs
+      &mdash; and the drafter has no input for its first proposal.
+    </p>
+  </section>
+
+  <p>
+    The fix (introduced in
+    <a href="https://github.com/vllm-project/vllm/pull/17137">#17137</a>) is to
+    shorten the cache hit by one block, forcing the model to recompute that
+    block's tokens on the next forward pass and regenerate their hidden states.
+    The original comment says it plainly:
+  </p>
+
+<pre class="mini-code"><code>if self.use_eagle and len(computed_blocks) &gt; 0:
+    # Drop the last matched block if (1) eagle is enabled and
+    # (2) there is a cache hit.
+    # This is to recompute the last block to get the required
+    # hidden states for eagle drafting head.
+    computed_blocks.pop()</code></pre>
+
+  <section class="callout info">
+    <strong>This is a different drop from the <code>num_tokens - 1</code> cap</strong>
+    <p>
+      <code>get_computed_blocks</code> already caps every hit at
+      <code>num_prompt_tokens - 1</code> so the last token is recomputed for its
+      <em>logits</em>. The EAGLE drop is an <em>additional</em> block sacrificed
+      for <em>hidden states</em>. The two coincide in lucky cases, but EAGLE must
+      guarantee the recompute regardless of where the prompt length lands.
+    </p>
+  </section>
+
+  <h2>2. Why SWA needs <code>shift</code>, not just a <code>pop()</code></h2>
+
+  <p>
+    For dense full attention the drop is trivial: every block is cached, so
+    <code>computed_blocks.pop()</code> just hands the last block back and the
+    block before it is still there. Sparse SWA retention breaks that, because of
+    two hard constraints that fight each other:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>The returned hit must land on an aligned boundary.</strong>
+      <code>allocate_slots</code> requires <code>num_computed_tokens</code> to be
+      block-aligned, and the coordinator only accepts hits that are a multiple
+      of <code>scheduler_block_size</code> (the <code>alignment_tokens</code>,
+      here 32). A hit ending at token 96 is legal; one ending at 88 is not.
+    </li>
+    <li>
+      <strong>A block must still be dropped</strong> to force the
+      hidden-state recompute (section 1).
+    </li>
+  </ol>
+
+  <p>
+    If SWA retained only the normal tail (<code>{b10, b11}</code>, ending at 96)
+    and then popped the last block, the hit would collapse to token 88 &mdash; no
+    longer aligned, so the coordinator throws the whole hit away. You would get a
+    <em>worse</em> result than not caching at all. The resolution is to do the
+    drop on a block that sits <em>past</em> the boundary:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong><code>shift = 1</code></strong> &mdash; match one block past the
+      aligned boundary, so the matched run's right edge is at token 104
+      (block <code>b12</code>), not 96.
+    </li>
+    <li>
+      <strong><code>need += 1</code></strong> &mdash; retain one extra block so
+      the real SWA tail (<code>{b10, b11}</code>) survives once the extra block is
+      dropped.
+    </li>
+    <li>
+      <strong>drop the extra block</strong> &mdash; pop <code>b12</code>. The
+      returned hit falls back exactly onto the aligned boundary, 96, and a block
+      was still sacrificed to trigger the recompute.
+    </li>
+  </ol>
+
+  <section class="callout warn">
+    <strong>The "0% prefix cache hit with MTP" bug</strong>
+    <p>
+      Matching past the boundary only works if that lookahead block was
+      <em>written into the prefix-cache hash map</em> in the first place. The
+      original SWA mask kept just the normal tail, so the boundary anchor
+      <code>b12</code> was never cached &mdash; the EAGLE match could never
+      complete its run to the anchor, and every replay silently dropped to a
+      0-token hit. That is the
+      literal symptom users saw with MTP enabled, fixed in
+      <a href="https://github.com/vllm-project/vllm/pull/44082">#44082</a>: the
+      coordinator bumps <code>num_tokens_to_cache</code> to
+      <code>aligned_num_computed_tokens + block_size</code> for EAGLE groups, and
+      the retention mask explicitly keeps the lookahead block. When
+      <code>sliding_window &le; alignment_tokens</code> that extra block lives at
+      the <em>next</em> segment's first position, which the plain SWA mask had
+      left uncached.
+    </p>
+  </section>
+
+  <section class="callout good">
+    <strong>&ldquo;If we drop it anyway, why cache it?&rdquo; &mdash; it is the anchor, not dead weight</strong>
+    <p>
+      The drop happens to the <em>match result</em>, not to the cache. The match
+      itself can only place its right edge on a block that is <em>physically
+      cached</em> &mdash; <code>find_longest_cache_hit</code> scans the hash map
+      for a contiguous run of cached blocks. <code>b12</code> is the block that
+      <em>starts at</em> the aligned boundary, so it is the only legal right-edge
+      anchor that leaves an aligned hit (96) after the pop. No cached
+      <code>b12</code>, no anchor.
+    </p>
+    <p>
+      And skipping it does not cost you one block &mdash; it costs you
+      <em>everything</em>. With <code>b12</code> absent the scan tries to anchor
+      on <code>b11</code>, but the alignment guard
+      (<code>post_pop_blocks * block_size % alignment_tokens != 0</code>: here
+      <code>88 % 32 &ne; 0</code>) refuses, because dropping <code>b11</code>
+      would leave a misaligned 88. No other run reaches <code>need</code>
+      contiguous blocks, so the hit collapses to <strong>0</strong> &mdash; the
+      bug above, not a graceful one-block haircut.
+    </p>
+    <p>
+      The irony: the replaying request never even <em>loads</em>
+      <code>b12</code>&rsquo;s KV. It is matched, then immediately popped, then
+      recomputed from 96 to regenerate hidden states. <code>b10</code> and
+      <code>b11</code> are the real tail whose KV the window actually reads;
+      <code>b12</code> serves only
+      as an <em>existence proof</em> in the hash map &mdash; &ldquo;the prefix
+      truly was computed through 104, so returning an aligned 96 and recomputing
+      from there is safe.&rdquo; The producer computed it anyway; retention just
+      declines to throw it away. One extra block held against eviction buys a
+      full aligned hit instead of zero.
+    </p>
+    <p>
+      Then why not make <code>b12</code> a <em>marker-only</em> anchor &mdash; a
+      hash entry with no stored KV &mdash; since it is dropped anyway? In the
+      sparse regime its KV genuinely is never read (the chart below proves it),
+      so a marker would in fact be <em>correct</em>. vLLM keeps a real block for
+      two mundane reasons, <em>not</em> because the data gets reused: first, the
+      cache has no &ldquo;hash without a block&rdquo; concept &mdash; the map is
+      <em>hash &rarr; physical block</em>, and &ldquo;found by hash&rdquo; means
+      &ldquo;data resident and pinned,&rdquo; so a phantom anchor would need a
+      parallel registry, its own eviction/refcount handling, would break that
+      invariant, and would not fit the free-queue ordering
+      <a href="https://github.com/vllm-project/vllm/pull/43447">#43447</a> relies
+      on; second, it is one block, trivial against <code>block_size = 256</code>
+      and million-token contexts.
+    </p>
+    <p>
+      Real <em>reuse</em> of the post-boundary block happens only in the
+      <em>dense</em> case (<code>alignment = block_size</code>, the common
+      non-hybrid setup), where there is no sparse mask at all: every block is
+      cached and the &ldquo;drop&rdquo; just pops the last contiguous one, so the
+      dropped block is an ordinary cached block that a longer hit will load. The
+      dedicated, never-loaded anchor is unique to the sparse hybrid regime this
+      page is about &mdash; there, storing it is about cache mechanics, not data
+      reuse. (An earlier draft of this page claimed the anchor doubles as a tail
+      for a later boundary; working the geometry out below shows that it cannot.)
+    </p>
+  </section>
+
+  <div class="chart">
+    <h3>Why the anchor is never a window tail (sparse regime)</h3>
+    <p style="margin: 4px 0 0; color: var(--muted); font-size: 0.86em;">
+      Same parameters as the rest of the page (<code>block_size = 8</code>,
+      <code>alignment_tokens = 32</code>, <code>sliding_window = 16</code> &rArr;
+      <code>need_base = 2</code>, EAGLE <code>need = 3</code>,
+      <code>shift = 1</code>, <code>per_segment = 4</code>), extended to a longer
+      replay so two boundaries &mdash; 96 and 128 &mdash; are visible.
+    </p>
+    <div class="segment-row" style="grid-template-columns: repeat(8, minmax(58px, 1fr)); min-width: 720px;" aria-label="Sparse SWA blocks 9 through 16">
+      <div class="block"><span class="id">b9</span><span class="range">72-79</span><span class="note">skip</span></div>
+      <div class="block cached"><span class="id">b10</span><span class="range">80-87</span><span class="note">tail for 96</span></div>
+      <div class="block cached boundary-right"><span class="id">b11</span><span class="range">88-95</span><span class="note">tail for 96</span></div>
+      <div class="block proof"><span class="id">b12</span><span class="range">96-103</span><span class="note">anchor 96, dropped</span></div>
+      <div class="block"><span class="id">b13</span><span class="range">104-111</span><span class="note">skip</span></div>
+      <div class="block cached"><span class="id">b14</span><span class="range">112-119</span><span class="note">tail for 128</span></div>
+      <div class="block cached boundary-right"><span class="id">b15</span><span class="range">120-127</span><span class="note">tail for 128</span></div>
+      <div class="block proof"><span class="id">b16</span><span class="range">128-135</span><span class="note">anchor 128, dropped</span></div>
+    </div>
+    <div class="legend">
+      <span class="key"><span class="swatch cached"></span>loaded window tail (KV read)</span>
+      <span class="key"><span class="swatch proof"></span>anchor &mdash; matched, dropped, never read</span>
+      <span class="key"><span class="swatch skipped"></span>not retained</span>
+    </div>
+  </div>
+
+  <p>
+    Each retained group is <code>need_base = 2</code> loaded tail blocks plus one
+    dropped anchor: <code>{b10, b11} + b12</code> for boundary 96 and
+    <code>{b14, b15} + b16</code> for boundary 128. A window tail always spans the
+    <code>need_base</code> blocks <em>ending</em> at an aligned boundary, while an
+    anchor sits one block <em>past</em> a boundary &mdash; in the gap between
+    groups (<code>b12</code>, the anchor for 96, is followed by the un-retained
+    <code>b13</code>, and is nowhere near the <code>{b14, b15}</code> tail for
+    128). The anchor of boundary <code>B</code> is block <code>B / block_size</code>;
+    for it to fall inside the tail of a later boundary <code>B&prime;</code> you
+    would need <code>B&prime; &minus; B &le; need_base &middot; block_size</code>.
+    But boundaries are <code>alignment = per_segment &middot; block_size</code>
+    apart, and sparse retention only happens when <code>need &lt; per_segment</code>
+    (i.e. <code>need_base + 1 &lt; per_segment</code>). Those two cannot both hold,
+    so <strong>no tail ever reaches an anchor</strong>: in the sparse regime the
+    anchor's KV is provably never loaded &mdash; it is retained purely to be
+    findable.
+  </p>
+
+  <h2>3. Why the latest replay boundary is 96</h2>
+
+  <p>
+    Exact prompt replay is capped at <code>num_prompt_tokens - 1</code>, then
+    rounded down to the cache-hit alignment:
+  </p>
+
+<pre><code>latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
+       = (127 - 1) // 32 * 32
+       = 126 // 32 * 32
+       = 96</code></pre>
+
+  <div class="chart">
+    <h3>Prompt timeline</h3>
+    <div class="number-line" aria-label="Prompt timeline from token 0 to token 128">
+      <div class="track">
+        <span class="marker" style="left: 0%;"><strong>0</strong></span>
+        <span class="marker" style="left: 25%;"><strong>32</strong></span>
+        <span class="marker" style="left: 50%;"><strong>64</strong></span>
+        <span class="marker" style="left: 75%;"><strong>96</strong></span>
+        <span class="marker" style="left: 81.25%;"><strong>104</strong></span>
+        <span class="marker" style="left: 99.2%;"><strong>127</strong></span>
+        <span class="marker" style="left: 100%;"><strong>128</strong></span>
+        <span class="pin boundary" style="left: 75%;">returned boundary: 96</span>
+        <span class="pin proof" style="left: 81.25%;">MTP/EAGLE match edge: 104</span>
+        <span class="pin prompt" style="left: 99.2%;">prompt end: 127</span>
+      </div>
+    </div>
+  </div>
+
+  <h2>4. Normal SWA: <code>need=2</code>, <code>shift=0</code></h2>
+
+  <p>
+    A 32-token aligned segment contains four 8-token SWA blocks. With a
+    16-token sliding window (two blocks), normal SWA needs the last two blocks
+    before each aligned boundary. For the 96-token boundary, those are blocks 10
+    and 11.
+  </p>
+
+  <section class="callout info">
+    <strong>Segment rule versus the PR test</strong>
+    <p>
+      The chart below shows the regular segment-boundary rule because it makes
+      <code>need=2</code> easy to see. In the PR test,
+      <code>retention_interval=0</code>, so only the replay-boundary exception
+      would run; for normal SWA that exception would retain just
+      <code>b10</code> and <code>b11</code>.
+    </p>
+  </section>
+
+  <div class="chart">
+    <h3>Normal sparse retention</h3>
+    <div class="segment-row" aria-label="Normal SWA retention blocks 0 through 15">
+      <div class="block"><span class="id">b0</span><span class="range">0-7</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b1</span><span class="range">8-15</span><span class="note">skip</span></div>
+      <div class="block cached"><span class="id">b2</span><span class="range">16-23</span><span class="note">tail for 32</span></div>
+      <div class="block cached boundary-right"><span class="id">b3</span><span class="range">24-31</span><span class="note">tail for 32</span></div>
+      <div class="block"><span class="id">b4</span><span class="range">32-39</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b5</span><span class="range">40-47</span><span class="note">skip</span></div>
+      <div class="block cached"><span class="id">b6</span><span class="range">48-55</span><span class="note">tail for 64</span></div>
+      <div class="block cached boundary-right"><span class="id">b7</span><span class="range">56-63</span><span class="note">tail for 64</span></div>
+      <div class="block"><span class="id">b8</span><span class="range">64-71</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b9</span><span class="range">72-79</span><span class="note">skip</span></div>
+      <div class="block cached returned"><span class="id">b10</span><span class="range">80-87</span><span class="note">tail for 96</span></div>
+      <div class="block cached boundary-right returned"><span class="id">b11</span><span class="range">88-95</span><span class="note">tail for 96</span></div>
+      <div class="block"><span class="id">b12</span><span class="range">96-103</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b13</span><span class="range">104-111</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b14</span><span class="range">112-119</span><span class="note">skip</span></div>
+      <div class="block partial"><span class="id">partial</span><span class="range">120-126</span><span class="note">not cached yet</span></div>
+    </div>
+    <div class="axis">
+      <span>0</span><span>8</span><span>16</span><span>24</span><span>32</span>
+      <span>40</span><span>48</span><span>56</span><span>64</span><span>72</span>
+      <span>80</span><span>88</span><span>96</span><span>104</span><span>112</span>
+      <span>120</span><span>128</span>
+    </div>
+    <div class="segment-labels">
+      <span>segment 0: 0-31</span>
+      <span>segment 1: 32-63</span>
+      <span>segment 2: 64-95</span>
+      <span>segment 3: 96-127</span>
+    </div>
+    <div class="legend">
+      <span class="key"><span class="swatch cached"></span>cached SWA tail</span>
+      <span class="key"><span class="swatch skipped"></span>not retained or not full</span>
+      <span class="key"><span class="swatch boundary"></span>aligned boundary</span>
+    </div>
+  </div>
+
+  <h2>5. MTP/EAGLE: <code>need=3</code>, <code>shift=1</code></h2>
+
+  <p>
+    MTP/EAGLE lookup asks SWA to prove one extra block after the returned
+    boundary. The returned hit is still 96 tokens, but the SWA match must
+    extend to 104 tokens. With <code>retention_interval=0</code> in the PR
+    test, the replay exception retains exactly blocks 10, 11, and 12. That is why
+    the replay tail is
+    <code>range(prompt_end_block - need, prompt_end_block)</code>.
+  </p>
+
+  <section class="callout info">
+    <strong>What changed from the regular segment rule?</strong>
+    <p>
+      With positive segment retention, the same <code>need=3</code>,
+      <code>shift=1</code> rule would retain triples such as
+      <code>b2+b3+b4</code>, <code>b6+b7+b8</code>, and <code>b10+b11+b12</code>.
+      The PR test sets <code>retention_interval=0</code>, so the chart below
+      focuses only on the latest replay triple: <code>b10+b11+b12</code>.
+    </p>
+  </section>
+
+<pre><code>prompt_end_block = latest // block_size + shift
+                 = 96 // 8 + 1
+                 = 13
+
+retained replay tail = range(prompt_end_block - need, prompt_end_block)
+                     = range(13 - 3, 13)
+                     = blocks 10, 11, and 12</code></pre>
+
+  <div class="chart">
+    <h3>MTP/EAGLE sparse retention</h3>
+    <div class="segment-row" aria-label="MTP EAGLE SWA retention blocks 0 through 15">
+      <div class="block"><span class="id">b0</span><span class="range">0-7</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b1</span><span class="range">8-15</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b2</span><span class="range">16-23</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b3</span><span class="range">24-31</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b4</span><span class="range">32-39</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b5</span><span class="range">40-47</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b6</span><span class="range">48-55</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b7</span><span class="range">56-63</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b8</span><span class="range">64-71</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b9</span><span class="range">72-79</span><span class="note">skip</span></div>
+      <div class="block cached returned"><span class="id">b10</span><span class="range">80-87</span><span class="note">tail for 96</span></div>
+      <div class="block cached boundary-right returned"><span class="id">b11</span><span class="range">88-95</span><span class="note">tail for 96</span></div>
+      <div class="block proof"><span class="id">b12</span><span class="range">96-103</span><span class="note">extra proof</span></div>
+      <div class="block"><span class="id">b13</span><span class="range">104-111</span><span class="note">skip</span></div>
+      <div class="block"><span class="id">b14</span><span class="range">112-119</span><span class="note">skip</span></div>
+      <div class="block partial"><span class="id">partial</span><span class="range">120-126</span><span class="note">not cached yet</span></div>
+    </div>
+    <div class="axis">
+      <span>0</span><span>8</span><span>16</span><span>24</span><span>32</span>
+      <span>40</span><span>48</span><span>56</span><span>64</span><span>72</span>
+      <span>80</span><span>88</span><span>96</span><span>104</span><span>112</span>
+      <span>120</span><span>128</span>
+    </div>
+    <div class="segment-labels">
+      <span>segment 0: not retained in this test</span>
+      <span>segment 1: not retained in this test</span>
+      <span>segment 2: replay tail for 96</span>
+      <span>segment 3: after replay boundary</span>
+    </div>
+    <div class="legend">
+      <span class="key"><span class="swatch cached"></span>normal SWA tail block</span>
+      <span class="key"><span class="swatch proof"></span>MTP/EAGLE proof block</span>
+      <span class="key"><span class="swatch skipped"></span>not retained or not full</span>
+    </div>
+  </div>
+
+  <h2>6. Compare the cache-hit result</h2>
+
+  <table class="comparison">
+    <thead>
+      <tr>
+        <th>Mode</th>
+        <th><code>need</code></th>
+        <th><code>shift</code></th>
+        <th>Blocks retained for the 96-token replay</th>
+        <th>Lookup behavior</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Normal SWA</td>
+        <td><code>2</code></td>
+        <td><code>0</code></td>
+        <td><code>b10</code> and <code>b11</code></td>
+        <td>Match ends at 96 tokens; returned hit is 96.</td>
+      </tr>
+      <tr>
+        <td>MTP/EAGLE SWA</td>
+        <td><code>3</code></td>
+        <td><code>1</code></td>
+        <td><code>b10</code>, <code>b11</code>, and <code>b12</code></td>
+        <td>Match extends to 104 tokens, then drops <code>b12</code>; returned hit is 96.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <section class="callout good">
+    <strong>The useful invariant</strong>
+    <p>
+      <code>shift</code> moves the right edge of the SWA match one block past
+      the aligned boundary. <code>need</code> widens the retained run so the
+      normal SWA tail is still present. Together they keep the extra proof
+      block without changing the final returned prefix length &mdash; so SWA
+      can hand back a block (the recompute that regenerates the drafter's seed
+      hidden state, section 1) while the returned hit still lands on a legal
+      aligned boundary. The proof block is the price SWA pays to satisfy the
+      same drop that full attention gets for free with a single
+      <code>pop()</code>.
+    </p>
+  </section>
+</main>
+</body>
+</html>

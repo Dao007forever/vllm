@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mooncake Direct Pipe Connector &mdash; vLLM Learning Notes</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">KV Cache</a> &middot;
+    <a href="index.html">Transfer</a> &middot;
+    <span>MOONCAKE_PIPE</span>
+  </div>
+
+  <h1>Mooncake Direct Pipe &mdash; P Pushes KV to D</h1>
+  <p class="subtitle">
+    The prefill worker invokes Mooncake's
+    <code>batch_transfer_sync_write</code> to write KV cache directly
+    into D's pre-registered GPU memory. FastAPI bootstrap server publishes
+    P workers; D queries, requests, P pushes.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      The direct Mooncake connector is the push counterpart to NIXL. D
+      first looks up P workers via an HTTP/JSON bootstrap server hosted
+      on P's global rank 0, then opens a ZMQ socket to a specific P
+      worker and sends a <code>MooncakeXferMetadata</code> containing
+      D's hostname, port, TP topology, and the destination block IDs.
+      P validates, plans, and writes KV directly into D's memory via
+      Mooncake RDMA. The transfer is a one-shot push from P to D; D
+      blocks waiting for the response and learns of completion via that
+      same ZMQ socket.
+    </p>
+  </section>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why-push">1. Why push, not pull</a></li>
+      <li><a href="#wire">2. The wire-level flow</a></li>
+      <li><a href="#bootstrap">3. The FastAPI bootstrap server</a></li>
+      <li><a href="#handshake">4. The ZMQ per-worker handshake</a></li>
+      <li><a href="#registration">5. Memory registration</a></li>
+      <li><a href="#xfer">6. The push transfer</a></li>
+      <li><a href="#completion">7. Completion via ZMQ response</a></li>
+      <li><a href="#failures">8. Timeouts &amp; failure modes</a></li>
+      <li><a href="#vs-nixl">9. How this differs from NIXL</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why-push">1. Why push, not pull</h2>
+
+  <p>
+    There's nothing wrong with push: it's how MPI-style accelerator
+    networks have shipped data for decades. The argument for push over
+    pull is that <strong>P knows when its KV is ready</strong>. With a
+    pull model, D has to either wait for an explicit "ready" signal from
+    P before issuing the READ, or speculatively READ and risk getting
+    half-written data. Push collapses those into one round-trip: D says
+    "here's where to put it", P writes when ready, P responds when done.
+  </p>
+
+  <p>
+    The wire call lives at
+    <span class="fileref">vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1365</span>:
+  </p>
+
+<pre><code>ret_value = self.engine.batch_transfer_sync_write(
+    remote_session, src_ptrs, dst_ptrs, lengths
+)
+</code></pre>
+
+  <p>
+    <code>remote_session</code> is <code>"{D_hostname}:{D_port}"</code>,
+    <code>src_ptrs</code> are P's GPU addresses, <code>dst_ptrs</code>
+    are D's GPU addresses. That's a clean RDMA write.
+  </p>
+
+  <h2 id="wire">2. The wire-level flow</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">Mooncake pipe end-to-end</div>
+<pre>
+P rank 0                      P worker                       D worker
+   |                             |                               |
+   | start FastAPI bootstrap     |                               |
+   |   on /register and /query   |                               |
+   |&lt;----- POST /register -------|  (each P worker reg's its     |
+   |  {engine_id, dp, tp, pp,    |   ZMQ socket addr at startup) |
+   |   addr=tcp://host:rand}     |                               |
+   |                             |                               |
+   |&lt;------------------ GET /query ----------------------------- |
+   |  return {dp -&gt; EngineEntry{tp/pp -&gt; worker_addr}}            |
+   |                                                              |
+   |                             |&lt;-- ZMQ REQ ------ recv -------|
+   |                             |    MooncakeXferMetadata {     |
+   |                             |      remote_hostname,         |
+   |                             |      remote_port,             |
+   |                             |      remote_tp_rank,          |
+   |                             |      remote_tp_size,          |
+   |                             |      req_blocks: {            |
+   |                             |        d_req_id: (xfer_id,    |
+   |                             |          local_block_ids)     |
+   |                             |      },                       |
+   |                             |      kv_caches_base_addr,     |
+   |                             |      block_lens               |
+   |                             |    }                          |
+   |                             |                                |
+   |                             | send_kv_to_decode():           |
+   |                             |   validate region lengths      |
+   |                             |   wait per-req until ready     |
+   |                             |   _build_transfer_params()     |
+   |                             |   _send_blocks() ---&gt; RDMA --&gt;-|--&gt; KV written to D's memory
+   |                             |                                |
+   |                             |-- ZMQ multipart ---&gt; send -----&gt;|
+   |                             |    MooncakeXferResponse {     |
+   |                             |      status,                  |
+   |                             |      ok_reqs, err_reqs        |
+   |                             |    }
+</pre>
+  </div>
+
+  <h2 id="bootstrap">3. The FastAPI bootstrap server</h2>
+
+  <p>
+    The direct Mooncake connector splits discovery from data transfer.
+    Discovery is a small FastAPI service that runs on P's global rank 0
+    (<span class="fileref">mooncake_utils.py:44-81</span>):
+  </p>
+
+<pre><code>class MooncakeBootstrapServer:
+    """
+    A centralized server running on the global rank 0 prefiller worker.
+    Prefiller workers register their connection info (IP, port, ranks) here.
+    """
+
+    def _register_routes(self):
+        self.app.post("/register")(self.register_worker)
+        self.app.get("/query", response_model=dict[int, EngineEntry])(self.query)
+</code></pre>
+
+  <p>
+    Each P worker, on startup, POSTs to <code>/register</code> with its
+    own engine ID, DP/TP/PP ranks, and the ZMQ socket it bound for data
+    transfer
+    (<span class="fileref">mooncake_connector.py:956</span>:
+    <code>await self.register_worker_with_bootstrap()</code>):
+  </p>
+
+<pre><code>class RegisterWorkerPayload(BaseModel):
+    engine_id: EngineId
+    dp_rank: int
+    tp_rank: int
+    pp_rank: int
+    addr: WorkerAddr             # e.g., "tcp://10.0.0.5:51234"
+</code></pre>
+
+  <p>
+    D workers GET <code>/query</code> to receive the full registry:
+    <code>dict[dp_rank, EngineEntry]</code> where
+    <code>EngineEntry.worker_addr</code> is
+    <code>dict[tp_rank, dict[pp_rank, addr]]</code>. Given a target (P
+    engine, TP rank, PP rank), D extracts the ZMQ address and goes
+    direct.
+  </p>
+
+  <div class="callout info">
+    <strong>Why a registry server, not ZMQ broadcast?</strong>
+    <p>
+      Two reasons. (1) DP &mdash; the registry handles many P DP groups
+      sharing a single bootstrap endpoint. (2) D may scale up after P
+      has started; D needs a way to <em>discover</em> the current P
+      population, not just receive notifications about it. A HTTP/JSON
+      registry is the lowest-common-denominator way to do that.
+    </p>
+  </div>
+
+  <h2 id="handshake">4. The ZMQ per-worker handshake</h2>
+
+  <p>
+    Each P worker (not just rank 0) opens its own ZMQ ROUTER socket and
+    registers that with the bootstrap server. The data plane handshake
+    is <strong>per worker pair</strong>: D connects directly to the P
+    worker it wants to talk to.
+  </p>
+
+  <p>
+    The sender listener
+    (<span class="fileref">mooncake_connector.py:942-979</span>) runs in
+    an asyncio event loop on a dedicated thread:
+  </p>
+
+<pre><code>sock = self.async_zmq_ctx.socket(zmq.ROUTER)
+self.side_channel_port = sock.bind_to_random_port(f"tcp://{self.hostname}")
+await self.register_worker_with_bootstrap()
+
+sender_tasks = [
+    asyncio.create_task(self._sender_worker(sock))
+    for _ in range(self.num_sender_tasks)
+]
+
+while True:
+    identity, metadata_bytes = await sock.recv_multipart()
+    await self.sender_worker_queue.put((identity, metadata_bytes))
+</code></pre>
+
+  <p>
+    Multiple sender tasks drain the queue concurrently and call
+    <code>send_kv_to_decode</code>, which is where the rest of the
+    handshake (validation, wait-for-ready, transfer) happens.
+  </p>
+
+  <p>
+    The metadata D sends is the
+    <code>MooncakeXferMetadata</code> msgspec struct
+    (<span class="fileref">mooncake_connector.py:254-264</span>):
+  </p>
+
+<pre><code>class MooncakeXferMetadata(msgspec.Struct, omit_defaults=True):
+    remote_hostname: str       # D's own hostname
+    remote_port: int           # D's Mooncake RPC port
+    remote_tp_size: int
+    remote_tp_rank: int
+    req_blocks: dict[ReqId, tuple[TransferId, list[list[int]]]]
+    kv_caches_base_addr: list[int]   # D's base addresses (destination)
+    block_lens: list[int]            # D's per-region block sizes
+</code></pre>
+
+  <p>
+    The notable line is <code>kv_caches_base_addr</code>: D ships its
+    <em>own</em> memory pointers to P. Combined with the per-request
+    <code>block_ids</code>, P has everything it needs to address D's
+    GPU memory. (This is also why D's memory must already be registered
+    with Mooncake on D's side &mdash; see next section.)
+  </p>
+
+  <h2 id="registration">5. Memory registration</h2>
+
+  <p>
+    Both P and D call <code>register_kv_caches</code>
+    (<span class="fileref">mooncake_connector.py:1388-1448</span>) at
+    worker startup:
+  </p>
+
+<pre><code>for layer_name, cache_or_caches in kv_caches.items():
+    for cache in cache_list:
+        base_addr = cache.data_ptr()
+        if base_addr in seen_base_addresses:
+            continue
+        seen_base_addresses.append(base_addr)
+        block_len = cache.stride(0) * cache.element_size()
+        kv_data_ptrs.append(base_addr)
+        kv_data_lens.append(self.num_blocks * block_len)
+
+ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
+</code></pre>
+
+  <p>
+    Two subtleties worth flagging:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Stride-based block length.</strong> The connector uses
+      <code>cache.stride(0) * cache.element_size()</code> rather than
+      the shape-based size. That's so RDMA reaches the last block's
+      padding region (relevant for DeepseekV4 MLA alignment). It always
+      matches or exceeds the logical size.
+    </li>
+    <li>
+      <strong>One registration covers both directions.</strong> A worker
+      doesn't register "send memory" and "receive memory" separately
+      &mdash; the same registration is used as <code>src_ptrs</code>
+      when this is P or as <code>dst_ptrs</code> when this is D.
+      <code>kv_both</code> workers therefore have everything they need
+      after a single call.
+    </li>
+  </ul>
+
+  <h2 id="xfer">6. The push transfer</h2>
+
+  <p>
+    When P receives <code>MooncakeXferMetadata</code> from D, it doesn't
+    transfer immediately. The KV blocks may not be ready yet &mdash; D's
+    worker-level handshake can reach P <em>before</em> P's scheduler has
+    finished writing the prefill KV and recorded the local block ids. So
+    P blocks on a per-request <code>ready</code> event rather than
+    transferring on arrival.
+    <code>send_kv_to_decode</code>
+    (<span class="fileref">mooncake_connector.py:1003-1173</span>)
+    couples two state machines:
+  </p>
+
+  <div class="callout info">
+    <strong>"Isn't prefill already done before D is contacted?"</strong>
+    <p>
+      In the reference proxy
+      (<span class="fileref">examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py:250-278</span>)
+      it is: <code>create_completion</code> fully drains the
+      <code>max_tokens=1</code> prefill response before it ever forwards
+      to a decode instance, so at the <em>HTTP level</em> P has finished
+      prefill by the time D's request exists, and this <code>ready</code>
+      wait is effectively a no-op. But the connector does not assume that
+      serialization. Two things make the wait necessary in general:
+      (1) "prefill HTTP response returned" is a different event from
+      "P's worker ran <code>request_finished()</code>, knows the block
+      ids, and confirmed the KV writes landed" &mdash; the worker-level
+      ZMQ handshake can race ahead of P's scheduler (see the two-path
+      <code>record_send_reqs</code> at
+      <span class="fileref">mooncake_connector.py:1698-1724</span>, whose
+      empty-<code>block_ids</code> branch handles exactly the case where
+      D's <code>MooncakeXferMetadata</code> arrived first); and (2) a
+      production proxy may dispatch to P and D concurrently to overlap
+      D's block allocation and handshake with P's prefill compute and cut
+      TTFT, in which case D's request genuinely arrives mid-prefill.
+    </p>
+  </div>
+
+  <ol>
+    <li>
+      For each D-requested transfer id, find the corresponding
+      <code>SendBlockMeta</code> in <code>self.reqs_need_send</code>.
+      That dict is populated by P's scheduler each step with the local
+      block ids for the prompt being prefilled. A
+      <code>SendBlockMeta</code> has an <code>asyncio.Event</code>
+      called <code>ready</code> that the scheduler sets when prefill
+      writes finish.
+    </li>
+    <li>
+      Await all <code>ready</code> events. As each fires, P builds the
+      transfer parameters (<code>_build_transfer_params</code>),
+      offloads <code>_send_blocks</code> to a ThreadPoolExecutor (CUDA
+      device-binding required, see
+      <code>_bind_sender_thread_device</code>), and pushes the response
+      back to D.
+    </li>
+  </ol>
+
+  <p>
+    The push itself is offloaded to a thread pool because
+    <code>batch_transfer_sync_write</code> is blocking
+    (<span class="fileref">mooncake_connector.py:1131-1138</span>):
+  </p>
+
+<pre><code>ret_value = await self.sender_loop.run_in_executor(
+    self._sender_executor,
+    self._send_blocks,           # the blocking RDMA call
+    remote_session,
+    src_ptrs,
+    dst_ptrs,
+    lengths,
+)
+</code></pre>
+
+  <p>
+    Each pool thread is initialized with
+    <code>_bind_sender_thread_device</code>
+    (<span class="fileref">mooncake_connector.py:1351-1355</span>) which
+    sets the CUDA device per thread &mdash; CUDA device selection is
+    thread-local, and without binding, NVLink transfers fail for TP
+    ranks &gt; 0.
+  </p>
+
+  <h2 id="completion">7. Completion via ZMQ response</h2>
+
+  <p>
+    After each batch of ready requests is sent, P pushes a
+    <code>MooncakeXferResponse</code> back over the same ZMQ multipart
+    socket
+    (<span class="fileref">mooncake_connector.py:1166-1172</span>):
+  </p>
+
+<pre><code>response = MooncakeXferResponse(
+    status=response_status,    # CONTINUE or FINISH
+    ok_reqs=[...],             # transferred successfully this batch
+    err_reqs=err_reqs or None,
+)
+await sock.send_multipart((identity, self._encoder.encode(response)))
+</code></pre>
+
+  <p>
+    Status semantics:
+  </p>
+
+  <ul>
+    <li>
+      <code>CONTINUE</code>: P is still waiting on other requests in the
+      D-batch. Expect another response later.
+    </li>
+    <li>
+      <code>FINISH</code>: All originally-requested D requests have been
+      handled (success or error). Stop expecting messages.
+    </li>
+    <li>
+      <code>ERROR</code>: A fatal error happened that affected the whole
+      batch (e.g., D's TP rank doesn't pair with this P).
+    </li>
+  </ul>
+
+  <p>
+    On D's side, the receiver thread
+    (<span class="fileref">mooncake_connector.py:1687-1729</span>) loops
+    on its ZMQ socket, decodes each response, and marks request IDs as
+    finished in <code>done_recving</code>.
+  </p>
+
+  <h2 id="failures">8. Timeouts &amp; failure modes</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>P waits too long for ready event</h3>
+      <p>
+        If a prefill stalls and the <code>SendBlockMeta.ready</code>
+        event never fires, the <code>asyncio.wait(...)</code> hits
+        <code>VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT</code> and P returns
+        a <code>FINISH</code> response with all pending IDs in
+        <code>err_reqs</code> and a "Timeout waiting for P side ready"
+        message
+        (<span class="fileref">mooncake_connector.py:1068-1085</span>).
+        D treats those as failed and recomputes.
+      </p>
+    </div>
+    <div class="box">
+      <h3>D's TP rank doesn't pair with this P</h3>
+      <p>
+        The TP mapping is consulted: P checks
+        <code>self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)</code>.
+        If D's rank isn't in the expected set, P immediately responds
+        with <code>ERROR</code>
+        (<span class="fileref">mooncake_connector.py:1007-1021</span>).
+        D logs and skips.
+      </p>
+    </div>
+    <div class="box">
+      <h3>RDMA write fails</h3>
+      <p>
+        <code>batch_transfer_sync_write</code> returns non-zero. P
+        records a failed-transfer stat
+        (<span class="fileref">mooncake_connector.py:1376-1385</span>)
+        and includes the request id in <code>err_reqs</code> in the
+        response. The error case is per-request, so other requests in
+        the same batch can still succeed.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Region length mismatch</h3>
+      <p>
+        Validation happens before any transfer
+        (<code>_validate_asymmetric_region_lengths</code>,
+        <span class="fileref">mooncake_connector.py:193-244</span>). If
+        the producer's region sizes don't match the consumer's under the
+        TP ratio, P refuses the whole batch with an
+        <code>ERROR</code> response. This catches misconfigured P/D
+        cluster pairs at handshake time rather than corrupting data.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="vs-nixl">9. How this differs from NIXL</h2>
+
+  <table>
+    <thead>
+      <tr><th>Aspect</th><th>NIXL</th><th>Mooncake pipe</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Initiator of wire transfer</td>
+        <td>D (READ)</td>
+        <td>P (WRITE)</td>
+      </tr>
+      <tr>
+        <td>Discovery</td>
+        <td>ZMQ ROUTER on a fixed side-channel port</td>
+        <td>FastAPI bootstrap server on rank 0 + per-worker ZMQ sockets</td>
+      </tr>
+      <tr>
+        <td>What D ships to P</td>
+        <td>(GET_META_MSG, target_tp_rank) &mdash; just queries metadata</td>
+        <td>Full <code>MooncakeXferMetadata</code> including D's memory pointers + block ids</td>
+      </tr>
+      <tr>
+        <td>Knows where to write</td>
+        <td>D, by reading from P</td>
+        <td>P, by writing into D's pointers</td>
+      </tr>
+      <tr>
+        <td>What handles ready-coordination</td>
+        <td>Lease + heartbeat; P waits for D's notif</td>
+        <td>P waits on <code>asyncio.Event</code>; aborts via timeout</td>
+      </tr>
+      <tr>
+        <td>Per-layer hooks used?</td>
+        <td>No (all-at-once)</td>
+        <td>No (all-at-once)</td>
+      </tr>
+      <tr>
+        <td>Threading</td>
+        <td>Polling in scheduler loop + ThreadPoolExecutor for handshake</td>
+        <td>asyncio event loop on dedicated thread + ThreadPoolExecutor for the blocking RDMA call</td>
+      </tr>
+      <tr>
+        <td>Failure surface</td>
+        <td>Lease expiry (P), <code>check_xfer_state</code> error (D)</td>
+        <td>Timeout (P), error in <code>MooncakeXferResponse</code> (D)</td>
+      </tr>
+      <tr>
+        <td>Best-suited for</td>
+        <td>Many small fan-outs to a stable P pool (heartbeat keeps things fresh)</td>
+        <td>Bursty P&rarr;D batches where P knows exactly when KV is ready</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout code-ref">
+    <strong>The "P knows ready" advantage in code</strong>
+    <p>
+      Look at <code>send_kv_to_decode</code>
+      (<span class="fileref">mooncake_connector.py:1054-1108</span>):
+      P uses <code>asyncio.FIRST_COMPLETED</code> to send each ready
+      request as it becomes available, while continuing to wait on the
+      rest. That granularity is harder to express in a pull model
+      &mdash; D would need P to signal each request individually as it
+      becomes ready, then issue READs piecemeal. Push collapses it into
+      "P sends as soon as it can, all in one connection."
+    </p>
+  </div>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Next: <a href="MOONCAKE_STORE.html">MOONCAKE_STORE.html</a> for the
+    other Mooncake mode that decouples P and D through a content-addressed
+    KV store. Or
+    <a href="PARALLELISM.html">PARALLELISM.html</a> for how TP ratios
+    work in detail.
+  </p>
+</main>
+</body>
+</html>

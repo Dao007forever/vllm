@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KV Cache Allocation &amp; Group Block IDs</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <a href="KV_CACHE_ALLOCATION.md">KV_CACHE_ALLOCATION.md</a>
+  </div>
+
+  <h1>KV Cache Allocation &amp; Group Block IDs</h1>
+  <p class="subtitle">
+    How vLLM groups KV-cache layers, why groups are shaped to have
+    uniform physical block sizes, and how logical block IDs map to
+    physical KV memory.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      A <em>group</em> is the equivalence class of layers that share a
+      KV-cache lifecycle. Each group has its own block table, but all
+      groups draw block IDs from one shared <code>BlockPool</code>.
+      The column-packed tensor layout turns that "global ID" into a
+      <em>physical</em> slot reused across groups &mdash; not just a
+      logical reservation label. Five constraints stack: lifecycle &rarr;
+      group separation &rarr; uniform layer count &rarr; uniform page
+      size &rarr; shared BlockPool &rarr; column packing.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#mental">Mental model</a></li>
+      <li><a href="#why-groups">Why groups exist at all</a></li>
+      <li><a href="#per-layer">Why not per-layer?</a></li>
+      <li><a href="#layer-data">How is layer-specific data wired?</a></li>
+      <li><a href="#one-giant">Why not one giant group?</a></li>
+      <li><a href="#uniform">Why groups need uniform physical block size</a></li>
+      <li><a href="#columns">The column-packing mechanism</a></li>
+      <li><a href="#byte-layout">Inside one block: byte layout</a></li>
+      <li><a href="#mamba-uniform">How Mamba/SSM fits the uniform-page invariant</a></li>
+      <li><a href="#nixl">How NIXL transfers SSM state (independent of the allocator)</a></li>
+      <li><a href="#why-columns">Why column packing vs per-group / per-layer</a></li>
+      <li><a href="#gemma">Gemma-3-style hybrid grouping</a></li>
+      <li><a href="#code">Code path: startup &rarr; groups &rarr; tensors &rarr; tables</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="mental">Mental model</h2>
+
+  <p>vLLM separates two ideas:</p>
+  <ul>
+    <li><strong>Logical block ID</strong>: an integer managed by the scheduler/block pool, such as <code>10</code>.</li>
+    <li><strong>Physical KV memory</strong>: the actual K/V tensor storage used by a specific layer or KV-cache group.</li>
+  </ul>
+
+  <p>
+    KV-cache groups have separate block tables, but their block IDs come
+    from one shared scheduler-side <code>BlockPool</code>. In the current
+    column-packed layout, that global ID is also a physical slot in the
+    preallocated KV-cache pool: block ID <code>10</code> means slot
+    <code>10</code> in each column tensor, not a group-local slot.
+  </p>
+
+  <div class="callout info">
+    <strong>Layout-dependent</strong>
+    In a hypothetical per-group physical layout, the scheduler could still
+    hand out globally unique logical IDs, but ID <code>10</code> would map
+    to <code>group_0_tensor[..., 10, ...]</code> or
+    <code>group_1_tensor[..., 10, ...]</code> &mdash; different byte
+    ranges. Column packing turns global uniqueness into <em>cross-group
+    physical-memory pooling</em>.
+  </div>
+
+  <p>For a hybrid model, one request may hold different block IDs in different groups:</p>
+<pre><code>group 0 table: [10, 11, 12]
+group 1 table: [13, 14, 15]
+group 2 table: [16, 17, 18]</code></pre>
+
+  <p>Inside a group, all layers share the same block table, but each layer has its own KV-cache tensor view:</p>
+<pre><code>group 1, layer 7,  block 13 -&gt; K/V memory for layer 7
+group 1, layer 13, block 13 -&gt; K/V memory for layer 13</code></pre>
+
+  <p>The actual key is effectively <code>(layer_name, block_id)</code>. The group selects the block table and attention metadata.</p>
+
+  <h2 id="why-groups">Why groups exist at all</h2>
+
+  <p>
+    Before "why must group blocks be uniform-sized" comes the prior
+    question: <strong>why have groups at all?</strong>
+  </p>
+
+  <p>
+    A group is the equivalence class of layers that share a KV-cache
+    lifecycle. Different attention types disagree about three things;
+    any one is enough to forbid sharing a block table:
+  </p>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>Eviction rule</h3>
+      <p>Full attention: K/V at position <code>p</code> available forever. SWA: free K/V at <code>p</code> once past <code>p + W</code>. Mamba: state checkpoints at block boundaries. One block table can encode one rule.</p>
+    </div>
+    <div class="box">
+      <h3>Scan direction</h3>
+      <p><code>FullAttentionManager.find_longest_cache_hit</code> walks L&rarr;R; <code>SlidingWindowManager</code> walks R&rarr;L; <code>MambaManager</code> walks R&rarr;L through state checkpoints. These fall out of attention-pattern correctness.</p>
+    </div>
+    <div class="box">
+      <h3>Block size</h3>
+      <p>Attention typically <code>block_size=16</code>. Mamba uses a different block size driven by SSM kernel state cadence. They cannot index into the same block table.</p>
+    </div>
+  </div>
+
+  <p>
+    The code shape mirrors this: each attention type gets its own
+    <code>SingleTypeKVCacheManager</code> subclass
+    (<code>FullAttentionManager</code>, <code>SlidingWindowManager</code>,
+    <code>ChunkedLocalAttentionManager</code>, <code>MambaManager</code>,
+    <code>CrossAttentionManager</code>) with its own
+    <code>find_longest_cache_hit</code> and <code>remove_skipped_blocks</code>.
+  </p>
+
+  <h2 id="per-layer">What about per-layer block tables instead?</h2>
+
+  <p>
+    It works but it's wasteful, because layers of the same attention type
+    have <em>identical</em> lifecycles. Sharing costs nothing semantically
+    and saves real GPU memory.
+  </p>
+
+  <div class="callout warn">
+    <strong>Why block tables live on GPU and why int32</strong>
+    The block table is a <code>(max_num_reqs, max_num_blocks_per_req)</code>
+    int32 tensor on GPU because Triton kernels read it directly via
+    <code>block_table_ptr</code>. Int32 because entries are <em>logical</em>
+    block IDs (indices in <code>[0, num_blocks)</code>), not memory addresses.
+    Even 60M blocks fits comfortably under 2&#179;&sup1; &asymp; 2.1B.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Asymmetry: int32 block table, int64 slot mapping</strong>
+<pre><code># block_table.py:357 (Triton kernel)
+tl.load(block_table_ptr + ...).to(tl.int64)
+# slot_id = block_id * block_size + offset, upcast to int64</code></pre>
+    Slot mapping is a per-token tensor (kilobytes), so int64's cost is
+    negligible and PyTorch's index-tensor API expects int64. The block
+    table is large (megabytes), so int32 saves real memory there.
+  </div>
+
+  <h3>Concrete numbers</h3>
+
+  <p>Typical production config: <code>max_num_reqs=512</code>, <code>max_model_len=131072</code>, <code>block_size=16</code>:</p>
+<pre><code>max_num_blocks_per_req = 131072 / 16 = 8192
+one table = 512 * 8192 * 4 bytes = 16 MiB on GPU</code></pre>
+
+  <p>An 80-layer model with per-layer tables would burn <code>80 &times; 16 MiB = 1.28 GiB</code> on metadata alone. With groups, that drops to one table per group (e.g., 6 tables for Gemma-3 hybrid &rarr; 96 MiB), a <strong>13&times; reduction</strong>.</p>
+
+  <p>At 1M context, per-layer table = 128 MiB, so 80 layers = 10 GiB before any K/V is stored. The savings ratio is <code>n_layers / n_groups</code> &mdash; most load-bearing on deep models with few group types.</p>
+
+  <h2 id="layer-data">How does layer-specific data work if metadata is shared?</h2>
+
+  <p>
+    Each group has one block table, one cache-hit walk result, one
+    slot-mapping tensor. But each layer still has its own K/V bytes. How?
+  </p>
+
+  <div class="callout good">
+    <strong>Metadata is logical, the K/V tensor is physical</strong>
+    Dispatch happens at the <code>forward()</code> call boundary, not
+    inside the kernel.
+  </div>
+
+  <p>When the model runner steps through layers:</p>
+  <ul>
+    <li>Layer L's <code>attn.forward()</code> is called with <strong>layer L's own <code>kv_cache</code> tensor</strong> (looked up via <code>kv_caches[layer_name]</code>).</li>
+    <li>The <code>attn_metadata</code> argument carries the <strong>group-shared</strong> <code>block_table</code> and <code>slot_mapping</code>.</li>
+  </ul>
+
+  <div class="callout code-ref">
+    <strong>Inside FlashAttention backend</strong>
+<pre><code># flash_attn.py:752
+key_cache, value_cache = kv_cache.unbind(0)   # layer-specific
+...
+flash_attn_varlen_func(
+    k=key_cache, v=value_cache,                # layer-specific
+    block_table=block_table,                   # group-shared
+    ...
+)</code></pre>
+    The kernel computes addresses as <code>kv_cache.data_ptr() + slot_id * stride</code>.
+    Slot ID is shared; data_ptr is layer-specific.
+  </div>
+
+<pre><code>slot_mapping (group):    [42,  43,  44, ...]   &lt;- shared across layers in group
+                          |
+                          v
+layer 7 forward(kv_cache=K_cache_7) &rarr; kernel writes K_cache_7[42], K_cache_7[43], ...
+layer 8 forward(kv_cache=K_cache_8) &rarr; kernel writes K_cache_8[42], K_cache_8[43], ...
+                          ^
+                       different physical tensors, same slot indices</code></pre>
+
+  <table>
+    <thead><tr><th>Group-level artifact</th><th>Per-layer counterpart at forward time</th></tr></thead>
+    <tbody>
+      <tr><td>Block table</td><td>The layer's own <code>kv_cache</code> tensor (via <code>kv_caches[layer_name]</code>)</td></tr>
+      <tr><td><code>find_longest_cache_hit</code> result</td><td>(No per-layer step &mdash; identical for all layers in group)</td></tr>
+      <tr><td><code>slot_mapping</code> tensor</td><td>The layer's own <code>kv_cache</code> tensor</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    This is also why <code>BlockHashWithGroupId</code> is keyed by
+    <code>group_id</code> rather than <code>layer_name</code>: layers
+    within a group cannot disagree about whether a prefix is cached.
+  </p>
+
+  <h2 id="one-giant">What about one giant group per attention type?</h2>
+
+  <p>
+    Within a single attention type, why subdivide (Gemma-3's 50 SWA
+    layers split into 5 groups of 10) instead of one giant SWA group?
+    The uniform-page-size constraint (next section) forces splitting an
+    attention type's layers into multiple groups when there are more
+    layers than the smallest other type.
+  </p>
+
+  <p>The hierarchy of reasons:</p>
+  <ol>
+    <li>Different attention types &rarr; must be different groups (lifecycle).</li>
+    <li>Same attention type, similar count &rarr; one group per type (sharing is free).</li>
+    <li>One group block-table entry is shared by every layer in that group, but each layer still needs its own K/V payload for that token block.</li>
+    <li>Same attention type, more layers than smallest type &rarr; split into equal-sized groups so block-pool slots stay uniform-sized.</li>
+    <li>Uniform group block size &rarr; one shared <code>BlockPool</code> can hand block IDs to any group.</li>
+    <li>One shared <code>BlockPool</code> plus per-group block tables &rarr; column-packed storage can share physical block slots across groups while keeping separate block tables for different cache lifecycles.</li>
+  </ol>
+
+  <h2 id="uniform">Why groups need uniform physical block size</h2>
+
+  <p>
+    vLLM's allocator wants a simple invariant: one block allocated from
+    the shared <code>BlockPool</code> corresponds to the same amount of
+    physical KV memory, regardless of which group uses it.
+  </p>
+
+  <p>
+    A group block is the allocation unit, so its physical size is
+    proportional to the number of layers in that group:
+  </p>
+<pre><code>group block bytes = layers_per_group * page_size_per_layer</code></pre>
+
+  <p>Suppose a model has 10 full-attention + 50 SWA layers. If only two groups:</p>
+<pre><code>Group 0: 10 full layers    Group 1: 50 SWA layers
+Group 0 block = KV memory for 10 layers
+Group 1 block = KV memory for 50 layers   (5x bigger!)</code></pre>
+
+  <div class="callout bad">
+    <strong>Why this breaks the scheduler</strong>
+    The scheduler could no longer ask "request needs 3 more blocks; do
+    we have at least 3 free blocks?" &mdash; it would need different-sized
+    chunks, fragmentation, per-group free capacity. Centralized scheduling
+    falls apart.
+  </div>
+
+  <p>vLLM's solution: split the 50 SWA layers into 5 groups of 10:</p>
+<pre><code>Group 0: 10 full layers
+Group 1..5: 10 SWA layers each
+1 block ~= KV memory for 10 layers</code></pre>
+
+  <div class="callout code-ref">
+    <strong>Code: the assumption is documented</strong>
+<pre><code># vllm/v1/core/kv_cache_utils.py
+# Physical memory per block: Must be the same across all KV cache groups.
+# Breaking this assumption is non-trivial due to memory fragmentation
+# concerns when allocating blocks of different sizes.</code></pre>
+  </div>
+
+  <p>This assumption ties to centralized scheduling. vLLM profiles memory once at startup, preallocates KV-cache tensors, and gives the scheduler a fixed logical block capacity.</p>
+
+  <h2 id="columns">The structural mechanism: shared column tensors</h2>
+
+  <p>The "fragmentation" framing is the consequence. The mechanism sits in the allocator at <code>_get_kv_cache_config_uniform_page_size</code>:</p>
+
+<pre><code># General case:
+# We will have group_size memory pools, each is shared by one layer from
+# each group. As layers of different groups have different block table,
+# they will use different parts of the shared Tensor.
+group_size = max(len(group.layer_names) for group in kv_cache_groups)
+page_size = get_uniform_page_size(...)
+num_blocks = get_num_blocks(vllm_config, group_size, available_memory, page_size)
+for i in range(group_size):
+    shared_by = []
+    for j in range(len(kv_cache_groups)):
+        if i &lt; len(kv_cache_groups[j].layer_names):
+            shared_by.append(kv_cache_groups[j].layer_names[i])
+    kv_cache_tensors.append(
+        KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+    )</code></pre>
+
+  <p>
+    <code>group_size</code> here is the number of <strong>layers per group</strong>
+    (not the number of groups). The outer loop iterates layer-slots
+    within a group; the inner loop walks across groups. Each
+    <code>KVCacheTensor</code> is shared by one layer from each group.
+  </p>
+
+  <p>For 30 layers in 6 groups of 5 layers each:</p>
+<pre><code>         slot 0   slot 1   slot 2   slot 3   slot 4
+Group 0: L5       L11      L17      L23      L29       &lt;- FULL
+Group 1: L0       L6       L12      L18      L24       &lt;- SWA
+Group 2: L1       L7       L13      L19      L25       &lt;- SWA
+Group 3: L2       L8       L14      L20      L26       &lt;- SWA
+Group 4: L3       L9       L15      L21      L27       &lt;- SWA
+Group 5: L4       L10      L16      L22      L28       &lt;- SWA
+         |---|    |---|    |---|    |---|    |---|
+       Tensor 0 Tensor 1 Tensor 2 Tensor 3 Tensor 4</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Column packing: 30 layers &rarr; 5 column tensors</div>
+    <div class="grid-2d" style="grid-template-columns: 80px repeat(5, 64px)">
+      <div class="lbl"></div>
+      <div class="lbl col">slot 0</div><div class="lbl col">slot 1</div><div class="lbl col">slot 2</div><div class="lbl col">slot 3</div><div class="lbl col">slot 4</div>
+
+      <div class="lbl row">G0 <span class="tag full">FULL</span></div>
+      <div class="cell sm full-grp">L5</div><div class="cell sm full-grp">L11</div><div class="cell sm full-grp">L17</div><div class="cell sm full-grp">L23</div><div class="cell sm full-grp">L29</div>
+
+      <div class="lbl row">G1 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L0</div><div class="cell sm swa-grp">L6</div><div class="cell sm swa-grp">L12</div><div class="cell sm swa-grp">L18</div><div class="cell sm swa-grp">L24</div>
+
+      <div class="lbl row">G2 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L1</div><div class="cell sm swa-grp">L7</div><div class="cell sm swa-grp">L13</div><div class="cell sm swa-grp">L19</div><div class="cell sm swa-grp">L25</div>
+
+      <div class="lbl row">G3 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L2</div><div class="cell sm swa-grp">L8</div><div class="cell sm swa-grp">L14</div><div class="cell sm swa-grp">L20</div><div class="cell sm swa-grp">L26</div>
+
+      <div class="lbl row">G4 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L3</div><div class="cell sm swa-grp">L9</div><div class="cell sm swa-grp">L15</div><div class="cell sm swa-grp">L21</div><div class="cell sm swa-grp">L27</div>
+
+      <div class="lbl row">G5 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L4</div><div class="cell sm swa-grp">L10</div><div class="cell sm swa-grp">L16</div><div class="cell sm swa-grp">L22</div><div class="cell sm swa-grp">L28</div>
+
+      <div class="lbl row"></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>0</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>1</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>2</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>3</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>4</sub></div>
+    </div>
+    <div class="diagram-caption">
+      Each column is one physical tensor of size <code>page_size &times; num_blocks</code>. Each row is one group's row of layers &mdash; <em>every</em> group contributes exactly one layer to <em>every</em> tensor. <strong>30 layers, 5 tensors</strong> &mdash; layer count drops out, block count stays the same.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Block ID 42, seen from three vantage points</div>
+    <div class="grid three">
+      <div class="box" style="border-left:4px solid var(--blue)">
+        <h4 style="margin-top:0;color:var(--blue)">Scheduler view</h4>
+        <p style="font-size:0.86em">Block 42 is a <code>KVCacheBlock</code> with <code>ref_cnt &ge; 1</code>. It's <em>currently held</em> by one group's block table.</p>
+      </div>
+      <div class="box" style="border-left:4px solid var(--violet)">
+        <h4 style="margin-top:0;color:var(--violet)">Physical view</h4>
+        <p style="font-size:0.86em">In <em>every</em> column tensor, byte offset <code>42 &times; page_size</code> is reserved for block 42. Tensor 0's bytes are for one layer; Tensor 1's for another. Same <em>index</em>, different bytes.</p>
+      </div>
+      <div class="box" style="border-left:4px solid var(--green)">
+        <h4 style="margin-top:0;color:var(--green)">Layer view</h4>
+        <p style="font-size:0.86em">L5 sees its bytes as <code>K, V</code> tensors of shape <code>[block_size, n_kv_heads, head_dim]</code>. L0 sees its own bytes the same way. No layer can see another layer's bytes.</p>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      "Block 42" is a <strong>row index</strong> shared across all column tensors &mdash; not a single physical address. Each tensor independently has a slot 42. The scheduler invariant (one holder at a time) ensures the row is consistent &mdash; whoever holds block 42 owns slot 42 in <em>all</em> column tensors at once.
+    </div>
+  </div>
+
+  <p>
+    Packing is column-major across the layer grid, but each physical
+    tensor is block-major: <code>column_tensor[block_id]</code>. The
+    <code>layer_slot</code> has already selected which column tensor this
+    layer uses. Every tensor has size <code>page_size * num_blocks</code>
+    and exactly <code>num_blocks</code> slots. A block ID <code>B</code>
+    means slot <code>B</code> in every tensor &mdash; no per-group offset
+    needed.
+  </p>
+
+  <h2 id="byte-layout">Inside one block: byte layout and per-layer reinterpretation</h2>
+
+  <p>A "block" in the column tensor is <code>page_size</code> bytes at offset <code>block_id * page_size</code>. The layout within those bytes is the layer's KV cache shape:</p>
+
+<pre><code>one block = page_size bytes
+          = [2, block_size, num_kv_heads, head_size] * dtype_bytes
+            ^   ^           ^             ^
+            |   |           |             head dim
+            |   |           number of KV heads (after TP/MQA/GQA)
+            |   token position within the block (0..block_size-1)
+            K vs V (unbind(0) splits these in flash_attn.py)</code></pre>
+
+  <div class="callout info">
+    <strong>Sharing is across groups, not within</strong>
+    A column tensor is shared by exactly one layer per group. Layers
+    within the same group are in different column slots &rarr; different
+    column tensors &rarr; different physical memory.
+  </div>
+
+<pre><code>column tensor 0 (raw allocation, page_size * num_blocks bytes):
+  offset 0           page_size       42*page_size      43*page_size
+  |&lt;- block 0     -&gt;|&lt;- block 1   -&gt;|...|&lt;- block 42 -&gt;|&lt;- block 43 -&gt;|...
+
+Block 42 (page_size bytes) &mdash; interpreted by each layer's view as:
+
+  L5's view  (group 0, FULL)  : [2, block_size, n_kv_heads, head_size]
+  L0's view  (group 1, SWA)   : [2, block_size, n_kv_heads, head_size]
+  L1's view  (group 2, SWA)   : [2, block_size, n_kv_heads, head_size]
+  ... (one view per layer in shared_by)</code></pre>
+
+  <p>
+    Each <code>kv_caches[layer_name]</code> is a
+    <code>.view(dtype).view(kv_cache_shape).permute(...)</code> of the same
+    raw bytes. PyTorch handles address arithmetic via strides; no copy.
+  </p>
+
+  <div class="callout good">
+    <strong>No collision because of the scheduler invariant</strong>
+    At any single moment, the global block ID 42 appears in <em>at most
+    one</em> group's block table. Block IDs are popped from one global
+    queue and ref-counted as held. Even though L5, L0, L1, L2, L3, L4
+    <em>could</em> all reference block 42, only one does at a time.
+  </div>
+
+  <p>
+    <strong>Within a group</strong>, every layer is in a <em>different</em>
+    column slot. For group 0 with 5 layers (L5, L11, L17, L23, L29), they
+    occupy slots 0..4 &rarr; Tensors 0..4 &rarr; five distinct allocations.
+    Block 42 in Tensor 0 (L5's storage) and block 42 in Tensor 1 (L11's
+    storage) are separate <code>page_size</code>-byte regions.
+  </p>
+
+  <h2 id="hybrid-example">Worked example: hybrid Full + SWA, with NULL blocks</h2>
+
+  <p>
+    The diagrams above show six full-attention column tensors in
+    abstract. Concrete numbers help see where NULL blocks come from and
+    why every group's block table is the same width. Here's a small
+    hybrid case &mdash; two groups, two layers each:
+  </p>
+
+  <div class="callout info">
+    <strong>Setup</strong>
+    <ul>
+      <li>4 layers, 2 groups, <code>group_size = 2</code> (2 column tensors)
+        <ul>
+          <li><strong>G1</strong> = {L1, L3} &mdash; Full attention <span class="tag full">FULL</span></li>
+          <li><strong>G2</strong> = {L2, L4} &mdash; SWA, <code>sliding_window = 8</code> <span class="tag swa">SWA</span></li>
+        </ul>
+      </li>
+      <li><code>block_size = 4</code>, request length = 16 tokens</li>
+    </ul>
+  </div>
+
+  <h3>Both groups' block tables are the same width</h3>
+
+  <p>
+    A 16-token request needs <code>16 / 4 = 4</code> logical blocks per
+    group. <strong>Both</strong> tables are 4 entries long &mdash; that's
+    the uniform-page-size invariant in action. The difference is what's
+    in the entries:
+  </p>
+
+<pre><code>positions:           0..3   4..7   8..11   12..15
+G1 (Full) table:  [   1      2      3        4   ]   &lt;- 16 tokens of K/V live
+G2 (SWA)  table:  [ NULL   NULL    5        6   ]   &lt;-  8 tokens of K/V live</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Hybrid block tables, same logical width, different storage</div>
+    <div class="diagram-row">
+      <span class="cell label">positions</span>
+      <div class="cell-row">
+        <div class="cell wide head">0..3</div>
+        <div class="cell wide head">4..7</div>
+        <div class="cell wide head">8..11</div>
+        <div class="cell wide head">12..15</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">G1 <span class="tag full">Full</span></span>
+      <div class="cell-row">
+        <div class="cell wide full-grp">blk 1</div>
+        <div class="cell wide full-grp">blk 2</div>
+        <div class="cell wide full-grp">blk 3</div>
+        <div class="cell wide full-grp">blk 4</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">G2 <span class="tag swa">SWA</span></span>
+      <div class="cell-row">
+        <div class="cell wide null">NULL</div>
+        <div class="cell wide null">NULL</div>
+        <div class="cell wide swa-grp">blk 5</div>
+        <div class="cell wide swa-grp">blk 6</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>Full attention &mdash; 16 tokens of live K/V</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>SWA &mdash; window of 8 ending at pos 15</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#f5f5f3;border-style:dashed"></span>NULL block &mdash; provably unreadable, no physical storage</div>
+    </div>
+    <div class="diagram-caption">
+      Block IDs <code>{1, 2, 3, 4}</code> and <code>{5, 6}</code> all come from the same global <code>BlockPool</code> &mdash; no two groups simultaneously hold the same ID. NULL slots stay in the table to keep its width matching G1's (uniform-page-size invariant), but no physical block is allocated for them.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Same request: where do positions 4 and 8 land in physical memory?</div>
+    <div class="grid-2d" style="grid-template-columns: 130px 90px 90px">
+      <div class="lbl"></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>0</sub> (slot 0)</div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>1</sub> (slot 1)</div>
+
+      <div class="lbl row">L1 <span class="tag full">G1 Full</span></div>
+      <div class="cell sm full-grp" style="min-width:88px">pos 4 &rarr; slot 8<br>pos 8 &rarr; slot 12</div>
+      <div class="cell sm null">&mdash;</div>
+
+      <div class="lbl row">L3 <span class="tag full">G1 Full</span></div>
+      <div class="cell sm null">&mdash;</div>
+      <div class="cell sm full-grp" style="min-width:88px">pos 4 &rarr; slot 8<br>pos 8 &rarr; slot 12</div>
+
+      <div class="lbl row">L2 <span class="tag swa">G2 SWA</span></div>
+      <div class="cell sm swa-grp" style="min-width:88px">pos 4 &rarr; PAD<br>pos 8 &rarr; slot 20</div>
+      <div class="cell sm null">&mdash;</div>
+
+      <div class="lbl row">L4 <span class="tag swa">G2 SWA</span></div>
+      <div class="cell sm null">&mdash;</div>
+      <div class="cell sm swa-grp" style="min-width:88px">pos 4 &rarr; PAD<br>pos 8 &rarr; slot 20</div>
+    </div>
+    <div class="diagram-caption">
+      <strong>T<sub>0</sub></strong> hosts L1 (G1) and L2 (G2); <strong>T<sub>1</sub></strong> hosts L3 and L4. L1 and L2 share the tensor but never collide &mdash; L1 uses slot 8 (block 2) for pos 4 while L2 has nothing there (PAD). At pos 8, L1 uses slot 12 (block 3) and L2 uses slot 20 (block 5) &mdash; same tensor, different rows. <strong>The global block-pool invariant is exactly what makes this collision-free.</strong>
+    </div>
+  </div>
+
+  <p>
+    G1 holds block IDs <code>{1, 2, 3, 4}</code>; G2 holds
+    <code>{5, 6}</code> plus two <code>null_block</code> sentinels.
+    All real IDs are drawn from the <em>same</em> global
+    <code>BlockPool</code> &mdash; the scheduler guarantees they don't
+    collide.
+  </p>
+
+  <p>
+    G2's first two table entries are NULL because the SWA layers' window
+    ends at position 15 and only reaches back to position 8. Positions
+    0..7 are <em>provably unreadable</em> by L2/L4, so the scheduler
+    refuses to back them with physical blocks. The NULL sentinels stay
+    in the table to keep the array the same width as G1's &mdash; they
+    are the SWA group's "this position has no storage" marker.
+  </p>
+
+  <h3>Slot-ID translation at the same logical positions</h3>
+
+  <p>The formula is identical across groups (it's just <code>block_id * block_size + offset</code>); only the table lookup differs:</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Token position</th>
+        <th>Group</th>
+        <th><code>block_index</code></th>
+        <th>Table entry &rarr; <code>block_id</code></th>
+        <th><code>slot_id</code></th>
+        <th>Outcome</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td rowspan="2">pos 8 (inside SWA window)</td>
+        <td>G1</td>
+        <td><code>8 // 4 = 2</code></td>
+        <td><code>table[2] = 3</code></td>
+        <td><code>3 * 4 + 0 = 12</code></td>
+        <td>L1, L3 write K/V at slot 12 of their column tensors</td>
+      </tr>
+      <tr>
+        <td>G2</td>
+        <td><code>2</code></td>
+        <td><code>table[2] = 5</code></td>
+        <td><code>5 * 4 + 0 = 20</code></td>
+        <td>L2, L4 write K/V at slot 20 of their column tensors</td>
+      </tr>
+      <tr>
+        <td rowspan="2">pos 4 (outside SWA window)</td>
+        <td>G1</td>
+        <td><code>1</code></td>
+        <td><code>table[1] = 2</code></td>
+        <td><code>2 * 4 + 0 = 8</code></td>
+        <td>L1, L3 write at slot 8</td>
+      </tr>
+      <tr>
+        <td>G2</td>
+        <td><code>1</code></td>
+        <td><code>table[1] = NULL</code></td>
+        <td><code>PAD_SLOT_ID = -1</code></td>
+        <td>L2, L4 skip the write (kernel honors <code>-1</code> as "don't touch")</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>What this example demonstrates</strong>
+    <ol>
+      <li><strong>Block tables are the same size across groups</strong> &mdash; both are 4 entries long. This is what makes one global slot-mapping kernel work for all groups (just swap the table pointer per group, same formula).</li>
+      <li><strong>NULL entries are the SWA group's way of saying "no physical storage here."</strong> They translate to <code>PAD_SLOT_ID</code> in the slot mapping and the attention kernel skips them. See <a href="KV_CACHE_ASSUMPTIONS.html#k4">KV_CACHE_ASSUMPTIONS &sect;4</a>.</li>
+      <li><strong>Block IDs come from one global pool.</strong> G1's {1, 2, 3, 4} and G2's {5, 6} were popped from a single <code>FreeKVCacheBlockQueue</code>. No two groups simultaneously hold the same block ID &mdash; that's the scheduler invariant that lets column packing share physical memory across groups.</li>
+      <li><strong>L1's slot 8 and L3's slot 8 are in different physical tensors.</strong> L1 lives at column slot 0 of G1, L3 at column slot 1 of G1 &rarr; different column tensors. L1 and L2 (different groups) <em>might</em> share a column tensor, but L1 holds block ID 2 there and L2 holds block ID 5 there &rarr; different slot IDs, no collision.</li>
+    </ol>
+  </div>
+
+  <p>
+    In code, the NULL sentinel translates to a flag on the
+    <code>KVCacheBlock</code> object (<code>is_null=True</code>) and the
+    scheduler invariant is enforced by the global
+    <code>FreeKVCacheBlockQueue</code> &mdash; an ID is either on the
+    free queue or in exactly one group's table at any moment, never both.
+  </p>
+
+  <h2 id="mamba-uniform">How Mamba/SSM layers fit the uniform-page invariant</h2>
+
+  <p>
+    SWA was the easy hybrid case: it still stores per-token K/V, just with
+    a shorter lifetime. Mamba (and GatedDeltaNet / GDN, RWKV, other linear
+    attentions) is the hard case &mdash; its &ldquo;cache&rdquo; isn't K/V at
+    all. A Mamba layer keeps two small <em>recurrent state</em> tensors per
+    request (see <a href="MAMBA.html">MAMBA.html</a>):
+  </p>
+
+  <ul>
+    <li><strong>conv_state</strong> &mdash; the rolling depthwise-conv window, shape <code>~(d_inner, d_conv&minus;1)</code>.</li>
+    <li><strong>ssm_state</strong> &mdash; the recurrent summary, shape <code>~(d_inner, d_state)</code>.</li>
+  </ul>
+
+  <p>
+    Their summed byte size is the Mamba layer's natural
+    <code>page_size_bytes</code> &mdash; and it has nothing to do with
+    <code>block_size</code>, because a Mamba block isn't &ldquo;16 tokens of
+    K/V,&rdquo; it's <em>one snapshot of state</em>. Left alone, that page
+    would be a different size than an attention page, which would break the
+    one-block-is-one-uniform-size invariant the shared <code>BlockPool</code>
+    depends on (&sect;<a href="#uniform">Why groups need uniform physical block
+    size</a>).
+  </p>
+
+  <div class="callout good">
+    <strong>The fix: pad the Mamba page up to the attention page</strong>
+    vLLM first raises the attention <code>block_size</code> until one
+    attention page is at least as large as one Mamba state page, then pads
+    the Mamba page with dead bytes so the two are <em>exactly</em> equal.
+    After that, a Mamba block and an attention block are byte-for-byte the
+    same allocation unit &mdash; the BlockPool can't tell them apart.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Code: alignment + padding</strong>
+<pre><code># vllm/platforms/interface.py (verify_and_update_config path)
+# 1. Force attention block_size up so attn_page &ge; mamba_page:
+attn_block_size = kernel_block_alignment_size * cdiv(
+    mamba_page_size, kernel_block_alignment_size * attn_page_size_1_token)
+...
+# 2. Pad the mamba page to *exactly* the attention page:
+attn_page_size = cache_config.block_size * attn_page_size_1_token
+assert attn_page_size &gt;= mamba_page_size
+if attn_page_size != mamba_page_size:
+    cache_config.mamba_page_size_padded = attn_page_size   # &lt;- the pad</code></pre>
+    <code>MambaSpec.page_size_bytes</code> returns
+    <code>page_size_padded</code> when set, so every consumer downstream
+    (allocator, model runner, connector) sees the padded, attention-equal
+    size. The padding percentage is logged at startup.
+  </div>
+
+  <h3>One block per request, not one per 16 tokens</h3>
+
+  <p>
+    Uniform page size makes a Mamba block <em>cost</em> the same as an
+    attention block, but a request needs far fewer of them. How many depends
+    on <code>mamba_cache_mode</code>
+    (<code>MambaSpec.max_memory_usage_bytes</code>):
+  </p>
+
+  <table>
+    <thead><tr><th>Mode</th><th>Blocks per request</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>"none"</code> (default)</td><td><code>1 + num_spec</code></td><td>One live state snapshot; no prefix reuse.</td></tr>
+      <tr><td><code>"align"</code></td><td><code>2 + num_spec</code></td><td>Snapshot + one aligned checkpoint.</td></tr>
+      <tr><td><code>"all"</code></td><td><code>cdiv(max_len, block) + num_spec</code></td><td>Full prefix caching of checkpoints.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>conv_state and ssm_state are two views of one buffer</h3>
+
+  <p>
+    Per layer, the allocator hands out <em>one</em> contiguous raw tensor of
+    <code>num_blocks &times; page_size_bytes</code>. conv_state and ssm_state
+    are not separate allocations &mdash; they are two
+    <code>torch.as_strided</code> views into that single buffer at different
+    storage offsets:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: striding two states out of one tensor</strong>
+<pre><code># vllm/v1/worker/gpu_model_runner.py (initialize_kv_cache_tensors)
+elif isinstance(kv_cache_spec, MambaSpec):
+    raw_tensor = kv_cache_raw_tensors[layer_name]   # ONE buffer
+    storage_offset_bytes = 0
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        tensor = torch.as_strided(raw_tensor.view(dtype), ...,
+                                  storage_offset=storage_offset_bytes // dtype_size)
+        state_tensors.append(tensor)
+        storage_offset_bytes += stride[0] * dtype_size
+    kv_caches[layer_name] = state_tensors            # [conv_view, ssm_view]</code></pre>
+  </div>
+
+  <div class="callout info">
+    <strong>The trade vLLM is making</strong>
+    A few percent of padding, on a handful of Mamba layers each holding one
+    block per request, is cheap. The alternative &mdash; giving Mamba its own
+    physical pool with its own page size &mdash; would re-introduce the
+    differently-sized-blocks fragmentation the uniform invariant exists to
+    avoid, and would statically strand memory between the attention and
+    Mamba pools. Padding pushes the waste onto the side where it costs least.
+  </div>
+
+  <h2 id="nixl">How NIXL transfers SSM state (independent of the allocator)</h2>
+
+  <div class="callout warn">
+    <strong>Uniform page size is <em>not</em> what makes SSM transferable</strong>
+    It's tempting to think the <code>mamba_page_size_padded</code> trick is
+    what lets the NIXL connector move SSM state. It isn't. The padding is a
+    <em>BlockPool / column-packing</em> concern, applied in platform config
+    for <em>any</em> hybrid model regardless of whether a connector is
+    attached. NIXL operates on whatever physical tensors the allocator
+    produced and would work just as well under a per-group allocator.
+  </div>
+
+  <p>
+    NIXL registers each layer's physical buffer as its own region and tracks
+    a <strong>per-layer</strong> block length &mdash; it is explicitly built
+    for SSM and attention layers having <em>different</em> page sizes and
+    <em>different</em> block counts. Mamba layers carry
+    <code>_logical_num_blocks</code> while attention layers carry
+    <code>num_blocks</code>, and a <code>_physical_blocks_per_logical_kv_block</code>
+    ratio reconciles them.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: per-layer block lengths, not a global page size</strong>
+<pre><code># vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py (register_kv_caches)
+# "physical page_size may differ when kernel requires a specific block size.
+#  This leads to SSM and FA layers having different num_blocks.
+#  `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this."
+self.block_len_per_layer = list[int]()      # &lt;- one entry per layer
+...
+num_blocks = (self._logical_num_blocks       # mamba: fewer, larger blocks
+              if isinstance(layer_spec, MambaSpec)
+              else self.num_blocks)          # attention: more, smaller blocks</code></pre>
+  </div>
+
+  <p>What <em>is</em> true and worth knowing about SSM transfer:</p>
+
+  <div class="callout good">
+    <strong>One physical region per Mamba layer, logically doubled</strong>
+    <ul>
+      <li>Each Mamba layer's contiguous buffer is registered as its <em>own</em> NIXL region (its own base address), distinct from every attention region. Descriptors are partitioned: attention (&ldquo;FA&rdquo;) descriptors first, SSM descriptors after.</li>
+      <li>conv+ssm are registered as a <em>single</em> region, then logically split in two so conv and ssm can be transferred/indexed independently &mdash; mirroring the &ldquo;one buffer, two views&rdquo; allocation above.</li>
+    </ul>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Code: SSM region registration</strong>
+<pre><code># vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py (register_kv_caches)
+if self.transfer_topo.virtually_split_kv_in_blocks:
+    # ... for Mamba layers, we register SSM+Conv as a single region and
+    # then duplicate it logically to be able to index SSM/Conv separately.
+    self.num_regions *= 2</code></pre>
+  </div>
+
+  <p>Two SSM-specific constraints the connector enforces:</p>
+  <ul>
+    <li><strong>No cross-layer block layout.</strong> <code>NixlConnector.prefer_cross_layer_blocks</code> returns <code>False</code> as soon as any group is a <code>MambaSpec</code> (<code>nixl/connector.py</code>) &mdash; hybrid SSM models don't yet support that packing.</li>
+    <li><strong>Heterogeneous TP (P-TP &ne; D-TP)</strong> splits the conv state into sub-projections for a fine-grained &ldquo;3-read&rdquo; RDMA transfer, which requires the DS conv-state layout (<code>VLLM_SSM_CONV_STATE_LAYOUT=DS</code>); see <code>ssm_conv_transfer_utils.py</code>.</li>
+  </ul>
+
+  <p>
+    What NIXL actually depends on is unrelated to the uniform-page invariant:
+    each region's byte layout (block length, block count) must be known, and
+    producer and consumer must agree on it &mdash; enforced by a compatibility
+    hash, plus an &ldquo;all regions same total size&rdquo; assertion on the
+    non-MLA path. Those hold under either allocation strategy. See
+    <a href="transfer/NIXL.html">transfer/NIXL.html</a> for the connector
+    internals.
+  </p>
+
+  <h2 id="why-columns">Why column packing instead of per-group or per-layer</h2>
+
+  <p>The same total memory could be cut three ways:</p>
+
+  <table>
+    <thead><tr><th>Layout</th><th># tensors</th><th>Per-tensor size</th></tr></thead>
+    <tbody>
+      <tr><td>Per-layer</td><td>30</td><td><code>page_size * num_blocks_per_layer</code></td></tr>
+      <tr><td>Per-group</td><td>6</td><td><code>page_size * 5 * num_blocks_per_group</code></td></tr>
+      <tr><td>Column (current)</td><td>5</td><td><code>page_size * num_blocks</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>The columns layout is chosen because:</p>
+
+  <ol class="steps">
+    <li>
+      <strong>The global <code>BlockPool</code> is physically pooled, not just globally named.</strong>
+      <p>
+        Each column tensor has <code>num_blocks</code> slots, and a block
+        ID <code>B</code> means slot <code>B</code> in every column. The
+        scheduler can pop block IDs from one queue and hand any of them
+        to any group. In per-group, a globally unique ID would still be
+        just a logical label &mdash; <code>B</code> in group 0 vs group 1
+        would be different byte ranges. Every private tensor would need
+        to reserve the full ID-range as slots even if its working set
+        is much smaller.
+      </p>
+    </li>
+    <li>
+      <strong>Layer view shape stays kernel-friendly.</strong>
+      <p>
+        With column packing, each layer's view is
+        <code>[num_blocks, 2, block_size, num_kv_heads, head_size]</code>,
+        indexed directly by block ID &mdash; what FlashAttention expects.
+        Per-group layout would produce
+        <code>[num_blocks, layers_per_group, ...]</code> and force every
+        backend to take an extra layer-index argument.
+      </p>
+    </li>
+    <li>
+      <strong>Layers sharing a block table want separate buffers.</strong>
+      <p>
+        All 5 layers in group 0 share group 0's block table, so when group
+        0 holds block ID <code>B</code>, all 5 write to slot <code>B</code>.
+        They cannot share a tensor without colliding. Layers from
+        different groups always hold different block IDs (scheduler
+        invariant), so they <em>can</em> share a tensor. The column axis
+        is exactly the axis that can collapse into shared storage.
+      </p>
+    </li>
+    <li>
+      <strong>Padding for uneven groups is cheap.</strong>
+      <p>
+        The <code>if i &lt; len(kv_cache_groups[j].layer_names)</code>
+        guard lets the last column be shared by fewer layers when groups
+        have unequal sizes (e.g., 13 FULL + 12 SWA padded to
+        <code>group_size=13</code>).
+      </p>
+    </li>
+    <li><strong>Fewer allocations.</strong> 5 large vs 30 small. Secondary, but consistent.</li>
+  </ol>
+
+  <h2 id="gemma">Gemma-3-style hybrid grouping</h2>
+
+  <p>Gemma-3-style models commonly use a repeated pattern like:</p>
+<pre><code>SWA, SWA, SWA, SWA, SWA, FULL</code></pre>
+
+  <p>For <code>N</code> repetitions: <code>5N</code> SWA + <code>N</code> full-attention layers.</p>
+
+  <div class="callout warn">
+    <strong>vLLM does NOT create groups by contiguous layer ranges</strong>
+    It creates groups that preserve a uniform layer count per group:
+  </div>
+
+<pre><code>SWA group 0: layer 0,  layer 6,  layer 12, ...
+SWA group 1: layer 1,  layer 7,  layer 13, ...
+SWA group 2: layer 2,  layer 8,  layer 14, ...
+SWA group 3: layer 3,  layer 9,  layer 15, ...
+SWA group 4: layer 4,  layer 10, layer 16, ...
+FULL group:  layer 5,  layer 11, layer 17, ...</code></pre>
+
+  <p>
+    Each group has <code>N</code> layers. The grouping is for memory /
+    block-table layout, not execution order. Forward execution still
+    runs layers in normal order: 0, 1, 2, 3, ...
+  </p>
+
+  <p>(See <a href="KV_CACHE_ASSUMPTIONS.html#k14">KV_CACHE_ASSUMPTIONS.html &sect;14</a> for why the split is strided, not contiguous &mdash; pipeline parallelism.)</p>
+
+  <h2 id="code">Code path</h2>
+
+  <h3>Startup memory sizing</h3>
+
+  <p>The worker profiles available memory:</p>
+<pre><code>def determine_available_memory(self) -&gt; int:
+    ...
+    self.model_runner.profile_run()
+    ...
+    self.available_kv_cache_memory_bytes = (
+        self.requested_memory
+        - profile_result.non_kv_cache_memory
+        - cudagraph_memory_estimate_applied
+    )
+    return int(self.available_kv_cache_memory_bytes)</code></pre>
+
+  <p>The engine core collects per-worker numbers and builds configs:</p>
+<pre><code>available_gpu_memory = self.model_executor.determine_available_memory()
+kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory)</code></pre>
+
+  <p>If workers differ, vLLM clamps everyone to the minimum:</p>
+<pre><code>min_num_blocks = min(c.num_blocks for c in kv_cache_configs)
+for c in kv_cache_configs: c.num_blocks = min_num_blocks</code></pre>
+
+  <p>(See <a href="KV_CACHE_ASSUMPTIONS.html#k11">KV_CACHE_ASSUMPTIONS.html &sect;11</a> for why clamping is the only safe choice.)</p>
+
+  <h3>Group construction</h3>
+
+<pre><code># _get_kv_cache_groups_uniform_page_size
+
+# A model with 10 full attention layers and 20 sliding window attention layers
+# can be regarded as repeating the pattern (1 * full, 2 * sw) 10 times.
+# ... there are 3 kv_cache_groups, each of which represents 10 layers.
+
+same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+for layer_name, layer_spec in kv_cache_spec.items():
+    same_type_layers[layer_spec].append(layer_name)
+
+min_num_layers = min([len(layers) for layers in same_type_layers.values()])
+group_size = min_num_layers
+
+for each attention type:
+    num_groups = cdiv(len(layers), group_size)
+    for i in range(num_groups):
+        grouped_layers.append(layers[i::num_groups])   # &lt;-- strided split</code></pre>
+
+  <h3>Block tables per group, slot mapping per group</h3>
+
+  <p>The worker keeps one block table per group, with int32 IDs:</p>
+<pre><code>self.num_kv_cache_groups = len(self.block_sizes)
+self.block_tables: list[StagedWriteTensor] = []
+for i in range(self.num_kv_cache_groups):
+    block_table = StagedWriteTensor(
+        (self.max_num_reqs, max_num_blocks),
+        dtype=torch.int32, device=device,
+    )
+    self.block_tables.append(block_table)</code></pre>
+
+  <p>For each token position, slot ID is computed per group:</p>
+<pre><code># Triton kernel
+group_id = tl.program_id(0)
+block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
+block_size = tl.load(block_sizes + group_id)
+...
+block_numbers = tl.load(block_table_ptr + req_state_idx * stride + block_indices)
+slot_ids = block_numbers * block_size + block_offsets</code></pre>
+
+  <h3>Attention metadata aliasing</h3>
+
+  <p>
+    During input preparation, vLLM starts with metadata for group 0 and
+    swaps in the group-specific block table and slot mapping for later
+    groups. Crucially, the resulting attention metadata is assigned to
+    every layer in the attention group as a <em>reference to the same
+    object</em>, not a copy:
+  </p>
+<pre><code>for layer_name in attn_group.layer_names:
+    attn_metadata_dict[layer_name] = attn_metadata_i   # &lt;-- aliased</code></pre>
+
+  <p>
+    Per-layer <code>attn_metadata_dict</code> lookup returns identical
+    metadata for every layer in the group, so there's only one
+    <code>block_table</code> tensor and one <code>slot_mapping</code>
+    tensor in memory per group.
+  </p>
+
+  <p>Final lookup shape:</p>
+<pre><code>layer_name -&gt; layer KV tensor                              (per-layer)
+layer_name -&gt; attention metadata (shared within group)     (per-group via aliasing)
+metadata   -&gt; group block table, group slot_mapping        (per-group)
+block id   -&gt; physical slot inside that layer/group KV tensor</code></pre>
+
+  <h2>Summary</h2>
+
+  <ul>
+    <li>vLLM splits hybrid models into KV-cache groups so each group block has uniform physical size.</li>
+    <li>KV-cache groups have separate block tables, but their block IDs are allocated from one shared <code>BlockPool</code>.</li>
+    <li>Physical lookup is layer-specific after the group block table selects the block ID: <code>(layer_name, block_id) &rarr; physical K/V memory</code>.</li>
+    <li>Mamba/SSM layers join the same invariant by <em>padding</em> their state page up to the attention page (<code>mamba_page_size_padded</code>); conv_state and ssm_state are two strided views of one per-layer buffer, and a request needs only one block (default mode).</li>
+    <li>NIXL transfer is <em>independent</em> of that padding: it registers one region per Mamba layer (logically split into conv/ssm) and tracks per-layer block lengths, explicitly handling SSM and attention having different page sizes and block counts &mdash; so it works under a per-group allocator too.</li>
+  </ul>
+
+  <p class="subtitle">
+    See also: <a href="BEGINNER_GUIDE.html#columns">BEGINNER_GUIDE.html &sect;7</a>
+    for the gentle introduction to column packing,
+    <a href="KV_CACHE_ASSUMPTIONS.html">KV_CACHE_ASSUMPTIONS.html</a>
+    for the 15 hidden assumptions this layout rests on,
+    and <a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT.html</a>
+    for one specific kernel-side constraint on block size.
+  </p>
+</main>
+</body>
+</html>

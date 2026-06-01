@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mooncake Store Connector &mdash; vLLM Learning Notes</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">KV Cache</a> &middot;
+    <a href="index.html">Transfer</a> &middot;
+    <span>MOONCAKE_STORE</span>
+  </div>
+
+  <h1>Mooncake Store &mdash; KV Through a Content-Addressed Cache</h1>
+  <p class="subtitle">
+    P puts KV into a distributed store keyed by content hash. D gets KV
+    from the same store. Workers never directly talk to each other.
+    Cache hits cross engine runs.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      The Mooncake <em>store</em> connector turns P/D disaggregation into
+      a producer/consumer system with an intermediary. P calls
+      <code>batch_put_from_multi_buffers</code> with content-addressed
+      keys; D calls <code>batch_get_into_multi_buffers</code> with the
+      same keys. Two background threads on each worker
+      (<code>KVCacheStoreSendingThread</code> and
+      <code>KVCacheStoreRecvingThread</code>) handle the actual
+      transfers asynchronously. Because keys are content-addressed, a
+      hot system prompt cached once is reused by every D worker, every
+      engine run, forever &mdash; or until evicted.
+    </p>
+  </section>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why">1. Why a store, not a pipe</a></li>
+      <li><a href="#keys">2. Content addressing &amp; the key format</a></li>
+      <li><a href="#wire">3. End-to-end flow</a></li>
+      <li><a href="#threads">4. The two background threads</a></li>
+      <li><a href="#coordinator">5. The coordinator and load/store masks</a></li>
+      <li><a href="#tp">6. TP/PP via candidate keys + dedup</a></li>
+      <li><a href="#pressure">7. Store pressure: skip-and-clear</a></li>
+      <li><a href="#failures">8. Failure modes</a></li>
+      <li><a href="#vs">9. How this differs from the pipe</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why">1. Why a store, not a pipe</h2>
+
+  <p>
+    Direct P&rarr;D connectors (NIXL, Mooncake pipe) cache nothing
+    across runs. If two API calls come in with the same long system
+    prompt five minutes apart, P does the prefill twice. That's
+    wasteful when prompts are reused &mdash; which is the case for most
+    production deployments (system prompts, RAG contexts, agent
+    scratchpads).
+  </p>
+
+  <p>
+    Mooncake Store inserts a content-addressed cache between P and D.
+    The first call pays the prefill + store-put cost. Every subsequent
+    call hits the cache and pays only the store-get cost. The
+    <em>same</em> prompt across <em>different</em> engine processes
+    deduplicates automatically because keys are derived from vLLM's
+    prefix-cache block hashes.
+  </p>
+
+  <h2 id="keys">2. Content addressing &amp; the key format</h2>
+
+  <p>
+    Every block stored gets a key encoding its identity, derived from
+    <code>PoolKey.to_string()</code>
+    (<span class="fileref">mooncake/store/data.py:58-67</span>):
+  </p>
+
+<pre><code>def to_string(self) -> str:
+    return (
+        f"{self.key_metadata.model_name}"
+        f"@tp_rank:{self.key_metadata.tp_rank}"
+        f"@pcp{self.key_metadata.pcp_rank}"
+        f"@dcp{self.key_metadata.dcp_rank}"
+        f"@pp_rank:{self.key_metadata.pp_rank}"
+        f"@group:{self.key_metadata.group_id}"
+        f"@{self.chunk_hash}"      # vLLM's prefix-cache block hash
+    )
+</code></pre>
+
+  <p>
+    A worked example for a Llama-3-8B on TP=2, PP=1:
+  </p>
+
+<pre><code>llama-3-8b@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@a3f2c1d4...
+llama-3-8b@tp_rank:1@pcp0@dcp0@pp_rank:0@group:0@a3f2c1d4...
+</code></pre>
+
+  <p>
+    Both keys carry the same <code>chunk_hash</code> but differ in
+    <code>tp_rank</code> &mdash; one for each shard of the KV. Any D
+    worker that knows the model name and prompt can independently
+    compute these keys and ask the store "do you have these?"
+    Cross-process dedup falls out of the design.
+  </p>
+
+  <div class="callout info">
+    <strong>Why the prefix-cache hash, not a new hash?</strong>
+    <p>
+      vLLM already content-addresses blocks for the local prefix cache.
+      The store connector reuses that hash so a local prefix-cache hit
+      and a store hit refer to the same logical block. See
+      <a href="../KV_CACHE.html">KV_CACHE.html</a> for the receptive-field
+      argument behind that hash and why it's sound.
+    </p>
+  </div>
+
+  <h2 id="wire">3. End-to-end flow</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">Store-mediated flow</div>
+<pre>
+P worker                           Mooncake store                     D worker
+   |                                     |                                |
+   | local prefix cache miss             |                                |
+   | scheduler.build_connector_meta()    |                                |
+   |   -- enqueue ReqMeta with           |                                |
+   |      can_save=True                  |                                |
+   |                                     |                                |
+   | KVCacheStoreSendingThread           |                                |
+   |   pull ReqMeta from request_queue   |                                |
+   |   build keys + addrs + sizes        |                                |
+   |   batch_is_exist(keys) -- dedup     |                                |
+   |   batch_put_from_multi_buffers ---&gt; |                                |
+   |       (RDMA into store cluster)     | -- chunk_hash -&gt; replicas      |
+   |                                     |                                |
+   |                                     |&lt;------ lookup(token_len,       |
+   |                                     |          block_hashes) ---     |
+   |                                     |   -&gt; hit_length                |
+   |                                     |                                |
+   |                                     | KVCacheStoreRecvingThread      |
+   |                                     |   build candidate_keys for     |
+   |                                     |   all (tp, pp) -&gt; batch_is_exist
+   |                                     |   batch_get_into_multi_buffers |
+   |                                     |&lt;---- RDMA into D's memory  ---|
+</pre>
+  </div>
+
+  <h2 id="threads">4. The two background threads</h2>
+
+  <p>
+    Unlike NIXL (which polls in the scheduler loop) and the Mooncake
+    pipe (which uses an asyncio event loop), the Mooncake store uses
+    classic worker threads with queues.
+  </p>
+
+  <h3>4.1 Sending thread (P or kv_both only)</h3>
+
+  <p>
+    <code>KVCacheStoreSendingThread</code>
+    (<span class="fileref">mooncake/store/worker.py:464-623</span>) is
+    the producer. The scheduler enqueues a <code>ReqMeta</code> with
+    <code>can_save=True</code> each step, and the thread:
+  </p>
+
+  <ol>
+    <li>
+      Floors <code>token_len_chunk</code> to the LCM block size
+      across KV cache groups.
+    </li>
+    <li>
+      Consults <code>coord.store_mask(token_len)</code> to skip chunks
+      that shouldn't be stored (SWA chunks outside the window,
+      Mamba's recurrent tail, etc.). The mask comes from the
+      coordinator &mdash; see next section.
+    </li>
+    <li>
+      Applies a <strong>TP striding</strong>
+      (<code>sl = slice(self.tp_rank % self.put_step, None, self.put_step)</code>),
+      which spreads put load across TP ranks when the store can serve a
+      block from any of them.
+    </li>
+    <li>
+      Calls <code>batch_is_exist(keys)</code> to dedup &mdash; if
+      another process or run already put these blocks, skip the put.
+    </li>
+    <li>
+      Calls <code>batch_put_from_multi_buffers(keys, addrs, sizes,
+      replicate_config)</code> for the survivors.
+    </li>
+    <li>
+      Handles failures: a <code>NO_AVAILABLE_HANDLE</code> (-200) return
+      code triggers the <a href="#pressure">store-pressure path</a>.
+    </li>
+  </ol>
+
+  <h3>4.2 Receiving thread (D or kv_both only)</h3>
+
+  <p>
+    <code>KVCacheStoreRecvingThread</code>
+    (<span class="fileref">mooncake/store/worker.py:657-759</span>) is
+    the consumer. The scheduler enqueues a <code>ReqMeta</code> with
+    <code>load_spec.can_load=True</code>, and the thread:
+  </p>
+
+  <ol>
+    <li>
+      Uses <code>load_spec.token_len</code> as the load range and
+      <code>load_spec.vllm_cached_tokens</code> as a mask offset &mdash;
+      no need to re-fetch what's already in the local prefix cache.
+    </li>
+    <li>
+      For each chunk hash, builds keys with
+      <code>group:g</code> + this worker's <code>(tp_rank, pp_rank)</code>.
+    </li>
+    <li>
+      Calls <code>batch_get_into_multi_buffers(keys, addrs, sizes)</code>.
+      The store does an RDMA write straight into D's KV cache memory.
+    </li>
+    <li>
+      If disk-offload buffer budget is configured, splits the get into
+      sub-batches that fit (<code>_split_disk_offload_load_batches</code>,
+      <span class="fileref">store/worker.py:185-191, 693-721</span>).
+      Single oversize keys are skipped entirely with a warning.
+    </li>
+  </ol>
+
+  <div class="callout code-ref">
+    <strong>One thread, one queue, no fan-out</strong>
+    <p>
+      There's a single send thread and a single recv thread per worker
+      &mdash; not a thread pool. Concurrency comes from the store
+      itself, which batches RDMA writes internally. From vLLM's side,
+      the bottleneck is "how fast can I assemble batches", not "how
+      many transfers can I parallelize."
+    </p>
+  </div>
+
+  <h2 id="coordinator">5. The coordinator and load/store masks</h2>
+
+  <p>
+    Not every chunk should be stored, and not every chunk that's in the
+    store should be loaded. Sliding-window attention only needs the
+    last K chunks; Mamba's recurrence collapses earlier state into the
+    current one. The store connector handles this with a
+    <code>MooncakeStoreCoordinator</code>
+    (<span class="fileref">mooncake/store/coordinator.py:55-182</span>)
+    that mirrors vLLM's hybrid KV cache coordinator:
+  </p>
+
+<pre><code>def load_mask(self, block_hashes, token_len):
+    """Per-group load masks: mask[g][i] is True iff group g's
+    spec would populate chunk i locally (e.g., SWA / Mamba tail-only)."""
+    masks, _ = self.find_longest_cache_hit(
+        block_hashes, token_len, ExternalCachedBlockPool()
+    )
+    return masks
+
+def store_mask(self, aligned_token_len):
+    """Per-group store masks: mask[g][i] is True iff chunk i would
+    be populated by some future cache hit."""
+</code></pre>
+
+  <p>
+    Mechanically: the producer thread uses <code>store_mask</code> to
+    decide what's worth storing; the consumer thread uses
+    <code>load_mask</code> to decide what's worth fetching. Together
+    they ensure hybrid models (full attention + SWA, or attention +
+    Mamba) put exactly the chunks that future fetches will want and
+    skip chunks that will be re-derived locally on load.
+  </p>
+
+  <div class="callout warn">
+    <strong>The hybrid memory allocator (HMA) wrinkle</strong>
+    <p>
+      For models with multiple KV cache groups (different block sizes
+      per group), the connector stretches its effective block size to
+      the LCM across groups. Token ranges are floored to this LCM in
+      <code>_handle_request</code>. Companion read:
+      <a href="../KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a>
+      explains why groups exist in the first place.
+    </p>
+  </div>
+
+  <h2 id="tp">6. TP/PP via candidate keys + dedup</h2>
+
+  <p>
+    Because keys carry <code>tp_rank</code> and <code>pp_rank</code>,
+    handling TP<sub>P</sub> &ne; TP<sub>D</sub> doesn't need a TP
+    mapping module &mdash; the consumer just <em>asks the store about
+    all relevant ranks</em>.
+    Lookup logic
+    (<span class="fileref">mooncake/store/worker.py:1210-1236</span>):
+  </p>
+
+<pre><code>tp_count = min(self.tp_size, self.num_kv_head)
+for g_idx, db in enumerate(self.token_dbs):
+    for chunk_id, h in enumerate(group_hashes):
+        for tp in range(tp_count):
+            for pp in range(self.pp_size):
+                md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
+                candidate_keys.append(PoolKey(md, h.hex()).to_string())
+
+res = self.store.batch_is_exist(candidate_keys)
+</code></pre>
+
+  <p>
+    A chunk hash is considered "present" only when <em>all</em> expected
+    (tp, pp) shards are in the store
+    (<span class="fileref">mooncake/store/worker.py:1225-1231</span>):
+  </p>
+
+<pre><code>expected_per_key = max(1, tp_count * self.pp_size)
+present_count: dict[tuple[int, bytes], int] = {}
+for gh, exists in zip(candidate_meta, res, strict=True):
+    if exists == 1:
+        present_count[gh] = present_count.get(gh, 0) + 1
+exists_set = {gh for gh, c in present_count.items() if c &gt;= expected_per_key}
+</code></pre>
+
+  <p>
+    This is the magic that absorbs heterogeneous TP between P and D:
+    Mooncake store doesn't care if P was TP=4 and D is TP=2. The keys
+    are just shard-labeled. D fetches the shards <em>it</em> needs by
+    iterating over the appropriate TP indices. See
+    <a href="PARALLELISM.html">PARALLELISM.html</a> for the
+    cross-connector comparison.
+  </p>
+
+  <h2 id="pressure">7. Store pressure: skip-and-clear</h2>
+
+  <p>
+    A real-world store cluster can saturate &mdash; bandwidth saturated,
+    backing disk full, replication queue full. Mooncake signals this
+    by returning <code>NO_AVAILABLE_HANDLE</code> from
+    <code>batch_put_from_multi_buffers</code>. The connector handles it
+    with a tiny state machine on the send thread
+    (<span class="fileref">mooncake/store/worker.py:445-462</span>):
+  </p>
+
+<pre><code>def _mark_request_skipped_for_pressure(self, req_id: str) -&gt; bool:
+    with self.done_task_lock:
+        already_skipped = req_id in self._skip_store_requests
+        self._store_pressure_active = True
+        self._skip_store_requests.add(req_id)
+    return already_skipped
+
+def _clear_store_pressure(self) -&gt; bool:
+    with self.done_task_lock:
+        if not self._store_pressure_active and not self._skip_store_requests:
+            return False
+        self._store_pressure_active = False
+        self._skip_store_requests.clear()
+    return True
+</code></pre>
+
+  <p>
+    Behavior:
+  </p>
+
+  <ul>
+    <li>
+      First <code>NO_AVAILABLE_HANDLE</code> for a request: mark it
+      skipped, log a warning, return without retrying. Other requests
+      on the same thread are still tried.
+    </li>
+    <li>
+      Future batches for this request are <em>silently dropped</em>
+      while the pressure flag is set (<code>_should_skip_request</code>
+      check at the top of <code>_handle_request</code>).
+    </li>
+    <li>
+      First successful put after pressure: clear the flag, log
+      recovery, resume normal behavior.
+    </li>
+  </ul>
+
+  <div class="callout warn">
+    <strong>Skipping is not a write-through-disk fallback</strong>
+    <p>
+      Under pressure, the connector simply doesn't store. There's no
+      retry queue, no spill-to-disk-locally. The reasoning: if the
+      store can't take it, putting it in a local buffer doesn't help
+      &mdash; D was going to fetch it from the store, not from this P.
+      The next time the same prompt arrives, prefill recomputes. This
+      keeps the connector simple and forces cluster scaling decisions
+      to live where they belong (in the store layer).
+    </p>
+  </div>
+
+  <h2 id="failures">8. Failure modes</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Store rejects put (code &lt; 0)</h3>
+      <p>
+        Each failed key is logged with its code. If the code is
+        <code>NO_AVAILABLE_HANDLE</code>, the pressure flag fires.
+        Other negative codes are logged but otherwise tolerated. No
+        exception is raised &mdash; the engine continues.
+      </p>
+    </div>
+    <div class="box">
+      <h3>D's get fails</h3>
+      <p>
+        Same shape on the recv thread: failed keys are logged, the
+        request is marked finished without all blocks loaded, and the
+        engine recomputes the missing tokens locally. Strictly best-effort
+        on the consumer side.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Oversize key</h3>
+      <p>
+        With disk offload enabled, a single key that exceeds the
+        worker's staging budget is skipped entirely with a warning
+        (<span class="fileref">mooncake/store/worker.py:693-721</span>).
+        This shouldn't happen with vanilla block sizes, but big-block
+        deployments need to size their staging budget accordingly.
+      </p>
+    </div>
+    <div class="box">
+      <h3>kv_consumer accidentally writes</h3>
+      <p>
+        Can't happen by construction. The scheduler sets
+        <code>force_skip_save = (kv_role == "kv_consumer")</code> at
+        ReqMeta construction time
+        (<span class="fileref">mooncake/store/scheduler.py:167</span>),
+        and the send thread isn't even started for pure consumers
+        (<span class="fileref">mooncake/store/worker.py:1121-1140</span>).
+      </p>
+    </div>
+  </div>
+
+  <h2 id="vs">9. How this differs from the pipe</h2>
+
+  <table>
+    <thead>
+      <tr><th>Aspect</th><th>Mooncake pipe</th><th>Mooncake store</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Connection topology</td>
+        <td>P&harr;D direct</td>
+        <td>P&rarr;Store&rarr;D</td>
+      </tr>
+      <tr>
+        <td>Cross-run reuse</td>
+        <td>No</td>
+        <td>Yes (content-addressed)</td>
+      </tr>
+      <tr>
+        <td>P/D simultaneity required</td>
+        <td>Yes &mdash; both must be alive</td>
+        <td>No &mdash; P can exit, D joins later</td>
+      </tr>
+      <tr>
+        <td>Wire hops</td>
+        <td>One (P&rarr;D)</td>
+        <td>Two (P&rarr;Store, Store&rarr;D)</td>
+      </tr>
+      <tr>
+        <td>TP handling</td>
+        <td>Pre-planned via <code>_get_tp_ratio</code></td>
+        <td>Candidate-key lookup + dedup</td>
+      </tr>
+      <tr>
+        <td>Threading</td>
+        <td>asyncio + ThreadPoolExecutor</td>
+        <td>Two dedicated background threads</td>
+      </tr>
+      <tr>
+        <td>Failure surface</td>
+        <td>Per-request timeout / ZMQ response error</td>
+        <td>Store pressure + per-batch skip</td>
+      </tr>
+      <tr>
+        <td>Best for</td>
+        <td>Low-latency P/D in same DC, no cross-call caching</td>
+        <td>Heavy prompt reuse, multi-tenant clusters, P fleet churn</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>Companion: connector/MOONCAKE.md</strong>
+    <p>
+      For a deep dive on the per-request <code>ReqMeta</code> dataclass
+      that drives both threads each engine step, including how
+      <code>token_len_chunk</code>, <code>load_spec.token_len</code>,
+      and <code>current_event</code> compose to produce a single
+      put/get batch, see
+      <a href="../connector/MOONCAKE.md">connector/MOONCAKE.md</a>.
+      That note assumes you've already read this one.
+    </p>
+  </div>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Next: <a href="PARALLELISM.html">PARALLELISM.html</a> for how the
+    three connectors compare on heterogeneous TP and PP between P and D.
+  </p>
+</main>
+</body>
+</html>

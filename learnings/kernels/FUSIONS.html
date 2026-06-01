@@ -1,0 +1,1298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kernel Fusions in vLLM — AllReduce+Norm, Norm+Quant & friends</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  /* page-local helpers */
+  .op {
+    display: inline-block;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.8em;
+    padding: 3px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    white-space: nowrap;
+    line-height: 1.3;
+  }
+  .op.read  { border-left: 3px solid var(--blue); }
+  .op.comp  { border-left: 3px solid var(--violet); }
+  .op.write { border-left: 3px solid var(--amber); }
+  .op.comm  { border-left: 3px solid var(--red); }
+  .op.fused { border: 1px solid #abd1bb; background: var(--green-soft); color: var(--green); font-weight: 650; }
+  .hbm {
+    font-family: "SF Mono", Monaco, monospace; font-size: 0.72em;
+    color: var(--red); font-weight: 650;
+  }
+  .save {
+    display: inline-block; font-size: 0.78em; color: var(--green);
+    font-weight: 650; margin-left: 4px;
+  }
+  .fusebar {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    margin: 6px 0;
+  }
+  .arr { color: var(--muted); font-size: 1.1em; padding: 0 1px; }
+  .pillrow { margin: 8px 0; }
+  .pill {
+    display: inline-block; font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.74em; padding: 2px 8px; border-radius: 12px;
+    margin: 0 4px 4px 0; border: 1px solid var(--border); background: var(--code);
+  }
+  .pill.on { background: var(--green-soft); border-color: #abd1bb; color: var(--green); }
+  .mini-th { font-size: 0.82em; }
+  details.qa { margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+  details.qa > summary {
+    cursor: pointer; padding: 9px 13px; font-weight: 650; font-size: 0.92em;
+    color: var(--blue); list-style: none;
+  }
+  details.qa > summary::-webkit-details-marker { display: none; }
+  details.qa > summary::before { content: "▸ "; color: var(--muted); }
+  details.qa[open] > summary::before { content: "▾ "; }
+  details.qa > div { padding: 0 14px 12px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../">&larr; learnings</a> &nbsp;|&nbsp; kernels &nbsp;|&nbsp;
+    source: <span class="fileref">vllm/compilation/passes/fusion/</span>
+  </div>
+
+  <h1>Kernel Fusions in vLLM</h1>
+  <p class="subtitle">
+    A guided tour of the popular fusions — RMSNorm+Quant, SiLU+Mul+Quant, AllReduce+Norm,
+    Attention+Quant, and the comm/compute overlap fusions — <em>what they merge, why it's
+    faster, and the torch.fx machine that rewrites your graph to use them.</em>
+    Grounded line-by-line in vLLM source on branch <code>dao/understand</code>.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    Most of these layers are <b>memory-bound</b>: the GPU spends more time shuffling tensors to and
+    from HBM than doing math. A fusion takes two adjacent ops — say <code>rms_norm</code> then
+    <code>fp8_quant</code> — and replaces them with a <em>single</em> kernel that reads the input once,
+    does both computations in registers, and writes the output once. That kills one kernel launch and a
+    full <span class="hbm">round-trip to HBM</span> of the intermediate tensor. vLLM does this
+    automatically at compile time: a stack of <b>torch.fx pattern-matcher passes</b> scans the traced
+    graph, finds known op sequences, and swaps in pre-written fused CUDA/Triton kernels. The same idea
+    extends to collectives (fold the norm into an AllReduce) and to <em>overlap</em> (pipeline a GEMM
+    with its ReduceScatter so communication hides behind compute). Newer models push it furthest:
+    <b>MiniMax&nbsp;M3</b> fuses a cross-GPU AllReduce into its QK-norm (§11), and <b>DeepSeek&nbsp;V4</b>
+    welds entire MLA prologues — compress + RMSNorm + RoPE + fp8 quant + KV-cache write — into single
+    Triton kernels (§12) — both <em>hand-written</em>, since they run with the auto-fusion passes off (§10).
+  </div>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why">1. Why fuse? The HBM round-trip</a></li>
+      <li><a href="#machine">2. The fusion machine (torch.fx)</a></li>
+      <li><a href="#catalog">3. The fusion catalog</a></li>
+      <li><a href="#normquant">4. RMSNorm + Quant (the workhorse)</a></li>
+      <li><a href="#actquant">5. SiLU·Mul + Quant (SwiGLU)</a></li>
+      <li><a href="#arnorm">6. AllReduce + RMSNorm (+Quant)</a></li>
+      <li><a href="#attnquant">7. Attention + Quant (epilogue)</a></li>
+      <li><a href="#sp">8. Sequence parallelism: AR &rarr; RS+AG</a></li>
+      <li><a href="#asynctp">9. Async TP: GEMM &harr; comm overlap</a></li>
+      <li><a href="#byhand">10. Writing a fusion by hand</a></li>
+      <li><a href="#minimax">11. Spotlight: MiniMax&nbsp;M3</a></li>
+      <li><a href="#deepseek">12. Spotlight: DeepSeek&nbsp;V4</a></li>
+      <li><a href="#more">13. The rest (RoPE, QK-norm, MLA)</a></li>
+      <li><a href="#enable">14. Turning fusions on</a></li>
+      <li><a href="#reading">15. Reading tips &amp; file map</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="why">1. Why fuse? The HBM round-trip</h2>
+
+  <p>
+    On a modern GPU, arithmetic is cheap and memory bandwidth is the bottleneck for "small" pointwise
+    ops. An RMSNorm or a quantization touches every element once — it does almost no FLOPs per byte.
+    So its runtime is dominated by <b>how many times the tensor crosses the HBM&harr;SM boundary</b>,
+    plus the fixed cost of launching the kernel.
+  </p>
+
+  <p>
+    Consider the most common pair in a quantized model: normalize a hidden state, then quantize it to
+    fp8 before the next matmul. Unfused, that's two kernels, and the bf16 intermediate is written out
+    and immediately read back:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Unfused: rms_norm → fp8_quant</div>
+    <div class="fusebar">
+      <span class="op read">read x (bf16)</span>
+      <span class="arr">→</span>
+      <span class="op comp">RMSNorm</span>
+      <span class="arr">→</span>
+      <span class="op write">write y (bf16) <span class="hbm">↓HBM</span></span>
+    </div>
+    <div class="fusebar">
+      <span class="op read">read y (bf16) <span class="hbm">↑HBM</span></span>
+      <span class="arr">→</span>
+      <span class="op comp">find scale + quant</span>
+      <span class="arr">→</span>
+      <span class="op write">write q (fp8)</span>
+    </div>
+    <div class="diagram-caption">
+      2 kernel launches. The full-size bf16 tensor <code>y</code> makes a wasted round-trip:
+      written by kernel 1, re-read by kernel 2.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Fused: rms_norm_static_fp8_quant</div>
+    <div class="fusebar">
+      <span class="op read">read x (bf16)</span>
+      <span class="arr">→</span>
+      <span class="op fused">RMSNorm + scale + quant (in registers)</span>
+      <span class="arr">→</span>
+      <span class="op write">write q (fp8)</span>
+    </div>
+    <div class="diagram-caption">
+      1 kernel launch. <code>y</code> never touches HBM — it lives in registers between the two steps.
+      <span class="save">saved: 1 launch + 1 write + 1 read of a full bf16 tensor</span>
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>The mental model in one line</strong>
+    A fusion turns <em>read → compute → write → read → compute → write</em> into
+    <em>read → compute → compute → write</em>. For memory-bound ops, removing the middle
+    write+read roughly halves the time.
+  </div>
+
+  <div class="callout info">
+    <strong>Two flavors of "fusion"</strong>
+    Most of this page is <b>vertical / epilogue fusion</b> — merge adjacent pointwise ops to cut HBM
+    traffic (§4, §5, §7). The collective fusions (§6, §8, §9) are different: they merge a
+    <em>communication</em> op with its neighbors, and the big win is often <b>overlap</b> — letting the
+    network and the SMs run at the same time — not just saving a write.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="machine">2. The fusion machine (torch.fx)</h2>
+
+  <p>
+    A fusion reaches the GPU one of <b>two ways</b>, and which one applies depends on whether the model
+    runs under <code>torch.compile</code>. <b>This section is the automatic route</b> — you write plain
+    <code>RMSNorm(...)</code> then <code>quant(...)</code> in the model and vLLM rewrites it for you.
+    <b>§10 is the hand-written route</b> — you call a fused op directly in <code>forward</code>. Every
+    fusion in §4–§9 is automatic; the model spotlights in §11–§12 are hand-written.
+  </p>
+
+  <p>
+    The automatic rewriter is a stack of <b>post-grad passes</b> over the traced FX graph, orchestrated
+    by <code>PostGradPassManager</code>. You emit the unfused ops; the matcher swaps in the fused kernel.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">vllm/compilation/passes/pass_manager.py</span> — <code>PostGradPassManager</code>;
+    base classes in <span class="fileref">.../vllm_inductor_pass.py</span>
+    (<code>VllmInductorPass</code>, <code>VllmPatternMatcherPass</code>).
+    Each fusion lives in its own file under <span class="fileref">.../passes/fusion/</span>.
+  </div>
+
+  <div class="callout warn">
+    <strong>This machine only runs under torch.compile</strong>
+    The pass manager is an inductor post-grad step. A model that runs eager — or under
+    <b>breakable CUDA graph</b> (<code>VLLM_USE_BREAKABLE_CUDAGRAPH=1</code>, which forces
+    <code>compilation mode = NONE</code>, i.e. no dynamo / no inductor) — <em>never invokes it</em>, so
+    none of §4–§9 fire. Those models must fuse <b>by hand</b> instead (§10). In vLLM,
+    DeepSeek&nbsp;V4 and MiniMax&nbsp;M3 default to exactly this regime — which is why they ship the
+    hand-written kernels in §11–§12.
+  </div>
+
+  <h3>Pattern → replacement, registered against the graph</h3>
+  <p>
+    Each fusion is a pair of small Python functions traced into FX subgraphs and handed to PyTorch's
+    <code>PatternMatcherPass</code> via <code>register_replacement</code>. The <b>pattern</b> traces the
+    unfused ops; the <b>replacement</b> traces the single fused op. At compile time the matcher finds
+    every occurrence of the pattern in the graph and splices in the replacement. Here is the real
+    static-fp8 case, lightly trimmed:
+  </p>
+
+  <pre><span class="c"># vllm/compilation/passes/fusion/rms_quant_fusion.py — RMSNormStaticQuantPattern</span>
+<span class="k">def</span> <span class="fn">pattern</span>(input, weight, scale):
+    result_rms = vllm.ir.ops.<span class="fn">rms_norm</span>(input, weight, self.epsilon)
+    <span class="k">return</span> self.<span class="fn">quant_matcher</span>(result_rms, scale)[<span class="n">0</span>]   <span class="c"># rms_norm → fp8 quant</span>
+
+<span class="k">def</span> <span class="fn">replacement</span>(input, weight, scale):
+    result = torch.<span class="fn">empty</span>(input.shape, dtype=self.quant_dtype, ...)
+    at = <span class="fn">auto_functionalized</span>(
+        self.FUSED_OP,                  <span class="c"># torch.ops._C.rms_norm_static_fp8_quant</span>
+        result=result, input=input, weight=weight,
+        scale=scale, epsilon=self.epsilon,
+    )
+    <span class="k">return</span> at[<span class="n">1</span>]                          <span class="c"># the fp8 result</span>
+
+pm.<span class="fn">register_replacement</span>(pattern, replacement, inputs, pm.fwd_only, pm_pass,
+                       extra_check=_rms_input_weight_dtype_match)</pre>
+
+  <div class="callout">
+    <strong>Why <code>extra_check</code> matters</strong>
+    A pattern can match structurally but be unsafe to fuse. Here
+    <code>_rms_input_weight_dtype_match</code> blocks the rewrite when the norm's input and weight
+    dtypes differ (e.g. a Gemma fp32 <code>weight.float()+1</code> gamma), because the fused kernel
+    assumes matching dtypes. Most passes carry similar guards.
+  </div>
+
+  <div class="callout">
+    <strong>Why <code>auto_functionalized</code> wraps the fused op</strong>
+    The fused kernels are <b>in-place</b>: the schema is <code>(Tensor! result, …) -&gt; ()</code> — they
+    write into a caller-allocated buffer and return nothing. But the FX graph the matcher rewrites is
+    <b>functional</b> (every node yields fresh values, no mutation, no aliasing), so a raw mutating op
+    can't sit in the replacement. <code>auto_functionalized</code> — a <b>higher-order op (HOP)</b>, i.e.
+    an op that takes another op as its first argument (from <code>torch._higher_order_ops</code>) —
+    presents it as a pure function, returning the mutated buffers as new SSA outputs in a tuple
+    <code>(orig_return, *Tensor!-args-in-schema-order)</code>. Index 0 is the op's declared return
+    (empty here, since <code>-&gt; ()</code>), so the mutated tensors start at <b>index 1</b> — which is
+    why this replacement does <code>return at[1]</code> (just <code>result</code>), while the residual
+    variant does <code>return at[1], at[2]</code> (<code>result, residual</code>, matching its
+    <code>Tensor! result, …, Tensor! residual</code> schema). It's also why <code>replacement</code>
+    allocates <code>result</code> itself and passes it in. A later pass
+    (<code>FixFunctionalizationPass</code>, shown next) restores the true in-place call — functional for
+    the compiler, in-place on the GPU.
+  </div>
+
+  <h3>Example: turning it back in-place (<code>fix_functionalization</code>)</h3>
+  <p>
+    The fusion pass leaves the <em>functional</em> form in the graph; the very last pass,
+    <code>FixFunctionalizationPass</code>, rewrites it into the <em>in-place</em> call that actually
+    runs. Same static-fp8 fusion, before and after that pass:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Before — functional (what the fusion pass emits)</div>
+    <pre>result = torch.<span class="fn">empty</span>(...)                       <span class="c"># output buffer, allocated in replacement()</span>
+at = <span class="fn">auto_functionalized</span>(                       <span class="c"># HOP wrapper — presents a pure op</span>
+        torch.ops._C.rms_norm_static_fp8_quant,
+        result=result, input=x, weight=w, scale=s, epsilon=eps)
+q  = at[<span class="n">1</span>]                                       <span class="c"># getitem(1): the "new" result value</span>
+<span class="c"># ... downstream ops read q ...</span></pre>
+    <div class="diagram-title" style="margin-top:16px">After — in-place (<code>FixFunctionalizationPass</code>, <code>mutated_args = {1: "result"}</code>)</div>
+    <pre>result = torch.<span class="fn">empty</span>(...)
+torch.ops._C.<span class="fn">rms_norm_static_fp8_quant</span>(         <span class="c"># direct in-place call, returns ()</span>
+        result=result, input=x, weight=w, scale=s, epsilon=eps)
+<span class="c"># every reader of q is rewired to read `result` directly;</span>
+<span class="c"># the auto_functionalized + getitem(1) nodes are erased — no clone, no copy.</span></pre>
+    <div class="diagram-caption">
+      The pass keys each fused op to a <code>mutated_args</code> map (getitem-index → kwarg name) and
+      does three things: rewire <code>at[i]</code> readers to that kwarg, insert the plain in-place call,
+      erase the HOP + getitem nodes.
+    </div>
+  </div>
+
+  <p>
+    The <code>mutated_args</code> map is literally the inverse of the <code>return at[…]</code> in the
+    replacement — one entry per <code>Tensor!</code> arg, in schema order:
+  </p>
+  <table class="mini-th">
+    <thead><tr><th>Fused op</th><th>replacement returns</th><th><code>mutated_args</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>rms_norm_static_fp8_quant</code></td><td><code>at[1]</code></td><td><code>{1: "result"}</code></td></tr>
+      <tr><td><code>fused_add_rms_norm_static_fp8_quant</code></td><td><code>at[1], at[2]</code></td><td><code>{1: "result", 2: "residual"}</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Why it must run last — and why no DCE after it</strong>
+    Every fusion pass needs the functional form to match against, so defunctionalization is pinned to the
+    end of the pipeline. And once an op produces its result by <b>mutation</b> instead of a consumed SSA
+    value, dead-code elimination would see the call as unused and wrongly delete it — so the pass's own
+    docstring warns <em>"After this pass, DCE should never be run."</em>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">vllm/compilation/passes/utility/fix_functionalization.py</span> —
+    <code>FixFunctionalizationPass</code> with the <code>defunctionalize</code> /
+    <code>replace_users_with_mutated_args</code> / <code>insert_defunctionalized</code> helpers and the
+    per-op <code>mutated_args</code> table; wired to run last in
+    <span class="fileref">pass_manager.py</span> (<code>self.fix_functionalization(graph)</code>).
+  </div>
+
+  <h3>The op names matter: IR ops vs. fused C++ ops</h3>
+  <div class="grid">
+    <div class="box">
+      <h3>What the model emits</h3>
+      <p>Custom ops in the <code>vllm_ir</code> namespace — these are the matchable "before" tokens:</p>
+      <ul>
+        <li><code>torch.ops.vllm_ir.rms_norm</code></li>
+        <li><code>torch.ops.vllm_ir.fused_add_rms_norm</code></li>
+        <li>quant matchers from <code>matcher_utils.py</code></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>What fusion swaps in</h3>
+      <p>Pre-compiled fused kernels in <code>torch.ops._C</code> (CUDA) — the "after":</p>
+      <ul>
+        <li><code>rms_norm_static_fp8_quant</code></li>
+        <li><code>fused_add_rms_norm_static_fp8_quant</code></li>
+        <li><code>silu_and_mul_quant</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Where do those op names come from?</h3>
+  <p>
+    Key subtlety: <code>register_replacement</code> never matches on a <em>string</em>. It
+    <b>traces</b> the <code>pattern</code> and <code>replacement</code> callables (with the example
+    <code>inputs</code> and the <code>fwd_only</code> tracer) into FX subgraphs, then matches on the
+    <b>op-overload identity</b> of the nodes — the <code>OpOverload</code> objects themselves. The
+    "names" in the snippet are just Python handles to ops registered in <em>two different libraries</em>:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>"Before" ops → the <code>vllm_ir</code> library</h3>
+      <p><code>vllm.ir.ops.rms_norm</code> is a vLLM <b>IR op</b>, declared with a decorator whose
+        <em>function name becomes the op name</em>:</p>
+      <pre><span class="c"># vllm/ir/ops/layernorm.py</span>
+<span class="fn">@register_op</span>
+<span class="k">def</span> <span class="fn">rms_norm</span>(input, weight, epsilon): ...
+<span class="c"># vllm/ir/op.py — registers it into the vllm_ir torch library</span>
+<span class="fn">Library</span>(<span class="s">"vllm_ir"</span>, <span class="s">"FRAGMENT"</span>).<span class="fn">define</span>(<span class="s">"rms_norm"</span> + schema)
+<span class="c"># ⇒ matchable node:  torch.ops.vllm_ir.rms_norm.default</span></pre>
+      <p>The model's <code>RMSNorm</code> layer emits the <em>same</em> IR op, so pattern and graph
+        share the node target — that's the match.</p>
+      <p><span class="fileref">vllm/ir/ops/layernorm.py</span>, <span class="fileref">vllm/ir/op.py</span></p>
+    </div>
+    <div class="box">
+      <h3>"After" ops → the <code>torch.ops._C</code> library</h3>
+      <p><code>rms_norm_static_fp8_quant</code> is a hand-written CUDA kernel registered in the
+        <b>C++ bindings</b> — that <code>def</code> string is where the name is born:</p>
+      <pre><span class="c">// csrc/.../torch_bindings.cpp</span>
+ops.<span class="fn">def</span>(<span class="s">"rms_norm_static_fp8_quant(Tensor! result, "</span>
+        <span class="s">"Tensor input, Tensor weight, ...) -> ()"</span>);
+ops.<span class="fn">impl</span>(<span class="s">"rms_norm_static_fp8_quant"</span>, <span class="fn">TORCH_BOX</span>(&amp;rms_norm_static_fp8_quant));
+<span class="c">// ⇒ in Python:  torch.ops._C.rms_norm_static_fp8_quant.default</span></pre>
+      <p>The pass doesn't hard-code it inline — it looks one up from the <code>FUSED_OPS</code> dict by
+        <code>FusedRMSQuantKey(quant_kind, fused_add)</code> → <code>self.FUSED_OP</code>.</p>
+      <p><span class="fileref">csrc/…/torch_bindings.cpp</span>, <span class="fileref">layernorm_quant_kernels.cu</span></p>
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>So when you write your own fusion</strong>
+    The <b>before</b> ops are whatever your model's <code>forward</code> already emits — you don't invent
+    them; read the layer (the <code>RMSNorm</code> layer emits <code>vllm_ir.rms_norm</code>; the quant
+    layer emits a <code>torch.ops._C.*_quant</code>) and make your <code>pattern</code> call the
+    <em>exact same</em> ops. The <b>after</b> op is the registered fused kernel: grep the C++ bindings
+    for its <code>def</code>, or list <code>[n for n in dir(torch.ops._C) if "rms" in n]</code> at a
+    REPL, then reference <code>torch.ops._C.&lt;name&gt;.default</code>. Because the match is by node
+    <em>identity</em>, a stray <code>reshape</code> between your two before-ops breaks it — which is
+    exactly what the NoOp pass below exists to prevent.
+  </div>
+
+  <h3>Order of passes (and why NoOp must go first)</h3>
+  <p>
+    The manager runs passes in a fixed order. <b>NoOp elimination runs first and is mandatory</b>:
+    models are full of reshape/view ops that sit <em>between</em> the two ops you want to fuse, and a
+    pattern like <code>rms_norm → reshape → quant</code> won't match <code>rms_norm → quant</code>.
+    Collapsing those redundant reshapes is what lets the rest of the patterns hit.
+  </p>
+
+  <div class="flow">
+    <div class="flow-step b"><span class="num">1</span>NoOp elimination<br><span style="font-size:.85em;color:var(--muted)">strip reshapes/slices</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step r"><span class="num">2</span>Sequence parallel<br><span style="font-size:.85em;color:var(--muted)">AR → RS + AG</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step r"><span class="num">3</span>Async TP<br><span style="font-size:.85em;color:var(--muted)">GEMM ↔ comm</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step a"><span class="num">4</span>AllReduce+RMS<br><span style="font-size:.85em;color:var(--muted)">flashinfer</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step v"><span class="num">5</span>RMSNorm+Quant</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step v"><span class="num">6</span>Act+Quant</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step g"><span class="num">7</span>Attn+Quant</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step b"><span class="num">8</span>cleanup +<br>functionalize</div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="catalog">3. The fusion catalog</h2>
+
+  <p>Every fusion in the table is a real pass under <span class="fileref">vllm/compilation/passes/fusion/</span>. The rest of the page walks the headline ones.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Fusion</th>
+        <th>Before (what you wrote)</th>
+        <th>After (single op)</th>
+        <th>Win</th>
+        <th>File</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><b>RMSNorm + Quant</b></td>
+        <td><code>rms_norm</code> → fp8/fp4 quant</td>
+        <td><code>rms_norm_static_fp8_quant</code> &amp; variants</td>
+        <td>−1 launch, −1 HBM round-trip</td>
+        <td><span class="fileref">rms_quant_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>Add+RMSNorm + Quant</b></td>
+        <td><code>fused_add_rms_norm</code> → quant</td>
+        <td><code>fused_add_rms_norm_static_fp8_quant</code></td>
+        <td>same, w/ residual add</td>
+        <td><span class="fileref">rms_quant_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>SiLU·Mul + Quant</b></td>
+        <td><code>silu_and_mul</code> → quant</td>
+        <td><code>silu_and_mul_quant</code> / <code>..._nvfp4_quant</code></td>
+        <td>−1 launch, −1 round-trip</td>
+        <td><span class="fileref">act_quant_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>AllReduce + RMSNorm</b></td>
+        <td><code>all_reduce</code> → <code>(add_)rms_norm</code></td>
+        <td>FlashInfer fused allreduce-norm</td>
+        <td>fold norm into comm epilogue</td>
+        <td><span class="fileref">allreduce_rms_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>AllReduce + RMSNorm + Quant</b></td>
+        <td>AR → norm → fp8/fp4 quant</td>
+        <td>FlashInfer fused allreduce-norm-quant</td>
+        <td>3 ops → 1 collective kernel</td>
+        <td><span class="fileref">allreduce_rms_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>Attention + Quant</b></td>
+        <td>attn → reshape → fp8 quant</td>
+        <td>attn with <code>output_scale</code> (quant in epilogue)</td>
+        <td>quant inside attn, no extra kernel</td>
+        <td><span class="fileref">attn_quant_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>Sequence parallelism</b></td>
+        <td><code>all_reduce</code> → <code>rms_norm</code></td>
+        <td><code>reduce_scatter</code> → norm → <code>all_gather</code></td>
+        <td>norm on 1/TP of data; enables async TP</td>
+        <td><span class="fileref">sequence_parallelism.py</span></td>
+      </tr>
+      <tr>
+        <td><b>Async TP (GEMM↔comm)</b></td>
+        <td><code>matmul</code> → <code>reduce_scatter</code></td>
+        <td><code>fused_matmul_reduce_scatter</code></td>
+        <td>overlap compute with comm</td>
+        <td><span class="fileref">collective_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>QK-norm + RoPE</b></td>
+        <td>q/k <code>rms_norm</code> → rotary</td>
+        <td>fused QK-norm-RoPE kernel</td>
+        <td>−launches in attn prologue</td>
+        <td><span class="fileref">qk_norm_rope_fusion.py</span></td>
+      </tr>
+      <tr>
+        <td><b>MLA RoPE + KV-cache</b></td>
+        <td>cat → rotary → cache write</td>
+        <td>fused MLA kv-cache-rope kernel</td>
+        <td>−launches in MLA path</td>
+        <td><span class="fileref">mla_rope_kvcache_cat_fusion.py</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="normquant">4. RMSNorm + Quant — the workhorse</h2>
+
+  <p>
+    This is the single most-used fusion in a quantized vLLM model. Every transformer block has an
+    input-layernorm and a post-attention layernorm, and in an fp8 model each is immediately followed by
+    a quant before the next GEMM. That's <b>two fusable sites per layer</b>, so 80 layers → 160 fused
+    kernels instead of 320 separate ones.
+  </p>
+
+  <h3>Four variants, one pattern family</h3>
+  <p>
+    The pass registers a Cartesian set of patterns keyed by <i>(has residual-add, quant kind)</i>. The
+    "has residual-add" axis is why there are paired classes everywhere: the residual stream is usually
+    added <em>inside</em> the norm kernel (<code>fused_add_rms_norm</code>), so the fused quant op must
+    also fold in the add.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>By residual</h3>
+      <ul>
+        <li><b>plain</b> — <code>rms_norm</code> → quant</li>
+        <li><b>+ add</b> — <code>fused_add_rms_norm</code> (residual) → quant</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>By quant kind</h3>
+      <ul>
+        <li><b>static</b> per-tensor fp8 (scale known ahead)</li>
+        <li><b>dynamic</b> per-token fp8 (scale from the data)</li>
+        <li><b>per-group</b> fp8 (block size 128 / 64)</li>
+        <li><b>NVFP4</b> (Blackwell)</li>
+      </ul>
+    </div>
+  </div>
+
+  <pre><span class="c"># rms_quant_fusion.py — the fused-op table (which kernel each key maps to)</span>
+FUSED_OPS = {
+  (kFp8StaticTensorSym, <span class="k">False</span>): torch.ops._C.<span class="fn">rms_norm_static_fp8_quant</span>,
+  (kFp8StaticTensorSym, <span class="k">True</span> ): torch.ops._C.<span class="fn">fused_add_rms_norm_static_fp8_quant</span>,
+  (kFp8DynamicTokenSym, <span class="k">False</span>): torch.ops._C.<span class="fn">rms_norm_dynamic_per_token_quant</span>,
+  (kFp8Dynamic128Sym,   ...): torch.ops._C.<span class="fn">rms_norm_per_block_quant</span>,
+  <span class="c"># ... 64-group, +residual rows ...</span>
+}</pre>
+
+  <div class="diagram">
+    <div class="diagram-title">With residual: fused_add_rms_norm → quant  ⟹  fused_add_rms_norm_static_fp8_quant</div>
+    <div class="compare">
+      <div class="side left">
+        <h4>Unfused — 2 kernels</h4>
+        <div class="fusebar"><span class="op read">read x, residual</span></div>
+        <div class="fusebar"><span class="op comp">x += residual; RMSNorm</span></div>
+        <div class="fusebar"><span class="op write">write y, new residual <span class="hbm">↓</span></span></div>
+        <div class="fusebar"><span class="op read">read y <span class="hbm">↑</span></span> <span class="op comp">quant</span> <span class="op write">write q (fp8)</span></div>
+      </div>
+      <div class="vs">⟹</div>
+      <div class="side right">
+        <h4>Fused — 1 kernel</h4>
+        <div class="fusebar"><span class="op read">read x, residual</span></div>
+        <div class="fusebar"><span class="op fused">add + RMSNorm + quant</span></div>
+        <div class="fusebar"><span class="op write">write q (fp8) + new residual</span></div>
+        <p style="font-size:.82em;color:var(--muted);margin:6px 0 0">The updated residual is still written (the next block needs it) — but <code>y</code> never hits HBM.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">rms_quant_fusion.py</span> — <code>RMSNormStaticQuantPattern</code>,
+    <code>FusedAddRMSNormStaticQuantPattern</code>, <code>...DynamicQuantPattern</code>,
+    <code>...GroupQuantPattern</code>; orchestrated by <code>RMSNormQuantFusionPass</code>.
+    Flag: <code>fuse_norm_quant</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="actquant">5. SiLU·Mul + Quant (SwiGLU MLP)</h2>
+
+  <p>
+    The gated MLP (SwiGLU) computes <code>silu(a) * b</code> where <code>a, b</code> are the two halves
+    of the up-projection. In an fp8 model that activation is immediately quantized for the
+    down-projection GEMM — the exact same read-compute-write-read-compute-write shape as §4, so the
+    same fix applies.
+  </p>
+
+  <div class="fusebar">
+    <span class="op read">gate·up (bf16)</span>
+    <span class="arr">→</span>
+    <span class="op comp">SiLU(a)·b</span>
+    <span class="arr">→</span>
+    <span class="op write">act (bf16) <span class="hbm">↓</span></span>
+    <span class="arr">→</span>
+    <span class="op read">read <span class="hbm">↑</span></span>
+    <span class="arr">→</span>
+    <span class="op comp">quant</span>
+    <span class="arr">→</span>
+    <span class="op write">fp8</span>
+  </div>
+  <div class="fusebar">
+    <span class="arr">⟹</span>
+    <span class="op read">gate·up (bf16)</span>
+    <span class="arr">→</span>
+    <span class="op fused">silu_and_mul_quant</span>
+    <span class="arr">→</span>
+    <span class="op write">fp8</span>
+    <span class="save">−1 launch, −1 round-trip</span>
+  </div>
+
+  <pre><span class="c"># act_quant_fusion.py</span>
+FUSED_OPS = {
+  kFp8StaticTensorSym: torch.ops._C.<span class="fn">silu_and_mul_quant</span>,
+  kNvfp4Dynamic:       torch.ops._C.<span class="fn">silu_and_mul_nvfp4_quant</span>,   <span class="c"># CUDA / Blackwell</span>
+  kFp8Dynamic128Sym:   torch.ops._C.<span class="fn">silu_and_mul_per_block_quant</span>,
+  kFp8Dynamic64Sym:    torch.ops._C.<span class="fn">silu_and_mul_per_block_quant</span>,
+}</pre>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">act_quant_fusion.py</span> — <code>SiluMulFp8StaticQuantPattern</code>,
+    <code>SiluMulNvfp4QuantPattern</code>, <code>SiluMulBlockQuantPattern</code>; pass
+    <code>ActivationQuantFusionPass</code>. Flag: <code>fuse_act_quant</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="arnorm">6. AllReduce + RMSNorm (+ Quant)</h2>
+
+  <p>
+    With tensor parallelism, each transformer block ends with an <b>AllReduce</b> that sums the partial
+    outputs across GPUs. The very next thing is the next block's <code>rms_norm</code> (usually with the
+    residual add). Naively that's: comm kernel → write summed tensor → read it back → norm kernel.
+  </p>
+
+  <p>
+    On NVIDIA GPUs with <b>FlashInfer</b> available, vLLM fuses the whole tail into one
+    <em>one-shot allreduce</em> kernel that does the cross-GPU reduction and then the norm (and
+    optionally the fp8/fp4 quant) in the same launch's epilogue — the reduced tensor is consumed
+    in-place instead of bouncing through HBM and a second kernel.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">TP block tail — fused all the way to fp8</div>
+    <div class="compare">
+      <div class="side left">
+        <h4>Unfused — 3 kernels</h4>
+        <div class="fusebar"><span class="op comm">AllReduce</span> <span class="op write">sum <span class="hbm">↓</span></span></div>
+        <div class="fusebar"><span class="op read">read <span class="hbm">↑</span></span> <span class="op comp">add + RMSNorm</span> <span class="op write">y <span class="hbm">↓</span></span></div>
+        <div class="fusebar"><span class="op read">read <span class="hbm">↑</span></span> <span class="op comp">quant</span> <span class="op write">fp8</span></div>
+      </div>
+      <div class="vs">⟹</div>
+      <div class="side right">
+        <h4>Fused — 1 collective kernel</h4>
+        <div class="fusebar"><span class="op fused">trtllm fused_allreduce_norm (+quant)</span></div>
+        <p style="font-size:.82em;color:var(--muted);margin:6px 0 0">
+          pattern code <code>kARResidualRMSNormFP8Quant</code> selects the all-in-one variant.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Size-gated, not always on</strong>
+    The fused one-shot allreduce only wins for <b>small</b> messages (latency-bound). The pass checks
+    the tensor size against a per-(device-capability, world-size) threshold
+    (<code>fi_allreduce_fusion_max_size_mb</code>, e.g. ~1–64&nbsp;MB) and falls back to the regular
+    AllReduce + separate norm for large tensors, where NCCL's ring/tree algorithms are bandwidth-optimal.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">allreduce_rms_fusion.py</span> — <code>AllReduceFusionPass</code> with
+    <code>AllReduceRMSNormPattern</code>, <code>AllReduceFusedAddRMSNormPattern</code>, and the
+    <code>...StaticQuantFP8/NVFP4Pattern</code> family; requires the <code>flashinfer.comm</code>
+    module. ROCm has a parallel <code>RocmAiterAllReduceFusionPass</code>. Flag: <code>fuse_allreduce_rms</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="attnquant">7. Attention + Quant (epilogue)</h2>
+
+  <p>
+    The attention kernel normally writes its output in bf16/fp16; a separate kernel then quantizes it
+    for the output projection GEMM. This fusion is slightly different in shape: instead of replacing two
+    ops with a third, it <b>pushes the scale into the attention op itself</b>. The matcher rewrites
+    <code>unified_attention_with_output(...)</code> to take an <code>output_scale</code>, and the kernel
+    quantizes in its <b>epilogue</b> — the result is written straight to fp8.
+  </p>
+
+  <div class="fusebar">
+    <span class="op comp">unified_attention</span>
+    <span class="arr">→</span>
+    <span class="op write">out (bf16) <span class="hbm">↓</span></span>
+    <span class="arr">→</span>
+    <span class="op read">reshape + read <span class="hbm">↑</span></span>
+    <span class="arr">→</span>
+    <span class="op comp">quant</span>
+    <span class="arr">→</span>
+    <span class="op write">fp8</span>
+  </div>
+  <div class="fusebar">
+    <span class="arr">⟹</span>
+    <span class="op fused">unified_attention_with_output(output_scale=scale) → writes fp8 directly</span>
+  </div>
+
+  <div class="callout">
+    <strong>Why it's its own pass (and constrains the graph)</strong>
+    Because the quant happens inside the attention kernel, the attention op cannot be split off into its
+    own piecewise-cudagraph region the usual way. <code>fuse_attn_quant</code> therefore interacts with
+    <code>splitting_ops</code> and graph partitioning (see the asserts in
+    <span class="fileref">config/compilation.py</span>). There is a separate
+    <code>MLAAttnQuantFusionPass</code> for the MLA path.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">attn_quant_fusion.py</span> — <code>AttnFp8StaticQuantPattern</code>,
+    <code>AttnNvfp4QuantPattern</code>; passes <code>AttnQuantFusionPass</code> /
+    <code>MLAAttnQuantFusionPass</code>. The fused target is
+    <code>torch.ops.vllm.unified_attention_with_output</code>. Flag: <code>fuse_attn_quant</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="sp">8. Sequence parallelism: AllReduce &rarr; ReduceScatter + AllGather</h2>
+
+  <p>
+    This one doesn't save a kernel — it <b>changes which collective you use</b> so that the work
+    <em>between</em> collectives shrinks, and so that the collectives can later fuse with neighboring
+    GEMMs (§9). An AllReduce leaves the full tensor on every rank. The rewrite splits it into a
+    <b>ReduceScatter</b> (each rank keeps only its 1/TP slice) and an <b>AllGather</b> (re-assemble
+    before the next op that needs the whole thing). The total bytes moved by RS+AG equal the AR — but
+    in between, the residual-add and RMSNorm run on only <b>1/TP of the rows per rank</b>.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Same comm volume, 1/TP the norm work per rank</div>
+    <div class="fusebar">
+      <span class="op comm">AllReduce</span>
+      <span class="arr">→</span>
+      <span class="op comp">add + RMSNorm (full tensor)</span>
+    </div>
+    <div class="fusebar">
+      <span class="arr">⟹</span>
+      <span class="op comm">ReduceScatter</span>
+      <span class="arr">→</span>
+      <span class="op comp">add + RMSNorm (1/TP slice)</span>
+      <span class="arr">→</span>
+      <span class="op comm">AllGather</span>
+    </div>
+    <div class="diagram-caption">
+      Each rank normalizes only its shard → less compute and less activation memory. The real payoff is
+      that RS and AG now sit next to GEMMs and can be overlapped with them (§9).
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Gated by hidden size &amp; token count</strong>
+    SP only helps when the tensor is big enough that sharding the norm beats the extra collective
+    bookkeeping. The pass disables itself below device-dependent thresholds on
+    <code>hidden_size</code> (e.g. 8192 on H100/Blackwell, 4096 on XPU) and token count
+    (<code>sp_min_token_num</code>). Requires <code>TP &gt; 1</code>.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">sequence_parallelism.py</span> — <code>SequenceParallelismPass</code> with
+    <code>FirstAllReduceRMSNormPattern</code> / <code>MiddleAllReduceRMSNormPattern</code>; comm ops
+    <code>torch.ops.vllm.reduce_scatter</code> / <code>all_gather</code>. Flag: <code>enable_sp</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="asynctp">9. Async TP: overlapping GEMM with its collective</h2>
+
+  <p>
+    Once §8 has turned the block boundaries into ReduceScatter / AllGather, the matmuls that feed or
+    follow them become fusable. The point here is <b>not</b> saving HBM — it's <b>latency hiding</b>.
+    A standard <code>matmul → reduce_scatter</code> runs the GEMM to completion, then sits idle on the
+    SMs while the network does the scatter. The fused
+    <code>fused_matmul_reduce_scatter</code> instead <b>tiles</b> the GEMM and pipelines it: as soon as
+    one output tile is ready, its slice starts streaming over the interconnect (via PyTorch
+    <b>symmetric memory</b> / P2P) while the next tile computes.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Serial vs. pipelined (GEMM → ReduceScatter)</div>
+    <div class="timeline">
+      <div class="timeline-label">unfused</div>
+      <div class="timeline-track">
+        <div class="timeline-seg" style="left:0;width:55%">GEMM (SMs)</div>
+        <div class="timeline-seg red" style="left:55%;width:40%">ReduceScatter (net)</div>
+      </div>
+      <div class="timeline-label">fused</div>
+      <div class="timeline-track">
+        <div class="timeline-seg" style="left:0;width:60%">GEMM tiles (SMs)</div>
+        <div class="timeline-seg red" style="left:20%;width:55%">RS tiles (net) — overlapped</div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Communication slides under compute. Wall-clock ≈ max(GEMM, comm) instead of their sum.
+    </div>
+  </div>
+
+  <p>The collective-fusion pass covers both directions, plus fp8/fp4 scaled-GEMM variants:</p>
+  <table class="mini-th">
+    <thead><tr><th>Before</th><th>After</th></tr></thead>
+    <tbody>
+      <tr><td><code>matmul</code> → <code>reduce_scatter</code></td><td><code>fused_matmul_reduce_scatter</code></td></tr>
+      <tr><td><code>all_gather</code> → <code>matmul</code></td><td><code>fused_all_gather_matmul</code></td></tr>
+      <tr><td><code>scaled_mm (fp8)</code> → <code>reduce_scatter</code></td><td><code>fused_flashinfer_scaled_matmul_reduce_scatter</code></td></tr>
+      <tr><td><code>all_gather</code> → <code>scaled_mm (fp8)</code></td><td><code>fused_all_gather_flashinfer_scaled_matmul</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">collective_fusion.py</span> — <code>AsyncTPPass</code> with
+    <code>GEMMReduceScatterPattern</code>, <code>AllGatherGEMMPattern</code>, and the scaled-MM /
+    FP4 variants. Built on <code>torch.ops.symm_mem.*</code>. Flag: <code>fuse_gemm_comms</code>
+    (pairs with <code>enable_sp</code>; CUDA + TP&gt;1).
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="byhand">10. Writing a fusion by hand (eager / breakable-CG)</h2>
+
+  <p>
+    When the pass manager is off (eager, or <code>VLLM_USE_BREAKABLE_CUDAGRAPH=1</code>) there is no
+    matcher to rewrite your graph, so a fusion only happens if <b>you call the fused op yourself</b> from
+    the model's <code>forward</code>. That sounds harder than it is — every hand-written fusion follows
+    the same three-part recipe. The worked example below is the real MiniMax-M3
+    <b>AllReduce + GemmaRMSNorm</b> fusion (the spotlight in §11 is what it buys you).
+  </p>
+
+  <ol class="steps">
+    <li>
+      <b>Producer — defer the intermediate.</b> For a <em>collective</em> fusion, stop the producer from
+      all-reducing so its raw per-rank partial flows downstream: a <code>RowParallelLinear</code> takes
+      <code>reduce_results=False</code>. For a plain <em>pointwise</em> pair (norm→quant, act→quant)
+      there is no producer change — just keep the two ops adjacent so the helper can see both.
+      <pre><span class="c"># minimax_m3/nvidia/model.py — attention o_proj stops reducing</span>
+<span class="c"># "the attention all-reduce is fused with the following GemmaRMSNorm"</span>
+self.o_proj = <span class="fn">RowParallelLinear</span>(..., reduce_results=<span class="k">False</span>, ...)</pre>
+    </li>
+    <li>
+      <b>Write the fused helper.</b> One function that drives the merged kernel and returns
+      <em>exactly</em> what the unfused pair returned. It must obey three rules — same return contract,
+      a capability gate, and a fallback that <em>is</em> the unfused code:
+      <pre><span class="c"># model_executor/layers/fused_allreduce_gemma_rms_norm.py (condensed)</span>
+<span class="k">def</span> <span class="fn">fused_allreduce_gemma_rms_norm</span>(hidden_states, residual, norm):
+    <span class="k">if</span> tp_size == <span class="n">1</span>:
+        <span class="k">return</span> norm(hidden_states, residual)        <span class="c"># nothing to fuse</span>
+
+    ok, max_token_num = <span class="fn">_can_use_flashinfer</span>(hidden_states, tp_size)   <span class="c"># ← gate</span>
+    <span class="k">if</span> ok:
+        norm_out = torch.<span class="fn">empty_like</span>(hidden_states)
+        <span class="fn">flashinfer_trtllm_fused_allreduce_norm</span>(       <span class="c"># the single fused kernel</span>
+            allreduce_in=hidden_states, residual=residual,
+            rms_gamma=norm.weight, rms_eps=norm.variance_epsilon,
+            weight_bias=<span class="n">1.0</span>, norm_out=norm_out, ...)      <span class="c"># weight_bias=1.0 → Gemma (1+w)</span>
+        <span class="k">return</span> norm_out, hidden_states               <span class="c"># (normed, new_residual) — same contract</span>
+
+    reduced = <span class="fn">tensor_model_parallel_all_reduce</span>(hidden_states)  <span class="c"># ← fallback = the unfused path</span>
+    <span class="k">return</span> norm(reduced, residual)</pre>
+    </li>
+    <li>
+      <b>Wire it into <code>forward</code>, behind a guard that mirrors the producer.</b> Replace the
+      two ops with the helper. The guard must answer <em>"is there actually a deferred all-reduce
+      waiting for me?"</em> — each clause maps back to a producer decision.
+      <pre><span class="c"># minimax_m3/nvidia/model.py — decoder layer</span>
+self.fuse_input_allreduce = (
+    layer_id &gt; <span class="n">0</span>                                  <span class="c"># layer 0 input came from embeddings</span>
+    <span class="k">and</span> <span class="k">not</span> <span class="fn">_is_moe_layer</span>(config, layer_id - <span class="n">1</span>)  <span class="c"># MoE reduces internally → nothing deferred</span>
+    <span class="k">and</span> pp_size == <span class="n">1</span>)                            <span class="c"># PP can't carry a partial across stages</span>
+...
+<span class="k">if</span> self.fuse_input_allreduce <span class="k">and</span> residual <span class="k">is not</span> <span class="k">None</span>:
+    hidden_states, residual = <span class="fn">fused_allreduce_gemma_rms_norm</span>(
+        hidden_states, residual, self.input_layernorm)
+<span class="k">else</span>:
+    ... <span class="c"># the original unfused add + norm, untouched</span></pre>
+    </li>
+  </ol>
+
+  <div class="callout good">
+    <strong>The three rules that keep a hand-written fusion correct</strong>
+    <b>(1) Identical contract</b> — same return shapes/dtypes/meaning as the ops you replaced, so callers
+    can't tell. <b>(2) A fallback that is the unfused code</b> — when the fast kernel can't apply, degrade
+    to bit-for-bit the old path; that fallback is also your numerical reference. <b>(3) A capability
+    gate</b> — dtype, shape, device, batch-size budget, workspace availability; <em>opt out, never
+    crash</em>, when unmet.
+  </div>
+
+  <div class="callout info">
+    <strong>Residual bookkeeping is the subtle part</strong>
+    The fused kernel does AllReduce → <code>+ residual</code> → RMSNorm and returns
+    <code>(normed, all_reduce(hidden)+residual)</code> — identical to the unfused norm. It only stays
+    correct because the deferring producer also did <em>not</em> fold itself into the residual yet. Break
+    one half of that contract and the math drifts. Always diff logits against the fallback to confirm.
+  </div>
+
+  <h3>Which route should you use?</h3>
+  <div class="compare">
+    <div class="side left">
+      <h4>Automatic pass (§2)</h4>
+      <ul>
+        <li>You write a <code>pattern</code>/<code>replacement</code> pair + <code>register_replacement</code></li>
+        <li>Matcher applies it across many models, for free</li>
+        <li><b>Needs <code>torch.compile</code></b> — dead under eager / breakable CG</li>
+        <li>Must express the before-pattern exactly; NoOp pass must clear reshapes first</li>
+      </ul>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <h4>Hand-written op (this section)</h4>
+      <ul>
+        <li>You write a helper + edit the model's <code>forward</code></li>
+        <li>Runs in <b>any</b> regime — no compiler dependency</li>
+        <li>Full control of guards &amp; fallback</li>
+        <li>Only fuses where you put the call; logic lives in model code</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">vllm/model_executor/layers/fused_allreduce_gemma_rms_norm.py</span> (the helper, with
+    its capability gate and fallback); wired in
+    <span class="fileref">vllm/models/minimax_m3/nvidia/model.py</span>
+    (<code>reduce_results=False</code> on <code>o_proj</code>/<code>down_proj</code>,
+    <code>fuse_input_allreduce</code> guard, two <code>fused_allreduce_gemma_rms_norm</code> call sites).
+    The breakable-CG regime: <span class="fileref">vllm/compilation/breakable_cudagraph.py</span> and the
+    auto-enable gate in <span class="fileref">vllm/config/vllm.py</span>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="minimax">11. Spotlight: MiniMax M3 — fused AllReduce + QK-norm</h2>
+
+  <p>
+    MiniMax M3 (and M2) shard each attention head's channels across the TP group, then RMSNorm Q and K
+    <em>per head</em> before RoPE. Because a head's channels are split across GPUs, the norm's variance
+    must be summed across ranks — so the natural code is: compute a partial per-token variance,
+    <b>AllReduce</b> it, then normalize. That AllReduce sits on the critical path of every attention
+    layer, at tiny message sizes (one fp32 scalar pair per token) where launch + latency dominate.
+  </p>
+
+  <p>
+    The fix is a hand-written custom op, <code>minimax_allreduce_rms_qk</code>, that does the
+    cross-GPU variance reduction <em>and</em> the Q/K normalization in a single <b>Lamport one-shot
+    allreduce</b> kernel. Lamport flags (set/poll in peer GPU memory over CUDA IPC) replace NCCL's
+    handshake, so the reduction and the norm epilogue happen in one launch with no separate collective.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">QK-norm across TP — eager vs. Lamport-fused</div>
+    <div class="compare">
+      <div class="side left">
+        <h4>Eager path</h4>
+        <div class="fusebar"><span class="op comp">partial var(Q), var(K)</span></div>
+        <div class="fusebar"><span class="op comm">AllReduce(var) <span class="hbm">net</span></span></div>
+        <div class="fusebar"><span class="op comp">rsqrt · weight → q, k</span></div>
+        <p style="font-size:.82em;color:var(--muted);margin:6px 0 0">separate collective + norm kernels, every layer</p>
+      </div>
+      <div class="vs">⟹</div>
+      <div class="side right">
+        <h4>Fused (TP&gt;1, ≤2048 tok)</h4>
+        <div class="fusebar"><span class="op fused">minimax_allreduce_rms_qk (Lamport one-shot)</span></div>
+        <p style="font-size:.82em;color:var(--muted);margin:6px 0 0">reduce variance + normalize Q/K in one launch</p>
+      </div>
+    </div>
+  </div>
+
+  <pre><span class="c"># minimax_rms_norm/rms_norm_tp.py — the fused QK-norm entry point</span>
+q, k = torch.ops.vllm.<span class="fn">minimax_qk_norm_fusion</span>(qkv, q_weight, k_weight, ...)
+<span class="c"># dispatches to the fused C++ op only when it pays off:</span>
+<span class="k">if</span> workspace <span class="k">is not</span> <span class="k">None</span> <span class="k">and</span> tp_world &gt; <span class="n">1</span> \
+   <span class="k">and</span> num_tokens &lt;= MINIMAX_QK_NORM_MAX_TOKEN_NUM:   <span class="c"># 2048</span>
+    <span class="k">return</span> torch.ops._C.<span class="fn">minimax_allreduce_rms_qk</span>(qkv, q_weight, k_weight, workspace, ...)
+<span class="k">return</span> _minimax_qk_norm_fallback(...)     <span class="c"># eager allreduce + RMSNorm</span></pre>
+
+  <div class="callout warn">
+    <strong>When it falls back</strong>
+    The fused kernel is <b>decode/small-batch only</b>: it bails to the eager allreduce+RMSNorm path
+    above 2048 tokens (large prefills are bandwidth-bound, not latency-bound), when TP=1 (no reduction
+    needed), or when the Lamport workspace can't be built — it needs CUDA IPC <b>P2P peer access</b>, so
+    on consumer PCIe cards with P2P disabled, workspace allocation raises and M3 logs a warning and
+    falls back instead of failing model load.
+  </div>
+
+  <div class="callout">
+    <strong>Why fp32 variance avoids the FlashInfer workspace</strong>
+    The per-token variance is reduced in fp32 for stability. The general FlashInfer fused allreduce
+    (§6) caches one global workspace keyed to the model's 16-bit activation dtype — routing an fp32
+    reduction through it would read a mismatched workspace and corrupt results. So
+    <code>_all_reduce_variance</code> reduces a flattened (1D) fp32 view, which keeps it on custom
+    all-reduce / pynccl. MiniMax's own Lamport workspace is separate, built specifically for the QK
+    kernel.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">vllm/model_executor/layers/minimax_rms_norm/rms_norm_tp.py</span> —
+    <code>MiniMaxText01RMSNormTP</code>, <code>minimax_qk_norm_fusion</code> (registered custom op),
+    <code>forward_qkv</code>; workspace in
+    <span class="fileref">.../minimax_rms_norm/lamport_workspace.py</span>. Wired into attention at
+    <span class="fileref">vllm/model_executor/models/minimax_m2.py</span> (<code>q_norm</code>/<code>k_norm</code>),
+    shared by M3. Fused C++ op: <code>torch.ops._C.minimax_allreduce_rms_qk</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="deepseek">12. Spotlight: DeepSeek V4 — MLA mega-fusions</h2>
+
+  <p>
+    DeepSeek V4 is the most aggressively fused model in the tree. Its attention is <b>sparse MLA</b>
+    (DeepSeek Sparse Attention with a "lightning indexer") over a compressed latent KV cache, and the
+    pre- and post-attention plumbing is full of small pointwise ops — compress, normalize, rotate,
+    quantize, write-to-cache. Left unfused, a single MLA step would launch a dozen tiny memory-bound
+    kernels. V4 ships <b>hand-written Triton/CUDA kernels</b> (under
+    <span class="fileref">vllm/models/deepseek_v4/common/ops/</span>) that weld each of these chains
+    into one launch, keeping every intermediate in registers.
+  </p>
+
+  <div class="callout info">
+    <strong>Different from §4–§9</strong>
+    Those were generic compile-time pattern matches. These are <b>model-specific custom ops</b> called
+    directly from the V4 model code (the hand-written recipe in §10) — chosen by hand because the op
+    chains are unique to MLA + sparse attention and too specialized for the generic matcher. Each has
+    NVIDIA CuTe-DSL, common-Triton, AMD, and XPU variants.
+  </div>
+
+  <h3>The KV compressor: the widest fusion in vLLM</h3>
+  <p>
+    Writing a token into the latent KV cache means: gather the raw state, softmax-compress it,
+    RMSNorm the result, split into NoPE / RoPE parts, fp8-quant the NoPE part per block, GPT-J-rotate
+    the RoPE part, and store both (plus the UE8M0 block scales) into the paged cache. That entire chain
+    is one kernel:
+  </p>
+
+  <div class="fusebar">
+    <span class="op read">gather state</span><span class="arr">→</span>
+    <span class="op comp">softmax compress</span><span class="arr">→</span>
+    <span class="op comp">RMSNorm</span><span class="arr">→</span>
+    <span class="op comp">split NoPE/RoPE</span><span class="arr">→</span>
+    <span class="op comp">fp8 quant (NoPE)</span><span class="arr">→</span>
+    <span class="op comp">RoPE</span><span class="arr">→</span>
+    <span class="op write">store fp8 + bf16 + scales</span>
+  </div>
+  <div class="fusebar">
+    <span class="arr">⟹</span>
+    <span class="op fused">_fused_kv_compress_norm_rope_insert_sparse_attn</span>
+    <span class="save">~10 ops → 1 kernel, intermediates stay in registers</span>
+  </div>
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">deepseek_v4/common/ops/fused_compress_quant_cache.py</span> — docstring:
+    <em>"Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope)."</em> Indexer variants
+    <code>_fused_kv_compress_norm_rope_insert_indexer_attn</code> (fp8) and <code>..._mxfp4_attn</code>.
+  </div>
+
+  <h3>The other DeepSeek V4 fusions</h3>
+  <div class="grid">
+    <div class="box">
+      <h3>Q-norm + RoPE + KV insert</h3>
+      <p>
+        "Horizontally fused" attention prologue: per-head Q RMSNorm + GPT-J RoPE (zero-filling padded
+        head slots) on the Q side; GPT-J RoPE + fp8 quant + paged-cache insert on the KV side.
+      </p>
+      <p><span class="fileref">attention.py</span> · <code>fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert</code> (+ <code>_full_cache_bf16_/_fp8_insert</code> variants)</p>
+    </div>
+    <div class="box">
+      <h3>Indexer Q: RoPE + quant</h3>
+      <p>
+        The lightning indexer's Q projection: GPT-J RoPE on the rope dims + per-token fp8 (or per-block
+        MXFP4) quant, with the per-token scale <b>folded into the index weights</b> so no separate scale
+        tensor is emitted — "free for the logits kernel".
+      </p>
+      <p><span class="fileref">common/ops/fused_indexer_q.py</span> · <code>fused_indexer_q_rope_quant</code></p>
+    </div>
+    <div class="box">
+      <h3>Output: inverse-RoPE + fp8 quant</h3>
+      <p>
+        Conjugate (inverse) RoPE on the attention output + per-block fp8 quant, pre-transforming the
+        scales to MN-major TMA-aligned layout so the downstream <code>fp8_einsum</code> can skip its
+        scale-relayout step.
+      </p>
+      <p><span class="fileref">common/ops/fused_inv_rope_fp8_quant.py</span></p>
+    </div>
+    <div class="box">
+      <h3>MTP input RMSNorm</h3>
+      <p>
+        The multi-token-prediction draft head fuses the position-0 mask-zero + <code>enorm</code> +
+        <code>hnorm</code> into one grid — replacing ~6 small kernels (CompareEq, where, Fill, two
+        rms_norms, elementwise helpers) on the breakable-cudagraph path.
+      </p>
+      <p><span class="fileref">common/ops/fused_mtp_input_rmsnorm.py</span></p>
+    </div>
+    <div class="box">
+      <h3>Merged-GEMM weight fusion</h3>
+      <p>
+        Load-time fusion: adjacent projections become one wider GEMM via
+        <code>MergedColumnParallelLinear</code> (e.g. WKV+Wgate in the compressor, WQA+WKV in
+        attention) — fewer, larger matmuls and better tensor-core utilization.
+      </p>
+      <p><span class="fileref">compressor.py</span>, <span class="fileref">attention.py</span></p>
+    </div>
+    <div class="box">
+      <h3>Q/KV RMSNorm pair</h3>
+      <p>
+        The two latent down-proj layernorms (q_a / kv_a) fuse into one kernel on a <code>(T, 2)</code>
+        grid — fp32 throughout, matching the compressor's norm math.
+      </p>
+      <p><span class="fileref">common/ops/fused_qk_rmsnorm.py</span> · <code>fused_q_kv_rmsnorm</code></p>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Plus the generic MLA passes (§13)</strong>
+    On top of these hand-written ops, V4 still benefits from the compile-time MLA fusions —
+    <code>fused_qk_norm_rope</code>, the MLA RoPE+KV-cache-cat fusion, and MLA attention+output-quant —
+    where they apply.
+  </div>
+
+  <div class="callout warn">
+    <strong>Many variants, one idea</strong>
+    Each V4 op has NVIDIA CuTe-DSL (SM100 TMA-aligned), common-Triton, AMD, and XPU implementations,
+    and fp8 vs. MXFP4 quant flavors. The names and exact op chains move quickly — treat this as a map of
+    <em>what is fused</em>, and read <span class="fileref">deepseek_v4/common/ops/</span> for the current
+    kernel for your platform.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="more">13. The rest (RoPE, QK-norm, MLA)</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>QK-norm + RoPE</h3>
+      <p>
+        Models that RMSNorm Q and K before rotary (e.g. newer Qwen/Gemma variants) fuse the two
+        per-head norms and the rotary embedding into one attention-prologue kernel.
+      </p>
+      <p><span class="fileref">qk_norm_rope_fusion.py</span> · flag <code>enable_qk_norm_rope_fusion</code></p>
+    </div>
+    <div class="box">
+      <h3>MLA RoPE + KV-cache</h3>
+      <p>
+        In the DeepSeek/MLA path, the concat of nope+rope parts, the rotary, and the KV-cache write fuse
+        into a single kernel — cutting launches on the hot decode path.
+      </p>
+      <p><span class="fileref">mla_rope_kvcache_cat_fusion.py</span> · flag <code>fuse_rope_kvcache_cat_mla</code></p>
+    </div>
+    <div class="box">
+      <h3>ROCm / AITER RoPE + KV-cache</h3>
+      <p>
+        On AMD, <code>fuse_rope_kvcache</code> fuses the QK rotary with the KV-cache write, gated to
+        small-batch decode (<code>rope_kvcache_fusion_max_token_num</code>); prefill uses unfused kernels.
+      </p>
+      <p><span class="fileref">rope_kvcache_fusion.py</span>, <span class="fileref">rocm_aiter_fusion.py</span></p>
+    </div>
+    <div class="box">
+      <h3>MLA attn + quant</h3>
+      <p>
+        The MLA counterpart to §7 — folds the output quant into the MLA attention kernel's epilogue.
+      </p>
+      <p><span class="fileref">mla_attn_quant_fusion.py</span> · flag <code>fuse_attn_quant</code></p>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="enable">14. Turning fusions on</h2>
+
+  <p>
+    These flags govern the <b>automatic</b> fusions only. They are <code>PassConfig</code> flags inside
+    <code>CompilationConfig</code> and take effect only under <code>torch.compile</code> (the default
+    <code>-O3</code>/inductor path); in eager or breakable-CG mode there is no graph to rewrite, so they
+    are no-ops. Most default to <code>None</code> and are resolved per platform/model during config
+    post-init — you usually let vLLM decide, and override only to debug.
+  </p>
+  <div class="callout info">
+    <strong>Hand-written fusions ignore these flags</strong>
+    The §10–§12 fusions are explicit calls in model code, so they fire regardless of
+    <code>PassConfig</code>. On a breakable-CG model (DeepSeek&nbsp;V4, MiniMax&nbsp;M3) the flags below
+    do nothing — the fusion you get is whatever the model hand-wrote.
+  </div>
+
+  <div class="pillrow">
+    Pointwise: <span class="pill">fuse_norm_quant</span> <span class="pill">fuse_act_quant</span>
+    <span class="pill">fuse_attn_quant</span> <span class="pill on">eliminate_noops (default True)</span>
+  </div>
+  <div class="pillrow">
+    Collective: <span class="pill">fuse_allreduce_rms</span> <span class="pill">enable_sp</span>
+    <span class="pill">fuse_gemm_comms</span>
+  </div>
+  <div class="pillrow">
+    RoPE/MLA: <span class="pill">enable_qk_norm_rope_fusion</span>
+    <span class="pill">fuse_rope_kvcache_cat_mla</span> <span class="pill">fuse_rope_kvcache</span>
+  </div>
+
+  <pre><span class="c"># Example: force the pointwise fusions on from the CLI</span>
+vllm serve &lt;model&gt; \
+  --compilation-config <span class="s">'{"pass_config": {"fuse_norm_quant": true, "fuse_act_quant": true}}'</span></pre>
+
+  <div class="callout">
+    <strong><code>eliminate_noops</code> is load-bearing</strong>
+    It defaults to <code>True</code> and you should leave it on: turn it off and the reshape ops between
+    your norm and quant block the patterns from matching, silently disabling most of the fusions above.
+  </div>
+
+  <div class="callout warn">
+    <strong>Verify before trusting a number</strong>
+    Flag names, defaults, and platform gating change often. The flags here were read from
+    <span class="fileref">vllm/config/compilation.py</span> (<code>PassConfig</code>) on branch
+    <code>dao/understand</code>. Check <code>VLLM_LOGGING_LEVEL=DEBUG</code> compile logs — each pass
+    logs how many patterns it matched — to confirm a fusion actually fired.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="reading">15. Reading tips &amp; file map</h2>
+
+  <details class="qa">
+    <summary>How do I find which fused kernel a pattern maps to?</summary>
+    <div>
+      <p>
+        Open the pass file and look for the <code>FUSED_OPS</code> dict (or equivalent). The dict keys
+        are <code>QuantKey</code>/<code>FusedRMSQuantKey</code> tuples describing the quant kind and
+        whether a residual add is folded in; the values are the concrete
+        <code>torch.ops._C.*</code> kernels. Then grep that op name in <span class="fileref">csrc/</span>
+        for the actual CUDA implementation.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>How do I confirm a fusion actually fired at runtime?</summary>
+    <div>
+      <p>
+        Each <code>VllmPatternMatcherPass</code> tracks a match count and logs it. Run with
+        <code>VLLM_LOGGING_LEVEL=DEBUG</code> and watch for the per-pass "matched N patterns" lines
+        during compilation. Zero matches means the pattern never hit — usually a stray reshape, a
+        dtype-mismatch <code>extra_check</code> bailing out, or the flag being off.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why are there separate CUDA and ROCm passes for the "same" fusion?</summary>
+    <div>
+      <p>
+        The fused kernels are backend-specific. CUDA paths lean on FlashInfer and
+        <code>torch.ops._C</code>; AMD paths use <code>rocm_aiter_ops</code> with their own kernels and
+        extra variants (e.g. bf16-norm fan-out for the DeepSeek indexer GEMM). The matcher logic is
+        analogous, but the "after" op differs, so they're distinct classes.
+      </p>
+    </div>
+  </details>
+
+  <table>
+    <thead><tr><th>File (under <code>vllm/compilation/passes/</code>)</th><th>What's in it</th></tr></thead>
+    <tbody>
+      <tr><td><span class="fileref">pass_manager.py</span></td><td><code>PostGradPassManager</code> — order &amp; wiring of all passes</td></tr>
+      <tr><td><span class="fileref">vllm_inductor_pass.py</span></td><td>base classes: <code>VllmInductorPass</code>, <code>VllmPatternMatcherPass</code></td></tr>
+      <tr><td><span class="fileref">fusion/matcher_utils.py</span></td><td>reusable matchers (RoPE, RMSNormGated, QuantFP8, SiluAndMul)</td></tr>
+      <tr><td><span class="fileref">fusion/rms_quant_fusion.py</span></td><td>§4 RMSNorm(+add) + fp8/fp4 quant</td></tr>
+      <tr><td><span class="fileref">fusion/act_quant_fusion.py</span></td><td>§5 SiLU·Mul + quant</td></tr>
+      <tr><td><span class="fileref">fusion/allreduce_rms_fusion.py</span></td><td>§6 AllReduce + RMSNorm (+quant), FlashInfer / AITER</td></tr>
+      <tr><td><span class="fileref">fusion/attn_quant_fusion.py</span>, <span class="fileref">mla_attn_quant_fusion.py</span></td><td>§7 attention output quant in epilogue</td></tr>
+      <tr><td><span class="fileref">fusion/sequence_parallelism.py</span></td><td>§8 AR → RS + AG</td></tr>
+      <tr><td><span class="fileref">fusion/collective_fusion.py</span></td><td>§9 async-TP GEMM↔comm overlap</td></tr>
+      <tr><td><span class="fileref">fusion/qk_norm_rope_fusion.py</span>, <span class="fileref">rope_kvcache_fusion.py</span>, <span class="fileref">mla_rope_kvcache_cat_fusion.py</span></td><td>§13 RoPE / QK-norm / MLA fusions</td></tr>
+      <tr><td><span class="fileref">utility/noop_elimination.py</span></td><td>strips reshapes/slices so patterns can match (runs first)</td></tr>
+      <tr><td><span class="fileref">config/compilation.py</span></td><td><code>PassConfig</code> — every flag in §14</td></tr>
+      <tr><td colspan="2" style="background:var(--code);color:var(--blue);font-weight:650">Model-specific / hand-written (outside the generic pass framework)</td></tr>
+      <tr><td><span class="fileref">model_executor/layers/fused_allreduce_gemma_rms_norm.py</span></td><td>§10 hand-written AR + GemmaRMSNorm helper (recipe)</td></tr>
+      <tr><td><span class="fileref">compilation/breakable_cudagraph.py</span></td><td>§10 breakable CUDA graph — the no-compile regime that needs hand fusion</td></tr>
+      <tr><td><span class="fileref">model_executor/layers/minimax_rms_norm/</span></td><td>§11 MiniMax M3 fused AllReduce + QK-RMSNorm (Lamport)</td></tr>
+      <tr><td><span class="fileref">models/deepseek_v4/common/ops/</span></td><td>§12 DeepSeek V4 MLA mega-fusions (compress/qk/indexer/mtp/inv-rope)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Caveat &amp; verification</strong>
+    File paths, class names, fused-op names, and flags were read directly from vLLM source on branch
+    <code>dao/understand</code> at the time of writing. Line numbers drift fast — confirm against the
+    live tree before relying on a specific location. The performance framing (memory-bound, round-trip,
+    overlap) is the standard rationale for these fusions, not a claim about a specific measured speedup
+    on your hardware.
+  </div>
+
+  <div class="foot">
+    Kernel fusions in vLLM · pattern-matcher passes over the torch.fx graph ·
+    sources: <span class="mono">vllm/compilation/passes/{pass_manager,vllm_inductor_pass}.py</span>,
+    <span class="mono">vllm/compilation/passes/fusion/*.py</span>,
+    <span class="mono">vllm/config/compilation.py</span>.
+  </div>
+</main>
+</body>
+</html>

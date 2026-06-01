@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vLLM v1 + Mooncake Store Architecture</title>
+<link rel="stylesheet" href="../../_shared.css" />
+<style>
+  /* Page-specific primitives (shared base lives in ../../_shared.css) */
+  .tag.scheduler { background: var(--blue-soft); border-color: #a6c8df; color: var(--blue); }
+  .tag.worker { background: var(--green-soft); border-color: #abd1bb; color: var(--green); }
+  .tag.store { background: var(--amber-soft); border-color: #e3c88a; color: var(--amber); }
+  .tag.data { background: var(--violet-soft); border-color: #c9b8dc; color: var(--violet); }
+
+  .arch {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin: 14px 0;
+    overflow-x: auto;
+  }
+
+  .lane-wrap { min-width: 980px; }
+
+  .lane-heads, .lane-row {
+    display: grid;
+    grid-template-columns: 170px repeat(4, 1fr);
+    gap: 8px;
+    align-items: stretch;
+  }
+
+  .lane-heads > div {
+    padding: 8px 10px;
+    background: var(--code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--blue);
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.84em;
+    font-weight: 650;
+  }
+
+  .lane-row { margin-top: 8px; }
+
+  .step-num {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f1f1ec;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.8em;
+  }
+
+  /* .lcell — architecture lane cell (distinct from shared .cell) */
+  .lcell {
+    min-height: 54px;
+    padding: 8px 9px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    background: #fbfbf9;
+    font-size: 0.84em;
+  }
+  .lcell.busy { background: var(--blue-soft); border-style: solid; border-color: #b8d4e7; }
+  .lcell.worker { background: var(--green-soft); border-style: solid; border-color: #b8dbc5; }
+  .lcell.store { background: var(--amber-soft); border-style: solid; border-color: #e5cb8e; }
+  .lcell.data { background: var(--violet-soft); border-style: solid; border-color: #cdbbe0; }
+  .lcell .title { font-weight: 650; margin-bottom: 3px; }
+
+  /* .pipe — horizontal node pipeline (distinct from shared .flow) */
+  .pipe {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 12px 0;
+  }
+  .pipe .node {
+    flex: 1 1 160px;
+    min-width: 150px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    position: relative;
+  }
+  .pipe .node:not(:last-child)::after {
+    content: "->";
+    position: absolute;
+    right: -17px;
+    top: 50%;
+    color: var(--muted);
+    transform: translateY(-50%);
+    font-family: "SF Mono", Monaco, monospace;
+  }
+  .node strong { display: block; color: var(--blue); margin-bottom: 4px; }
+  .small { color: var(--muted); font-size: 0.86em; }
+
+  .source-list {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+  }
+  .source-list li { margin: 5px 0; }
+
+  @media (max-width: 820px) {
+    .pipe .node:not(:last-child)::after { display: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>vLLM v1 + Mooncake Store Architecture</h1>
+  <p class="subtitle">
+    Focus: pure vLLM v1 scheduler path, non-V2 <code>GPUModelRunner</code> with
+    <code>KVConnectorModelRunnerMixin</code>, and <code>MooncakeStoreConnector</code>.
+    Code pointers are from <code>/home/zhewen/repos/vllm</code> at commit
+    <code>1c78f76c29</code>.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      Think of the KV connector as a two-sided plugin. The scheduler side decides
+      what prefix is already external, which GPU blocks were allocated, and what
+      metadata the worker should see. The worker side receives that metadata in
+      <code>KVConnectorModelRunnerMixin</code>, then returns a
+      <code>KVConnectorOutput</code> containing completed sends/receives. For
+      Mooncake Store specifically, <code>start_load_kv()</code> and
+      <code>wait_for_save()</code> are intentionally no-ops: its real load/store
+      work is issued from worker-side <code>get_finished()</code> to overlap with
+      compute.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#mental-model">Mental model</a></li>
+      <li><a href="#source-map">Source map</a></li>
+      <li><a href="#engine-loop">Engine loop</a></li>
+      <li><a href="#scheduler">Core scheduler hooks</a></li>
+      <li><a href="#model-runner">V1 model runner mixin</a></li>
+      <li><a href="#mooncake-pieces">Mooncake Store pieces</a></li>
+      <li><a href="#lookup">External prefix lookup</a></li>
+      <li><a href="#metadata">Scheduler-to-worker metadata</a></li>
+      <li><a href="#reqmeta">ReqMeta deep dive</a></li>
+      <li><a href="#worker-io">Worker I/O path</a></li>
+      <li><a href="#completion">Completion feedback</a></li>
+      <li><a href="#hma">HMA and block-size frames</a></li>
+      <li><a href="#read-order">Suggested read order</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="mental-model">1. Mental model</h2>
+  <div class="grid">
+    <div class="box">
+      <h3>Scheduler owns request truth</h3>
+      <p>
+        The scheduler owns <code>Request</code> states, local KV allocation,
+        preemption, and when a request is safe to run again. A connector may
+        delay frees or mark a request as waiting for remote KV, but the scheduler
+        still owns <code>self.requests</code> and queue transitions.
+      </p>
+      <span class="tag scheduler">scheduler.py</span>
+      <span class="tag scheduler">KVCacheManager</span>
+    </div>
+    <div class="box">
+      <h3>Connector scheduler plans</h3>
+      <p>
+        <code>MooncakeStoreScheduler</code> does not move bytes. It performs
+        external lookup, tracks per-request save/load intent, and emits
+        <code>MooncakeStoreConnectorMetadata</code> for the worker.
+      </p>
+      <span class="tag scheduler">get_num_new_matched_tokens</span>
+      <span class="tag data">ReqMeta</span>
+    </div>
+    <div class="box">
+      <h3>Model runner brackets forward</h3>
+      <p>
+        In non-V2 GPU execution, <code>GPUModelRunner</code> inherits
+        <code>KVConnectorModelRunnerMixin</code>. The mixin binds connector
+        metadata before forward and polls <code>get_finished()</code> after
+        forward, even when no model tokens are run.
+      </p>
+      <span class="tag worker">KVConnectorModelRunnerMixin</span>
+    </div>
+    <div class="box">
+      <h3>Mooncake worker moves bytes</h3>
+      <p>
+        <code>MooncakeStoreWorker</code> owns Mooncake store setup, lookup
+        server, one <code>ChunkedTokenDatabase</code> per KV group, and background
+        send/recv threads that call Mooncake batch put/get APIs.
+      </p>
+      <span class="tag worker">MooncakeStoreWorker</span>
+      <span class="tag store">MooncakeDistributedStore</span>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>One-sentence architecture</strong>
+    Scheduler-side connector code produces a per-step I/O plan; V1 model-runner
+    mixin transports that plan into the worker; Mooncake Store worker translates
+    the plan into store keys and GPU addresses; scheduler consumes completion
+    signals on the next <code>update_from_output()</code>.
+  </div>
+
+  <h2 id="source-map">2. Source map</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Area</th>
+        <th>File / lines</th>
+        <th>Why it matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Engine setup</td>
+        <td><code>vllm/v1/engine/core.py:141-156</code>, <code>202-211</code></td>
+        <td>Resolves scheduler/hash block sizes, constructs scheduler, initializes KV output aggregation, and creates request block hasher.</td>
+      </tr>
+      <tr>
+        <td>Core scheduler</td>
+        <td><code>vllm/v1/core/sched/scheduler.py:597-603</code>, <code>746-751</code>, <code>887-922</code>, <code>2127-2154</code></td>
+        <td>Calls connector scheduler hooks, packages <code>SchedulerOutput</code>, then consumes <code>KVConnectorOutput</code>.</td>
+      </tr>
+      <tr>
+        <td>V1 model runner</td>
+        <td><code>vllm/v1/worker/gpu_model_runner.py:415-417</code>, <code>4205-4236</code>, <code>4499-4520</code></td>
+        <td>Non-V2 GPU runner inherits the mixin and wraps model forward with connector lifecycle.</td>
+      </tr>
+      <tr>
+        <td>KV mixin</td>
+        <td><code>vllm/v1/worker/kv_connector_model_runner_mixin.py:85-119</code></td>
+        <td>Calls worker-side <code>bind_connector_metadata()</code>, <code>start_load_kv()</code>, <code>wait_for_save()</code>, and <code>get_finished()</code>.</td>
+      </tr>
+      <tr>
+        <td>Mooncake connector facade</td>
+        <td><code>.../mooncake/store/connector.py:80-147</code>, <code>153-194</code>, <code>222-264</code></td>
+        <td>Splits scheduler role from worker role and forwards abstract connector calls to concrete store components.</td>
+      </tr>
+      <tr>
+        <td>Mooncake scheduler</td>
+        <td><code>.../mooncake/store/scheduler.py:47-84</code>, <code>84-127</code>, <code>163-366</code>, <code>368-388</code></td>
+        <td>Tracks lookup/load/save intent and builds worker metadata.</td>
+      </tr>
+      <tr>
+        <td>Mooncake data model</td>
+        <td><code>.../mooncake/store/data.py:26-149</code>, <code>152-290</code></td>
+        <td>Defines <code>PoolKey</code>, <code>ChunkedTokenDatabase</code>, <code>LoadSpec</code>, <code>RequestTracker</code>, <code>ReqMeta</code>, and connector metadata.</td>
+      </tr>
+      <tr>
+        <td>Mooncake worker</td>
+        <td><code>.../mooncake/store/worker.py:767-1075</code>, <code>1090-1186</code>, <code>1188-1236</code></td>
+        <td>Registers GPU memory, starts threads, issues I/O in <code>get_finished()</code>, and handles lookup.</td>
+      </tr>
+      <tr>
+        <td>Coordinator</td>
+        <td><code>.../mooncake/store/coordinator.py:55-143</code>, <code>145-191</code>, <code>193-284</code></td>
+        <td>Reuses vLLM manager semantics to produce store/load masks and longest external hit length across hybrid KV groups.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="engine-loop">3. Engine loop</h2>
+  <p>
+    The engine loop is the backbone. It asks the scheduler for a
+    <code>SchedulerOutput</code>, sends that object to workers, gets a
+    <code>ModelRunnerOutput</code>, then lets the scheduler update request state.
+  </p>
+
+  <div class="pipe">
+    <div class="node">
+      <strong>1. Scheduler</strong>
+      <code>scheduler.schedule()</code><br />
+      Creates <code>SchedulerOutput</code> with connector metadata.
+    </div>
+    <div class="node">
+      <strong>2. Executor</strong>
+      <code>execute_model(scheduler_output)</code><br />
+      Sends the output to all worker processes.
+    </div>
+    <div class="node">
+      <strong>3. Worker</strong>
+      <code>GPUModelRunner.execute_model()</code><br />
+      Runs model forward and connector worker hooks.
+    </div>
+    <div class="node">
+      <strong>4. Scheduler</strong>
+      <code>update_from_output()</code><br />
+      Consumes generated tokens and <code>KVConnectorOutput</code>.
+    </div>
+  </div>
+
+  <pre><code>EngineCore.step()
+  scheduler_output = scheduler.schedule()
+  future = model_executor.execute_model(scheduler_output, non_block=True)
+  model_output = future.result() or model_executor.sample_tokens(...)
+  scheduler.update_from_output(scheduler_output, model_output)</code></pre>
+
+  <h2 id="scheduler">4. Core scheduler hooks</h2>
+  <p>
+    In pure v1, the core scheduler calls three connector scheduler-side methods
+    during scheduling, and one method when a request finishes. It later calls
+    <code>update_connector_output()</code> when worker output comes back.
+  </p>
+
+  <div class="arch">
+    <div class="lane-wrap">
+      <div class="lane-heads">
+        <div>step</div>
+        <div>core scheduler</div>
+        <div>MooncakeStoreScheduler</div>
+        <div>SchedulerOutput</div>
+        <div>meaning</div>
+      </div>
+
+      <div class="lane-row">
+        <div class="step-num">A</div>
+        <div class="lcell busy">
+          <div class="title">external lookup</div>
+          <code>connector.get_num_new_matched_tokens(request, local_hit)</code>
+        </div>
+        <div class="lcell">
+          Calls <code>LookupKeyClient.lookup()</code>; records <code>LoadSpec</code>
+          when external tokens should be loaded.
+        </div>
+        <div class="lcell"></div>
+        <div class="lcell">Decides whether the request has a remote KV prefix and whether loading is async.</div>
+      </div>
+
+      <div class="lane-row">
+        <div class="step-num">B</div>
+        <div class="lcell busy">
+          <div class="title">after allocation</div>
+          <code>connector.update_state_after_alloc(request, blocks, external_tokens)</code>
+        </div>
+        <div class="lcell">
+          Stores <code>(Request, block_ids)</code> in <code>_unfinished_requests</code>;
+          flips <code>LoadSpec.can_load</code> after GPU blocks exist.
+        </div>
+        <div class="lcell"></div>
+        <div class="lcell">The connector cannot load until destination blocks are allocated.</div>
+      </div>
+
+      <div class="lane-row">
+        <div class="step-num">C</div>
+        <div class="lcell busy">
+          <div class="title">metadata build</div>
+          <code>connector.build_connector_meta(scheduler_output)</code>
+        </div>
+        <div class="lcell">
+          Creates <code>RequestTracker</code> and <code>ReqMeta</code> entries for
+          loads, saves, chunked prefills, resumed requests, and pending loads.
+        </div>
+        <div class="lcell data">
+          <code>scheduler_output.kv_connector_metadata = meta</code>
+        </div>
+        <div class="lcell">This is the scheduler-to-worker contract.</div>
+      </div>
+
+      <div class="lane-row">
+        <div class="step-num">D</div>
+        <div class="lcell busy">
+          <div class="title">request finished</div>
+          <code>connector.request_finished_all_groups(request, block_ids)</code>
+        </div>
+        <div class="lcell">
+          Returns <code>delay_free_blocks=True</code> when saved tokens exist and
+          blocks should remain pinned until send completion.
+        </div>
+        <div class="lcell"></div>
+        <div class="lcell">Prevents freeing GPU blocks before async store reads them.</div>
+      </div>
+
+      <div class="lane-row">
+        <div class="step-num">E</div>
+        <div class="lcell busy">
+          <div class="title">worker output</div>
+          <code>_update_from_kv_xfer_finished(kv_connector_output)</code>
+        </div>
+        <div class="lcell">
+          <code>connector.update_connector_output()</code> currently aggregates KV
+          events for Mooncake Store.
+        </div>
+        <div class="lcell data">
+          <code>finished_recving</code><br />
+          <code>finished_sending</code>
+        </div>
+        <div class="lcell">Recv completion unblocks waiting requests; send completion frees delayed blocks.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>Important scheduler distinction</strong>
+    Scheduler-side connector methods plan state. Worker-side connector methods
+    move or poll data. The scheduler never directly calls
+    <code>MooncakeStoreWorker.get_finished()</code>.
+  </div>
+
+  <h2 id="model-runner">5. V1 model runner mixin</h2>
+  <p>
+    If <code>use_v2_model_runner</code> is false, <code>gpu_worker.py</code>
+    instantiates <code>vllm.v1.worker.gpu_model_runner.GPUModelRunner</code>.
+    That class inherits <code>KVConnectorModelRunnerMixin</code>. The mixin is the
+    bridge between <code>SchedulerOutput</code> and worker-side connector logic.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Normal forward path</h3>
+      <ol>
+        <li><code>GPUModelRunner</code> enters <code>maybe_get_kv_connector_output()</code>.</li>
+        <li>Mixin binds <code>scheduler_output.kv_connector_metadata</code>.</li>
+        <li>Mixin calls <code>start_load_kv(get_forward_context())</code>.</li>
+        <li>Model forward runs inside the context.</li>
+        <li>On exit, mixin calls <code>wait_for_save()</code> and <code>get_finished(...)</code>.</li>
+        <li>Mixin attaches completed send/recv sets to <code>KVConnectorOutput</code>.</li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>No-forward path</h3>
+      <p>
+        Even when <code>total_num_scheduled_tokens == 0</code>, the V1 runner
+        calls <code>kv_connector_no_forward()</code> if a KV connector exists.
+        That still binds metadata and calls <code>get_finished()</code>, which is
+        necessary for background Mooncake loads/saves to make progress.
+      </p>
+      <p class="small">
+        Pointer: <code>gpu_model_runner.py:4004-4021</code> and
+        <code>kv_connector_model_runner_mixin.py:38-55</code>.
+      </p>
+    </div>
+  </div>
+
+  <pre><code>KVConnectorModelRunnerMixin._get_kv_connector_output(...)
+  output = KVConnectorOutput()
+  kv_connector = get_kv_transfer_group()
+  kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+  kv_connector.start_load_kv(get_forward_context())
+  try:
+      yield output                 # model forward happens here
+  finally:
+      kv_connector.wait_for_save()
+      output.finished_sending, output.finished_recving =
+          kv_connector.get_finished(scheduler_output.finished_req_ids)
+      output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+      kv_connector.clear_connector_metadata()</code></pre>
+
+  <div class="callout warn">
+    <strong>Mooncake Store twist</strong>
+    The mixin still calls <code>start_load_kv()</code> and
+    <code>wait_for_save()</code>, but Mooncake Store implements both as no-ops.
+    Its loads and stores are issued from <code>get_finished()</code> instead.
+    This is why understanding Mooncake Store requires reading the worker
+    <code>get_finished()</code> method, not just the generic connector lifecycle.
+  </div>
+
+  <h2 id="mooncake-pieces">6. Mooncake Store pieces</h2>
+  <div class="grid three">
+    <div class="box">
+      <h3>Connector facade</h3>
+      <p>
+        <code>MooncakeStoreConnector</code> subclasses
+        <code>KVConnectorBase_V1</code> and <code>SupportsHMA</code>. Depending on
+        role, it creates either <code>MooncakeStoreScheduler</code> or
+        <code>MooncakeStoreWorker</code>.
+      </p>
+      <span class="tag scheduler">role=SCHEDULER</span>
+      <span class="tag worker">role=WORKER</span>
+    </div>
+    <div class="box">
+      <h3>Scheduler component</h3>
+      <p>
+        <code>MooncakeStoreScheduler</code> owns <code>load_specs</code>,
+        <code>_request_trackers</code>, <code>_unfinished_requests</code>, and
+        <code>_preempted_req_ids</code>. It packages <code>ReqMeta</code> records
+        into metadata.
+      </p>
+      <span class="tag data">LoadSpec</span>
+      <span class="tag data">RequestTracker</span>
+      <span class="tag data">ReqMeta</span>
+    </div>
+    <div class="box">
+      <h3>Worker component</h3>
+      <p>
+        <code>MooncakeStoreWorker</code> sets up the Mooncake store, registers KV
+        cache GPU buffers, starts a lookup server on rank 0, creates token DBs,
+        and starts send/recv transfer threads.
+      </p>
+      <span class="tag store">batch_is_exist</span>
+      <span class="tag store">batch_get</span>
+      <span class="tag store">batch_put</span>
+    </div>
+  </div>
+
+  <h3>Data objects</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Object</th>
+        <th>Side</th>
+        <th>Role</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>LoadSpec</code></td>
+        <td>Scheduler -> worker</td>
+        <td>Records local cached tokens, external cached tokens, and whether a load is now legal.</td>
+      </tr>
+      <tr>
+        <td><code>RequestTracker</code></td>
+        <td>Scheduler internal</td>
+        <td>Tracks token length, allocated blocks, saved-token watermark, token IDs, and prefill boundary.</td>
+      </tr>
+      <tr>
+        <td><code>ReqMeta</code></td>
+        <td>Metadata payload</td>
+        <td>Per-request command: token length to save/load, block IDs, block hashes, load spec, save flag, CUDA event slot.</td>
+      </tr>
+      <tr>
+        <td><code>PoolKey</code></td>
+        <td>Worker/store</td>
+        <td>String key containing model, TP/PCP/DCP/PP ranks, group ID, and chunk hash.</td>
+      </tr>
+      <tr>
+        <td><code>ChunkedTokenDatabase</code></td>
+        <td>Worker/store</td>
+        <td>Maps token chunks to <code>PoolKey</code> and maps block IDs to GPU addresses/sizes.</td>
+      </tr>
+      <tr>
+        <td><code>MooncakeStoreCoordinator</code></td>
+        <td>Worker lookup/load/store</td>
+        <td>Computes longest external hit and per-group masks using vLLM KV cache manager semantics.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="lookup">7. External prefix lookup</h2>
+  <p>
+    Lookup begins in the core scheduler, but it is serviced by a worker-local ZMQ
+    server on rank 0. The scheduler asks, "how many prefix tokens already exist
+    in Mooncake Store for this request's block hashes?" The worker answers with
+    a scheduler-safe prefix length.
+  </p>
+
+  <div class="arch">
+    <div class="lane-wrap">
+      <div class="lane-heads">
+        <div>step</div>
+        <div>Core scheduler</div>
+        <div>MooncakeStoreScheduler</div>
+        <div>Lookup server / worker</div>
+        <div>Mooncake store</div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">1</div>
+        <div class="lcell busy"><code>get_num_new_matched_tokens()</code></div>
+        <div class="lcell busy">Rounds lookup length to scheduler block boundary when partial chunks are discarded.</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">2</div>
+        <div class="lcell"></div>
+        <div class="lcell busy"><code>LookupKeyClient.lookup(token_len, block_hashes)</code></div>
+        <div class="lcell worker">ZMQ <code>LookupKeyServer</code> receives token length and hashes.</div>
+        <div class="lcell"></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">3</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+        <div class="lcell worker"><code>MooncakeStoreWorker.lookup()</code> expands candidate keys across TP and PP ranks.</div>
+        <div class="lcell store"><code>batch_is_exist(candidate_keys)</code></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">4</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+        <div class="lcell worker"><code>MooncakeStoreCoordinator.find_longest_cache_hit()</code> converges HMA groups and masks.</div>
+        <div class="lcell"></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">5</div>
+        <div class="lcell busy">Uses returned token count as external cached tokens.</div>
+        <div class="lcell busy">Stores <code>LoadSpec</code> if remote load is needed.</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Why lookup is worker-backed</strong>
+    The scheduler process does not own Mooncake store handles or registered GPU
+    address layout. Rank-0 worker has the store instance and can translate
+    request hashes into concrete Mooncake keys.
+  </div>
+
+  <h2 id="metadata">8. Scheduler-to-worker metadata</h2>
+  <p>
+    <code>MooncakeStoreConnectorMetadata</code> is one object per engine step. It
+    is not just a list of current scheduled requests: it also carries unfinished
+    request IDs and preemptions, and each <code>ReqMeta</code> tells the worker
+    whether to load, save, both, or only poll completion.
+  </p>
+
+  <pre><code>MooncakeStoreConnectorMetadata
+  unfinished_request_ids: set[str]
+  preempted_req_ids: set[str]
+  requests: list[ReqMeta]              # one per request scheduled this step
+                                       # (or with a pending load)</code></pre>
+
+  <div class="callout info">
+    <strong>Where ReqMeta sits</strong>
+    Scheduler → <code>ReqMeta.from_request_tracker(...)</code> in
+    <code>mooncake/store/scheduler.py</code> → packed into
+    <code>MooncakeStoreConnectorMetadata.requests</code> → worker iterates and
+    routes: <code>if req.can_save: send_thread.add_request(req)</code>,
+    <code>if req.load_spec.can_load: recv_thread.add_request(req)</code>.
+  </div>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Fresh or resumed prefill</h3>
+      <p>
+        The scheduler creates a <code>RequestTracker</code> from the request's
+        prefill token range and allocated block IDs. It builds <code>ReqMeta</code>
+        with optional <code>LoadSpec</code>, block hashes, and a save watermark.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Decode / chunked continuation</h3>
+      <p>
+        The scheduler extends the existing tracker with new block IDs, advances
+        the token length, and emits more save metadata only while the request is
+        still inside the tracked prefill range.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="reqmeta">9. ReqMeta deep dive</h2>
+  <p>
+    <code>ReqMeta</code> is the per-request "work order" the scheduler emits on
+    every engine step. It is the single most important data structure for
+    understanding Mooncake Store: every save and every load is parameterized by
+    one of these. See
+    <a href="MOONCAKE.md"><code>MOONCAKE.md</code></a> for the long-form note.
+  </p>
+
+  <pre><code>@dataclass
+class ReqMeta:
+    req_id: str
+    token_len_chunk: int
+    block_ids: tuple[list[int], ...]
+    block_hashes: list[BlockHash]
+
+    can_save: bool | None = None
+    load_spec: LoadSpec | None = None
+    is_last_chunk: bool | None = None
+    current_event: torch.cuda.Event | None = None
+
+    token_ids: list[int] | None = None
+    original_block_size: int | None = None</code></pre>
+
+  <h3>Companion: RequestTracker (persistent across steps)</h3>
+  <p>
+    <code>ReqMeta</code> is rebuilt every step. <code>RequestTracker</code>
+    persists — the scheduler keeps one per in-flight request in
+    <code>self._request_trackers</code>. Its job is to remember "how far have we
+    saved this request so far?" so the next step knows where to resume.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>RequestTracker field</th>
+        <th>Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>req_id</code></td>
+        <td>vLLM request ID.</td>
+      </tr>
+      <tr>
+        <td><code>token_len</code></td>
+        <td>Token length covered by the <em>current</em> prefill chunk; grows as chunked prefill progresses.</td>
+      </tr>
+      <tr>
+        <td><code>allocated_block_ids</code></td>
+        <td>Per-group block IDs for this request in the GPU paged cache. Updated as new blocks are allocated.</td>
+      </tr>
+      <tr>
+        <td><code>num_saved_tokens</code></td>
+        <td>High-watermark of tokens already saved to Mooncake. Drives the "anything new to save?" check.</td>
+      </tr>
+      <tr>
+        <td><code>token_ids</code></td>
+        <td>Cached token-id list, used to populate KV cache events.</td>
+      </tr>
+      <tr>
+        <td><code>prefill_end_tokens</code></td>
+        <td>Snapshot of the prefill range. For a fresh request = <code>len(prompt)</code>. For a preempt-resume request it includes previously-generated tokens that have to be re-prefilled. Used to compute <code>is_last_chunk</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Fields by purpose</h3>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Identity &amp; addressing</h3>
+      <p><code>req_id</code> — dedup key for in-flight saves, cancel key under store pressure, completion key in <code>get_finished()</code>.</p>
+      <p>
+        <code>block_ids: tuple[list[int], ...]</code> — per-KV-cache-group lists of GPU paged-cache block IDs. A <em>tuple of lists</em>, not a flat list, because of HMA: each <code>KVCacheGroup</code> (full-attn, sliding-window, Mamba, ...) has its own block pool.
+      </p>
+      <p>
+        <code>block_hashes</code> — vLLM's prefix-cache block hashes computed at the engine's <code>hash_block_size</code>, reused as global Mooncake store keys. A single hash → a single
+        <code>PoolKey</code> rendered as
+        <code class="mono">model@tp:i@pcp..@dcp..@pp:j@group:g@&lt;hex&gt;</code>.
+        Content-addressed: a store hit from one engine run can be served to another.
+      </p>
+    </div>
+
+    <div class="box">
+      <h3>Save plan</h3>
+      <p>
+        <code>token_len_chunk</code> — how many tokens to consider for save this
+        step. Block-aligned when <code>discard_partial_chunks=True</code> (default):
+        <code>num_tokens_to_save = token_len // block_size * block_size</code>.
+        The send thread later re-floors this to the <strong>HMA LCM block size</strong> before issuing I/O.
+      </p>
+      <p>
+        <code>can_save</code> — gate for "anything new whole-block to put?":
+        <code class="mono">chunk_boundary = cdiv(num_saved_tokens + 1, block_size) * block_size</code>;
+        <code>skip_save</code> if the new chunk does not reach the next boundary.
+        Forced off when <code>kv_role == "kv_consumer"</code> (pure consumer of P/D disagg never writes back).
+      </p>
+      <p>
+        <code>is_last_chunk</code> — <code>True</code> when this chunk reaches the end of the prefill range
+        (<code>token_len &gt;= floor(prefill_end / block_size) * block_size</code>).
+        The send thread uses it to know when to surface the request as
+        <code>finished_sending</code> so the scheduler can release blocks that
+        <code>request_finished()</code> previously deferred.
+      </p>
+    </div>
+
+    <div class="box">
+      <h3>Load plan</h3>
+      <p><code>load_spec: LoadSpec | None</code> — non-<code>None</code> means this request wants to load KV from Mooncake into freshly allocated GPU blocks.</p>
+<pre><code>@dataclass
+class LoadSpec:
+    vllm_cached_tokens: int    # already in local prefix cache
+    kvpool_cached_tokens: int  # found in Mooncake
+    can_load: bool             # blocks allocated &amp; ready
+    token_len: int = 0         # actual range, set by worker</code></pre>
+      <ul>
+        <li><code>vllm_cached_tokens</code> / <code>kvpool_cached_tokens</code> — filled in <code>get_num_new_matched_tokens</code> after <code>client.lookup()</code>. Subtracts one if 100% hit so vLLM still generates from at least one real token.</li>
+        <li><code>can_load</code> — flipped <code>True</code> in <code>update_state_after_alloc</code> once destination blocks exist.</li>
+        <li><code>token_len</code> — stamped by the worker in <code>get_finished()</code> right before handing the request to the recv thread. Recv uses this, not <code>token_len_chunk</code>.</li>
+        <li>Recv also uses <code>vllm_cached_tokens</code> as a mask offset to avoid re-fetching what the local prefix cache already covers.</li>
+      </ul>
+    </div>
+
+    <div class="box">
+      <h3>Side channel: events &amp; KV-event reporting</h3>
+      <p>
+        <code>current_event: torch.cuda.Event | None</code> — <strong>not set by the scheduler</strong>. The worker's <code>get_finished()</code> records one event on the compute stream after forward and stamps it on every save <code>ReqMeta</code> before queuing into the send thread:
+      </p>
+<pre><code>current_event = torch.cuda.Event()
+current_event.record()           # compute stream
+for req in meta.requests:
+    if req.can_save:
+        req.current_event = current_event
+        send_thread.add_request(req)</code></pre>
+      <p>The send thread <code>synchronize()</code>s on it before reading GPU memory; without this barrier the Mooncake put would race the forward writing KV into the same blocks (torn KV).</p>
+      <p>
+        <code>token_ids</code> — chunk's tokens, for emitting
+        <code>BlockStored.token_ids</code> on the KV event bus.
+      </p>
+      <p>
+        <code>original_block_size</code> — the engine's user-visible
+        <code>cache_config.block_size</code>, <em>not</em> the LCM-stretched
+        effective <code>_block_size</code> the connector uses internally.
+        External KV-event consumers index by the user-visible size.
+      </p>
+    </div>
+  </div>
+
+  <h3>Construction logic</h3>
+  <pre><code>RequestTracker
+  ├── token_len             # grows each step (chunked prefill)
+  └── num_saved_tokens      # high-watermark; updated when can_save=True
+
+ReqMeta.from_request_tracker:
+
+  num_tokens_to_save = floor(token_len / block_size) * block_size      # if discard_partial
+  chunk_boundary     = ceil((num_saved_tokens + 1) / block_size) * block_size
+  skip_save          = (caller forced skip) OR num_tokens_to_save &lt; chunk_boundary
+
+  if skip_save and no load_spec: return None
+  if not skip_save: tracker.num_saved_tokens = num_tokens_to_save
+
+  ReqMeta(
+    req_id              = tracker.req_id
+    token_len_chunk     = num_tokens_to_save             # save range this step
+    block_ids           = tracker.allocated_block_ids    # per-group blocks
+    block_hashes        = caller-supplied                # prefix-cache hashes
+    can_save            = not skip_save
+    load_spec           = caller-supplied (or None)      # only when external hit
+    is_last_chunk       = caller-supplied                # uses prefill_end_tokens
+    token_ids           = tracker.token_ids              # for KV events
+    original_block_size = engine's cache_config.block_size
+    current_event       = None                           # worker fills in later
+  )</code></pre>
+
+  <h3>Cheat sheet</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Set where?</th>
+        <th>Used by</th>
+        <th>Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>req_id</code></td>
+        <td>tracker</td>
+        <td>both</td>
+        <td>dedup, cancel, completion reporting</td>
+      </tr>
+      <tr>
+        <td><code>token_len_chunk</code></td>
+        <td><code>tracker.token_len</code> floored to block</td>
+        <td>send (re-floored to LCM)</td>
+        <td>tokens to save this step</td>
+      </tr>
+      <tr>
+        <td><code>block_ids</code></td>
+        <td><code>tracker.allocated_block_ids</code></td>
+        <td>both</td>
+        <td>token range → GPU memory addresses, per HMA group</td>
+      </tr>
+      <tr>
+        <td><code>block_hashes</code></td>
+        <td>from <code>request.block_hashes</code></td>
+        <td>both</td>
+        <td>derive Mooncake <code>PoolKey</code>s (content-addressed)</td>
+      </tr>
+      <tr>
+        <td><code>can_save</code></td>
+        <td>derived from <code>num_saved_tokens</code></td>
+        <td>send</td>
+        <td>gate: save this step?</td>
+      </tr>
+      <tr>
+        <td><code>load_spec</code></td>
+        <td>scheduler <code>load_specs</code> dict</td>
+        <td>recv, <code>worker.get_finished</code></td>
+        <td>load amounts; <code>can_load</code>/<code>token_len</code> gate recv</td>
+      </tr>
+      <tr>
+        <td><code>is_last_chunk</code></td>
+        <td><code>tracker.token_len &gt;= prefill_end</code></td>
+        <td>send</td>
+        <td>know when to report <code>finished_sending</code></td>
+      </tr>
+      <tr>
+        <td><code>current_event</code></td>
+        <td><code>worker.get_finished()</code></td>
+        <td>send</td>
+        <td>block save behind compute-stream forward; avoid torn KV</td>
+      </tr>
+      <tr>
+        <td><code>token_ids</code></td>
+        <td><code>tracker.token_ids</code></td>
+        <td>send</td>
+        <td>populate <code>BlockStored.token_ids</code></td>
+      </tr>
+      <tr>
+        <td><code>original_block_size</code></td>
+        <td>scheduler (<code>cache_config.block_size</code>)</td>
+        <td>send</td>
+        <td><code>BlockStored.block_size</code> at user-visible granularity</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Easy-to-confuse pair</strong>
+    <code>token_len_chunk</code> (the save range) vs
+    <code>load_spec.token_len</code> (the load range) — independent ranges living on
+    the same <code>ReqMeta</code>. The save path reads the former; the load path
+    reads the latter. If you mix them up while debugging, neither path will line
+    up with the block IDs.
+  </div>
+
+  <div class="callout good">
+    <strong>Reading order for ReqMeta</strong>
+    <p style="margin-top:6px">
+      <strong>Save:</strong>
+      <code>from_request_tracker</code> →
+      <code>KVCacheStoreSendingThread._handle_request</code>.
+      The scheduler decides what is saveable; the send thread translates ranges
+      to addresses, dedups against <code>batch_is_exist</code>, calls
+      <code>batch_put_from_multi_buffers</code>.
+    </p>
+    <p style="margin-top:6px">
+      <strong>Load:</strong>
+      <code>get_num_new_matched_tokens</code> →
+      <code>update_state_after_alloc</code> →
+      <code>worker.get_finished</code> (stamps <code>load_spec.token_len</code>)
+      → <code>KVCacheStoreRecvingThread._handle_request</code>.
+    </p>
+  </div>
+
+  <h2 id="worker-io">10. Worker I/O path</h2>
+  <p>
+    Mooncake Store intentionally centralizes I/O issue and completion polling in
+    worker-side <code>get_finished()</code>. The method does three things in one
+    pass: enqueue loads, enqueue stores, and poll completions from prior work.
+  </p>
+
+  <div class="arch">
+    <div class="lane-wrap">
+      <div class="lane-heads">
+        <div>phase</div>
+        <div>Mixin / connector facade</div>
+        <div>MooncakeStoreWorker</div>
+        <div>Recv thread</div>
+        <div>Send thread</div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">bind</div>
+        <div class="lcell worker"><code>bind_connector_metadata(meta)</code></div>
+        <div class="lcell data">Metadata is stored on connector base.</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">start</div>
+        <div class="lcell worker"><code>start_load_kv(...)</code></div>
+        <div class="lcell">No-op for Mooncake Store.</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">forward</div>
+        <div class="lcell worker">Model forward executes.</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">finish</div>
+        <div class="lcell worker"><code>get_finished(finished_req_ids)</code></div>
+        <div class="lcell worker">Reads metadata; enqueues load and store jobs.</div>
+        <div class="lcell store"><code>add_request(load ReqMeta)</code></div>
+        <div class="lcell store"><code>add_request(save ReqMeta)</code></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">I/O</div>
+        <div class="lcell"></div>
+        <div class="lcell"></div>
+        <div class="lcell store"><code>batch_get_into_multi_buffers()</code></div>
+        <div class="lcell store"><code>batch_put_from_multi_buffers()</code></div>
+      </div>
+      <div class="lane-row">
+        <div class="step-num">poll</div>
+        <div class="lcell worker">Returns <code>KVConnectorOutput</code>.</div>
+        <div class="lcell worker">Collects done sets.</div>
+        <div class="lcell store"><code>done_recving</code></div>
+        <div class="lcell store"><code>done_sending</code></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Load path</h3>
+  <ol>
+    <li><code>get_finished()</code> finds each request with <code>load_spec.can_load</code>.</li>
+    <li>It sets <code>load_spec.token_len</code> to the external cached length.</li>
+    <li>It enqueues the request on <code>KVCacheStoreRecvingThread</code>.</li>
+    <li>The recv thread uses <code>coord.load_mask()</code> to skip chunks the local KV spec would not populate.</li>
+    <li>It turns each chunk into Mooncake keys and GPU address/size lists.</li>
+    <li>It calls <code>batch_get_into_multi_buffers()</code> and marks the request finished.</li>
+  </ol>
+
+  <h3>Store path</h3>
+  <ol>
+    <li><code>get_finished()</code> records a CUDA event when any request can save.</li>
+    <li>Each save request receives that event and is enqueued on <code>KVCacheStoreSendingThread</code>.</li>
+    <li>The send thread aligns token length to <code>coord.lcm_block_size</code>.</li>
+    <li>It uses <code>coord.store_mask()</code> to avoid storing chunks that no future hit would need.</li>
+    <li>It deduplicates with <code>batch_is_exist()</code>.</li>
+    <li>It synchronizes the CUDA event before reading GPU memory.</li>
+    <li>It calls <code>batch_put_from_multi_buffers()</code> and decrements outstanding store jobs.</li>
+  </ol>
+
+  <h2 id="completion">11. Completion feedback</h2>
+  <p>
+    Completion has two meanings:
+    <code>finished_recving</code> means remote KV is now loaded into local GPU
+    blocks, while <code>finished_sending</code> means blocks whose free was delayed
+    for store can now be released.
+  </p>
+
+  <div class="pipe">
+    <div class="node">
+      <strong>Worker</strong>
+      <code>get_finished()</code><br />
+      returns <code>(done_sending, done_recving)</code>
+    </div>
+    <div class="node">
+      <strong>Model output</strong>
+      <code>ModelRunnerOutput.kv_connector_output</code><br />
+      carries the two sets to scheduler.
+    </div>
+    <div class="node">
+      <strong>Scheduler</strong>
+      <code>_update_from_kv_xfer_finished()</code><br />
+      handles send/recv sets.
+    </div>
+    <div class="node">
+      <strong>Queues</strong>
+      recv moves waiting request back toward scheduling; send frees delayed blocks.
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Worker signal</th>
+        <th>Scheduler action</th>
+        <th>Code pointer</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>finished_recving</code></td>
+        <td>
+          If request is <code>WAITING_FOR_REMOTE_KVS</code>, add request ID to
+          <code>finished_recving_kv_req_ids</code>. A later scheduler pass promotes
+          it and caches blocks.
+        </td>
+        <td><code>scheduler.py:2142-2148</code>, <code>2060-2109</code></td>
+      </tr>
+      <tr>
+        <td><code>finished_sending</code></td>
+        <td>
+          Free blocks and remove the request row, because the connector has
+          completed any delayed save/send responsibility.
+        </td>
+        <td><code>scheduler.py:2151-2154</code></td>
+      </tr>
+      <tr>
+        <td><code>kv_cache_events</code></td>
+        <td>
+          Mooncake connector facade aggregates worker KV events and exposes them
+          through <code>take_events()</code>.
+        </td>
+        <td><code>connector.py:196-216</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="hma">12. HMA and block-size frames</h2>
+  <p>
+    Mooncake Store with HMA is easiest to reason about if you keep three token
+    frames separate. Mixing these frames is the usual source of wrong conclusions.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Frame</th>
+        <th>Meaning</th>
+        <th>Where used</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>native group block size</code></td>
+        <td>Each KV cache group's own physical/spec block size.</td>
+        <td><code>ChunkedTokenDatabase</code> per group, coordinator masks, address mapping.</td>
+      </tr>
+      <tr>
+        <td><code>hash_block_size</code></td>
+        <td>Granularity of <code>Request.block_hashes</code>.</td>
+        <td>Request block hasher, <code>BlockHashListWithBlockSize</code>, key generation.</td>
+      </tr>
+      <tr>
+        <td><code>scheduler_block_size</code></td>
+        <td>Safe prefix length alignment visible to the scheduler.</td>
+        <td>Scheduler <code>num_computed_tokens</code>, Mooncake hit length, HMA convergence.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>Resolver rule</strong>
+    Single group returns <code>cache_config.block_size * dcp * pcp</code> for both
+    scheduler and hash block sizes. Multiple groups use LCM of group block sizes
+    for scheduler alignment, and either explicit <code>hash_block_size</code> or
+    GCD of group block sizes for hash granularity.
+  </div>
+
+  <h3>The divisibility chain</h3>
+  <p>
+    The three frames are not independent — they are constrained to nest cleanly:
+  </p>
+
+  <pre><code>hash_block_size  |  group block_size  |  scheduler_block_size
+
+   ↑ smallest                                ↑ largest
+   one hash covers this many tokens          scheduler rounds prefix lengths
+                                             to this many tokens</code></pre>
+
+  <p>
+    Every group <code>block_size</code> is a multiple of <code>hash_block_size</code>
+    (so consecutive hashes <em>concatenate</em> into a group-level block hash via
+    <code>BlockHashListWithBlockSize</code>). The
+    <code>scheduler_block_size = lcm(group block sizes)</code>, so every prefix
+    length the scheduler reports is a clean block boundary in <em>every</em> group
+    simultaneously. The largest unit (scheduler) is the one Mooncake's send
+    thread also floors against — that is the <code>coord.lcm_block_size</code>
+    you saw in section 10's store path.
+  </p>
+
+  <h3>Worked examples</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th><code>hash_block_size</code></th>
+        <th>group <code>block_size</code></th>
+        <th><code>scheduler_block_size</code></th>
+        <th>Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Single-group full-attn, <code>cache.block_size=16</code>, no DCP/PCP</td>
+        <td>16</td>
+        <td>{16}</td>
+        <td>16</td>
+        <td>Single group: scheduler = hash = <code>block_size · dcp · pcp</code>.</td>
+      </tr>
+      <tr>
+        <td>Single-group, <code>block_size=16</code>, <code>dcp=2</code></td>
+        <td>32</td>
+        <td>{16} (physical)</td>
+        <td>32</td>
+        <td>Single-group branch multiplies by DCP/PCP. Scheduler frame and hash frame both become 32.</td>
+      </tr>
+      <tr>
+        <td>Gemma-3 (5 SWA : 1 full), both groups <code>block_size=16</code></td>
+        <td>16</td>
+        <td>{16, 16}</td>
+        <td>16</td>
+        <td>Multiple groups but uniform: <code>lcm(16,16)=16</code>, <code>gcd(16,16)=16</code>. All frames collapse.</td>
+      </tr>
+      <tr>
+        <td>Hybrid: full-attn <code>block_size=32</code>, SWA <code>block_size=16</code></td>
+        <td>16</td>
+        <td>{32, 16}</td>
+        <td>32</td>
+        <td><code>gcd(32,16)=16</code> hashes; <code>lcm(32,16)=32</code> alignment. The full-attn group concatenates 2 hashes per block; SWA uses 1 hash per block.</td>
+      </tr>
+      <tr>
+        <td>Same hybrid, but user sets <code>cache.hash_block_size=8</code></td>
+        <td>8</td>
+        <td>{32, 16}</td>
+        <td>32</td>
+        <td>Explicit override wins. Full concatenates 4 hashes per block; SWA concatenates 2. Resolver asserts both are divisible by 8.</td>
+      </tr>
+      <tr>
+        <td>Mamba + full-attn hybrid, <code>mamba_cache_mode="align"</code>, both <code>block_size=16</code></td>
+        <td>16</td>
+        <td>{16, 16}</td>
+        <td>16</td>
+        <td>"Align" forces Mamba's block size to equal <code>cache_config.block_size</code>, so divisibility holds. Mamba participates in the normal <code>gcd</code>/<code>lcm</code> dance and Mamba prefix caching is active (one state checkpoint per aligned block boundary).</td>
+      </tr>
+      <tr>
+        <td>Mamba + full-attn hybrid, <code>mamba_cache_mode</code> ≠ <code>"align"</code> (<code>"all"</code> or <code>"none"</code>)</td>
+        <td>= scheduler</td>
+        <td>{cache.bs, Mamba's own size}</td>
+        <td>LCM of the above</td>
+        <td>Mamba's block diverges from <code>cache_config.block_size</code> (e.g. it caches one state per request, not per <code>block_size</code> tokens). Divisibility breaks; resolver backs off so <code>hash_block_size = scheduler_block_size</code> — no finer hashing.</td>
+      </tr>
+      <tr>
+        <td>Multi-group, prefix caching off, no KV connector</td>
+        <td>= scheduler</td>
+        <td>varies</td>
+        <td>LCM</td>
+        <td>Block hashes are only consumed by prefix caching and connectors. With both inactive, the resolver collapses hash to scheduler to skip the work.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Walking through the hybrid {32, 16} case end-to-end</h3>
+  <p>
+    Concrete tokens. Block sizes: full-attn group = 32, SWA group = 16,
+    <code>hash_block_size = gcd(32, 16) = 16</code>,
+    <code>scheduler_block_size = lcm(32, 16) = 32</code>.
+  </p>
+  <pre><code>Tokens:        [0..15] [16..31] [32..47] [48..63] [64..79] ...
+
+block_hashes:    H0      H1       H2       H3       H4         # one per hash_block_size (16)
+
+SWA group blocks (block_size=16):
+  block 0: H0       block 1: H1       block 2: H2 ...
+
+Full-attn group blocks (block_size=32, via BlockHashListWithBlockSize):
+  block 0: H0||H1   block 1: H2||H3   block 2: H4||H5 ...
+
+Scheduler num_computed_tokens (must be multiple of 32):
+  valid:    0, 32, 64, 96, ...
+  invalid:  16, 48 — full-attn group would land mid-block</code></pre>
+
+  <p>
+    When Mooncake's lookup returns "I have 48 cached tokens" but
+    <code>scheduler_block_size = 32</code>, the scheduler rounds <em>down</em> to
+    32 — because 48 would leave the full-attn group's block 1 half-populated and
+    the manager has no partial-block representation.
+  </p>
+
+  <h3>How each frame is used at runtime</h3>
+  <div class="grid">
+    <div class="box">
+      <h3><code>hash_block_size</code> (smallest)</h3>
+      <ul>
+        <li>Driven by <code>get_request_block_hasher(block_size=hash_block_size)</code> in <code>core.py:202-211</code>.</li>
+        <li>One <code>BlockHash</code> in <code>Request.block_hashes</code> per <code>hash_block_size</code> tokens.</li>
+        <li>The Mooncake <code>PoolKey</code>'s <code>chunk_hash</code> is the hex of either one of these hashes (when group block size equals hash block size) or a concatenation of consecutive ones (when group block size is larger).</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>group <code>block_size</code> (middle)</h3>
+      <ul>
+        <li>Each <code>KVCacheGroup.kv_cache_spec.block_size</code> — the physical paging unit for that group's GPU tensor.</li>
+        <li>One <code>ChunkedTokenDatabase</code> per group, parameterized by this size, drives token-range → GPU-address translation.</li>
+        <li><code>SingleTypeKVCacheManager</code> subclasses (<code>FullAttentionManager</code>, <code>SlidingWindowManager</code>, ...) all iterate in this frame.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3><code>scheduler_block_size</code> (largest)</h3>
+      <ul>
+        <li>LCM of all group block sizes.</li>
+        <li>Scheduler's <code>num_computed_tokens</code> is always a multiple of this — guarantees a clean block boundary in every group.</li>
+        <li>Mooncake's send thread re-floors <code>token_len_chunk</code> to this before issuing <code>batch_put</code>: <code>token_len = token_len_chunk // lcm_block_size * lcm_block_size</code>.</li>
+        <li>External lookup return value is also clamped to this in <code>MooncakeStoreScheduler.get_num_new_matched_tokens</code>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>The trap</strong>
+    <code>cache_config.block_size</code> is the user-facing knob, but it is
+    <em>not</em> any of these three frames directly. It is the
+    <em>seed</em> for them: single-group multiplies it by DCP·PCP to get the
+    scheduler size; multi-group uses it as the basis for each group's spec
+    block size, then derives scheduler/hash from those. When a connector emits
+    <code>BlockStored</code> events it ships <code>original_block_size =
+    cache_config.block_size</code> so external consumers can re-index in the
+    user-visible frame — never in the LCM-stretched effective frame.
+  </div>
+
+  <p>
+    The coordinator is the HMA bridge. It mirrors vLLM cache-manager hit logic
+    over an <code>ExternalCachedBlockPool</code>, not over local allocated blocks.
+    Lookup feeds it an existence set from Mooncake keys. Load and store paths ask
+    it for masks so each group only transfers chunks that the corresponding KV
+    spec would actually use.
+  </p>
+
+  <pre><code>MooncakeStoreCoordinator
+  find_longest_cache_hit(block_hashes, max_length, ExternalCachedBlockPool)
+    -> (load_mask_per_group, hit_length)
+
+  load_mask(block_hashes, token_len)
+    -> which chunks to load locally
+
+  store_mask(aligned_token_len)
+    -> which chunks are worth storing for future hits</code></pre>
+
+  <h2 id="read-order">13. Suggested read order</h2>
+  <ol class="source-list">
+    <li>
+      Start with <code>vllm/v1/engine/core.py:141-156</code> and
+      <code>202-211</code> to see how scheduler/hash block sizes and request hashing
+      are wired into v1.
+    </li>
+    <li>
+      Read the scheduler connector calls in
+      <code>vllm/v1/core/sched/scheduler.py:597-603</code>,
+      <code>746-751</code>, <code>887-922</code>, and <code>2127-2154</code>.
+    </li>
+    <li>
+      Read <code>vllm/v1/worker/kv_connector_model_runner_mixin.py:85-119</code>
+      to understand exactly when worker-side connector methods are invoked.
+    </li>
+    <li>
+      Read <code>mooncake/store/connector.py:80-147</code> to see how one connector
+      class splits into scheduler and worker role objects.
+    </li>
+    <li>
+      Read <code>mooncake/store/scheduler.py:84-127</code> for lookup and
+      <code>163-366</code> for metadata construction.
+    </li>
+    <li>
+      Read <code>mooncake/store/data.py:70-149</code> for key/address translation,
+      then <code>195-290</code> for metadata payload shape.
+    </li>
+    <li>
+      Read <code>mooncake/store/worker.py:1090-1186</code> first, then jump back to
+      <code>393-623</code> and <code>626-759</code> for send/recv thread internals.
+    </li>
+    <li>
+      Finish with <code>mooncake/store/coordinator.py:55-284</code>; it explains
+      why HMA lookup/load/store are not just flat block-list operations.
+    </li>
+  </ol>
+
+  <div class="callout good">
+    <strong>Practical debugging tip</strong>
+    When a request appears stuck, ask which boundary failed: scheduler never
+    emitted load metadata, worker never enqueued the recv, recv completed but
+    <code>finished_recving</code> did not reach scheduler, or scheduler received
+    it but did not promote <code>WAITING_FOR_REMOTE_KVS</code>.
+  </div>
+</main>
+</body>
+</html>

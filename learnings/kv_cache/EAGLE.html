@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EAGLE + SWA Prefix-Cache Lookahead Block (PR #44082)</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    PR: <a href="https://github.com/vllm-project/vllm/pull/44082">vllm-project/vllm#44082</a>
+  </div>
+
+  <h1>EAGLE + SWA: caching the lookahead block</h1>
+  <p class="subtitle">
+    Why a memory optimization for sliding-window prefix caching
+    (<a href="https://github.com/vllm-project/vllm/pull/42258">#42258</a>)
+    silently broke <em>all</em> prefix-cache hits under EAGLE/MTP speculative
+    decoding, and how <a href="https://github.com/vllm-project/vllm/pull/44082">#44082</a>
+    caches exactly the one extra block EAGLE needs &mdash; no more.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      In a hybrid model, a sliding-window (SWA) group only needs the last
+      <code>tail</code> blocks of each <code>lcm_block_size</code>-aligned
+      segment to serve a prefix-cache hit. #42258 stopped writing the other
+      blocks of each segment into the prefix-cache hash map to save memory.
+      But <strong>EAGLE/MTP needs <code>tail + 1</code> contiguous cached
+      blocks</strong> &mdash; it matches one block <em>past</em> the aligned
+      boundary, then drops it. That lookahead block lives at the
+      <em>first</em> position of the next segment &mdash; exactly the position
+      the mask skipped. Result: EAGLE + SWA found <strong>zero</strong> cache
+      hits. #44082 fixes this by caching that single extra block (and only
+      that one), keeping the memory win for the non-EAGLE path.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#bg">Background: SWA prefix caching in hybrid models</a></li>
+      <li><a href="#mask">The #42258 optimization: the segment mask</a></li>
+      <li><a href="#eagle">What EAGLE needs: tail + 1 contiguous blocks</a></li>
+      <li><a href="#bug">The bug: the lookahead block was never cached</a></li>
+      <li><a href="#fix">The fix: cache exactly one extra block</a></li>
+      <li><a href="#rename">The <code>use_eagle</code> &rarr; <code>drop_eagle</code> rename</a></li>
+      <li><a href="#specgroup">SpecGroup: carrying the eagle bit explicitly</a></li>
+      <li><a href="#tests">Tests &amp; the alternative PR</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="bg">1. Background: SWA prefix caching in hybrid models</h2>
+
+  <p>
+    A hybrid model mixes attention types &mdash; e.g. some layers use full
+    attention, some use sliding-window attention (SWA). Each type is a separate
+    <strong>KV cache group</strong> with its own <code>block_size</code>. Prefix
+    caching must produce a hit length that is valid for <em>every</em> group at
+    once, so the cache-hit length is required to be a multiple of the
+    <strong>LCM of all groups' block sizes</strong>.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/core/kv_cache_coordinator.py</span> (HybridKVCacheCoordinator)</strong>
+<pre><code>self.lcm_block_size = lcm(*(g.spec.block_size for g in self.attention_groups))</code></pre>
+  </div>
+
+  <p>This <code>lcm_block_size</code> defines an <strong>aligned segment</strong>. Our running example (taken from the PR's regression tests):</p>
+
+  <table>
+    <thead><tr><th>Quantity</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>full attn <code>block_size</code></td><td>32</td><td>4 &times; SWA block</td></tr>
+      <tr><td>SWA <code>block_size</code></td><td>8</td><td>the small group</td></tr>
+      <tr><td><code>lcm_block_size</code> (alignment)</td><td><strong>32</strong> tokens</td><td>= 4 SWA blocks</td></tr>
+      <tr><td><code>per_segment</code></td><td>4 blocks</td><td><code>alignment / block_size</code></td></tr>
+      <tr><td>SWA <code>sliding_window</code></td><td>8 tokens</td><td>1 block of context</td></tr>
+      <tr><td><code>tail</code></td><td>1 block</td><td><code>cdiv(window&minus;1, block_size)</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The key insight for SWA: within a <code>per_segment = 4</code>-block window,
+    a sliding window of 8 tokens only ever reads back <code>tail = 1</code>
+    block. The other 3 blocks of each segment fall outside the window for any
+    aligned boundary &mdash; they can <em>never</em> participate in an aligned
+    cache hit.
+  </p>
+
+  <h2 id="mask">2. The #42258 optimization: the segment mask</h2>
+
+  <p>
+    Since those earlier blocks can never serve a hit, #42258 decided not to
+    write them into the prefix-cache hash map at all (saving hash-map entries
+    and the bookkeeping that comes with them). It did this with a per-block
+    <em>cache mask</em> in <code>SlidingWindowManager</code>:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Before (#42258): <span class="fileref">single_type_kv_cache_manager.py</span> <code>_cache_block_mask</code></strong>
+<pre><code>per_segment = alignment_tokens // self.block_size      # 4
+tail = cdiv(self.sliding_window - 1, self.block_size)  # 1
+if tail >= per_segment:
+    return None                # cache everything (no savings possible)
+skip = per_segment - tail      # 3
+return [i % per_segment >= skip for i in range(num_cached_blocks, num_full_blocks)]
+#       only the LAST `tail` block(s) of each 4-block segment are cached</code></pre>
+  </div>
+
+  <p>For our numbers, <code>skip = 3</code>, so block <code>i</code> is cached iff <code>i % 4 &ge; 3</code> &mdash; only blocks 3, 7, 11, &hellip; (the last block of each segment):</p>
+
+  <div class="diagram">
+    <div class="diagram-title">#42258 mask (no EAGLE): only the last block of each 32-token segment is cached</div>
+    <div class="diagram-row">
+      <span class="cell label">segment 0</span>
+      <div class="cell-row tight">
+        <div class="cell sm evicted">b0</div><div class="cell sm evicted">b1</div><div class="cell sm evicted">b2</div><div class="cell sm cached">b3</div>
+      </div>
+      <span class="cell label">segment 1</span>
+      <div class="cell-row tight">
+        <div class="cell sm evicted">b4</div><div class="cell sm evicted">b5</div><div class="cell sm evicted">b6</div><div class="cell sm cached">b7</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw cached"></span>written to prefix-cache hash map</div>
+      <div class="legend-item"><span class="legend-sw evicted"></span>skipped (outside any aligned window)</div>
+    </div>
+    <div class="diagram-caption">
+      Each segment is 4 SWA blocks = 32 tokens (one aligned unit). The sliding
+      window is 1 block, so only block 3, 7, 11&hellip; (the segment tail) is
+      ever read back. The other three are pure overhead &mdash; #42258 stops
+      caching them. <strong>This is correct&hellip; until EAGLE.</strong>
+    </div>
+  </div>
+
+  <h2 id="eagle">3. What EAGLE needs: <code>tail + 1</code> contiguous blocks</h2>
+
+  <p>
+    EAGLE (and MTP) speculative decoding runs a draft head that needs the KV
+    of <em>one extra token past</em> the matched prefix as its starting context.
+    In the prefix-cache lookup, vLLM handles this by matching one additional
+    block and then <strong>dropping the last matched block</strong> &mdash; the
+    "lookahead" block. For SWA, the lookup widens its required contiguous run by
+    one:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>After #44082: shared helper used by both lookup and mask</strong>
+<pre><code>@classmethod
+def _contiguous_blocks_for_hit(cls, window_size, block_size, use_eagle) -&gt; int:
+    blocks = cdiv(window_size - 1, block_size)   # tail
+    if use_eagle:
+        blocks += 1     # match one extra block past the boundary, then drop it
+    return blocks</code></pre>
+  </div>
+
+  <p>
+    So with EAGLE, the SWA group needs <code>need = tail + 1 = 2</code>
+    contiguous cached blocks. After matching those 2 and dropping the last, it
+    is left with 1 block ending exactly on the aligned boundary. The
+    <strong>extra (dropped) block sits one position past the boundary &mdash;
+    the first block of the next segment</strong>.
+  </p>
+
+  <div class="callout info">
+    <strong>Why "one block past the boundary"?</strong>
+    The cache hit length (after the drop) must be a multiple of
+    <code>alignment_tokens</code> = 32. So the matched run is
+    <code>aligned + block_size</code> long: it ends one block beyond an aligned
+    boundary. That trailing block &mdash; index 4, 8, 12&hellip; (i.e.
+    <code>i % per_segment == 0</code>) &mdash; is the lookahead block EAGLE
+    drops.
+  </div>
+
+  <h2 id="bug">4. The bug: the lookahead block was never cached</h2>
+
+  <p>
+    Look at where the lookahead block lives versus what the mask cached. The
+    lookahead block is at <code>i % 4 == 0</code> (block 4, 8, &hellip;). But
+    the #42258 mask only cached <code>i % 4 &ge; 3</code> (block 3, 7, &hellip;).
+    <strong>The lookahead block was never written to the hash map.</strong>
+    EAGLE could therefore never find 2 contiguous cached blocks &mdash; so
+    EAGLE + SWA found <em>no</em> prefix-cache hit at all.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">The collision: lookahead block (b4) vs. what #42258 cached</div>
+    <div class="diagram-row">
+      <span class="cell label">segment 0</span>
+      <div class="cell-row tight">
+        <div class="cell sm evicted">b0</div><div class="cell sm evicted">b1</div><div class="cell sm evicted">b2</div><div class="cell sm cached">b3</div>
+      </div>
+      <span class="cell label" style="color:var(--red)">boundary&rarr;</span>
+      <div class="cell-row tight">
+        <div class="cell sm miss">b4</div><div class="cell sm evicted">b5</div><div class="cell sm evicted">b6</div><div class="cell sm cached">b7</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw cached"></span>cached by #42258 (segment tail)</div>
+      <div class="legend-item"><span class="legend-sw miss"></span>lookahead block EAGLE needs &mdash; <strong>NOT cached</strong></div>
+    </div>
+    <div class="diagram-caption">
+      To reuse the 32-token prefix ending at the segment-0 boundary, EAGLE must
+      match <strong>b3 + b4</strong> (2 contiguous blocks) then drop b4. b3 is
+      cached; <strong>b4 is not</strong>. The contiguous run is length 1, short
+      of the required 2, so the match fails and falls through to zero hit.
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>Symptom</strong>
+    A model that combines sliding-window attention with EAGLE/MTP speculative
+    decoding (where the cache-hit alignment exceeds the SWA window) gets a
+    <strong>0% prefix-cache hit rate</strong> &mdash; every request recomputes
+    its full prompt, even on an exact repeat. No crash, no error: just silently
+    lost performance.
+  </div>
+
+  <h2 id="fix">5. The fix: cache exactly one extra block</h2>
+
+  <p>
+    #44082 keeps the memory win but caches the single lookahead block EAGLE
+    needs. Two coordinated changes do this.
+  </p>
+
+  <h3>5a. <code>reachable_block_mask</code> &mdash; a shifted, widened run</h3>
+
+  <p>
+    <code>_cache_block_mask</code> is renamed to <code>reachable_block_mask</code>
+    (a classmethod now) and reworked around the shared
+    <code>_contiguous_blocks_for_hit</code> helper, so the mask and the lookup
+    can never drift apart. A block is reachable iff it falls in the
+    <code>need</code>-wide run ending at a boundary's <em>right edge</em>, where
+    EAGLE shifts that edge one block to the right:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>After #44082: <span class="fileref">single_type_kv_cache_manager.py</span> <code>SlidingWindowManager.reachable_block_mask</code></strong>
+<pre><code>per_segment = alignment_tokens // kv_cache_spec.block_size          # 4
+need = cls._contiguous_blocks_for_hit(
+    window_size=kv_cache_spec.sliding_window,
+    block_size=kv_cache_spec.block_size,
+    use_eagle=use_eagle,                                            # tail (+1 if eagle)
+)
+if need >= per_segment:
+    return None
+shift = 1 if use_eagle else 0
+return [
+    i &gt;= shift and (i - shift) % per_segment &gt;= per_segment - need
+    for i in range(start_block, num_blocks)
+]</code></pre>
+  </div>
+
+  <table>
+    <thead><tr><th>Case</th><th><code>need</code></th><th><code>shift</code></th><th>Cached blocks (mod 4)</th></tr></thead>
+    <tbody>
+      <tr><td>no EAGLE</td><td>1</td><td>0</td><td><code>i%4 &ge; 3</code> &rarr; {3} &mdash; identical to #42258</td></tr>
+      <tr><td>EAGLE</td><td>2</td><td>1</td><td><code>(i&minus;1)%4 &ge; 2</code> &rarr; {3, 4} &mdash; tail <em>plus</em> lookahead</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram">
+    <div class="diagram-title">With the fix: EAGLE mask also caches the post-boundary block (b4, b8&hellip;)</div>
+    <div class="diagram-row">
+      <span class="cell label">segment 0</span>
+      <div class="cell-row tight">
+        <div class="cell sm evicted">b0</div><div class="cell sm evicted">b1</div><div class="cell sm evicted">b2</div><div class="cell sm cached">b3</div>
+      </div>
+      <span class="cell label" style="color:var(--green)">boundary&rarr;</span>
+      <div class="cell-row tight">
+        <div class="cell sm match">b4</div><div class="cell sm evicted">b5</div><div class="cell sm evicted">b6</div><div class="cell sm cached">b7</div>
+      </div>
+      <span class="cell label" style="color:var(--green)">boundary&rarr;</span>
+      <div class="cell-row tight">
+        <div class="cell sm match">b8</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw cached"></span>segment tail (always needed)</div>
+      <div class="legend-item"><span class="legend-sw match"></span>lookahead block (now cached when EAGLE)</div>
+      <div class="legend-item"><span class="legend-sw evicted"></span>still skipped &mdash; memory win preserved</div>
+    </div>
+    <div class="diagram-caption">
+      The EAGLE mask caches 2 of every 4 blocks instead of 1 &mdash; the tail
+      <em>and</em> the next segment's first block &mdash; while still skipping
+      the middle two. Non-EAGLE behavior is byte-for-byte unchanged.
+    </div>
+  </div>
+
+  <h3 id="walkthrough">5b. <code>reachable_block_mask</code> parameter-by-parameter, with worked examples</h3>
+
+  <p>
+    This is the heart of the fix, so it is worth slowing down. The method is a
+    <code>@classmethod</code> &mdash; it holds no instance state; everything it
+    needs arrives as an argument. It is called from
+    <code>SingleTypeKVCacheManager.cache_blocks</code> like this:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Call site: <span class="fileref">single_type_kv_cache_manager.py</span> <code>cache_blocks</code></strong>
+<pre><code>block_mask = self.reachable_block_mask(
+    num_cached_blocks,   # -&gt; start_block
+    num_full_blocks,     # -&gt; num_blocks
+    alignment_tokens,    # -&gt; alignment_tokens  (= coordinator's lcm_block_size)
+    self.kv_cache_spec,  # -&gt; kv_cache_spec
+    self.use_eagle,      # -&gt; use_eagle  (propagated by the coordinator, see &sect;7)
+)</code></pre>
+  </div>
+
+  <table>
+    <thead><tr><th>Parameter</th><th>Type</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>start_block</code></td><td>int</td>
+        <td>First block index to produce a flag for. Equals
+        <code>num_cached_blocks</code> &mdash; how many blocks of this request were
+        <em>already</em> cached on a previous step. Caching is incremental, so the
+        mask only covers the newly-full blocks.</td>
+      </tr>
+      <tr>
+        <td><code>num_blocks</code></td><td>int</td>
+        <td>One past the last block index (<code>num_full_blocks</code>). The
+        returned list has length <code>num_blocks &minus; start_block</code>:
+        element <code>j</code> describes <strong>absolute</strong> block
+        <code>start_block + j</code>.</td>
+      </tr>
+      <tr>
+        <td><code>alignment_tokens</code></td><td>int</td>
+        <td>The aligned-segment size in tokens (the coordinator's
+        <code>lcm_block_size</code>). Asserted <code>&gt; block_size</code> &mdash;
+        the caller only builds a mask when a segment spans more than one block.</td>
+      </tr>
+      <tr>
+        <td><code>kv_cache_spec</code></td><td>KVCacheSpec</td>
+        <td>Source of <code>block_size</code> and <code>sliding_window</code>.
+        Asserted to be a <code>SlidingWindowSpec</code>.</td>
+      </tr>
+      <tr>
+        <td><code>use_eagle</code></td><td>bool</td>
+        <td>Whether this group caches the EAGLE lookahead block. This is the
+        <em>instance</em> flag <code>self.use_eagle</code>, propagated to every
+        manager in an EAGLE spec group (&sect;7).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p><strong>Returns:</strong> a <code>list[bool]</code> aligned to blocks
+  <code>[start_block, num_blocks)</code> &mdash; <code>True</code> = write this
+  block into the prefix-cache hash map. Or <code>None</code>, the sentinel
+  meaning "<em>cache every non-null block</em>" (the base-class default for full
+  attention; SWA returns it only when masking can save nothing).</p>
+
+  <h4>The three derived quantities</h4>
+
+  <pre><code>per_segment = alignment_tokens // block_size      # blocks per aligned segment
+need        = tail (+1 if use_eagle)              # contiguous blocks a hit consumes
+shift       = 1 if use_eagle else 0               # push the run's right edge past the boundary
+threshold   = per_segment - need                  # the comparison's right-hand side</code></pre>
+
+  <p>
+    Picture the blocks chopped into <code>per_segment</code>-sized segments.
+    An aligned cache hit ends on a segment boundary. The blocks a hit actually
+    consumes are a <code>need</code>-wide contiguous run whose <em>right edge</em>
+    sits at the boundary &mdash; on the <strong>last block before</strong> the
+    boundary for plain SWA (<code>shift=0</code>), or one block <strong>past</strong>
+    it for EAGLE (<code>shift=1</code>, the lookahead block). A block is reachable
+    iff it lands inside such a run for some boundary, which is exactly:
+  </p>
+
+  <pre><code>i &gt;= shift  AND  (i - shift) % per_segment &gt;= per_segment - need</code></pre>
+
+  <p>
+    The <code>i &gt;= shift</code> guard only matters for EAGLE at
+    <code>i = 0</code>: block 0 has no segment before it, so it can never be a
+    lookahead block. Without the guard, <code>(0 - 1) % per_segment</code> wraps
+    to <code>per_segment - 1</code> in Python and would wrongly mark block 0.
+  </p>
+
+  <h4>Example A &mdash; plain SWA (no EAGLE)</h4>
+  <p><code>block_size=8</code>, <code>alignment_tokens=32</code>,
+  <code>sliding_window=8</code>, <code>start_block=0</code>,
+  <code>num_blocks=12</code>.
+  &rArr; <code>per_segment=4</code>, <code>tail=cdiv(7,8)=1</code>,
+  <code>need=1</code>, <code>shift=0</code>, <code>threshold=4&minus;1=3</code>.
+  Condition collapses to <code>i % 4 &ge; 3</code>:</p>
+
+  <table>
+    <thead><tr><th>i</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th></tr></thead>
+    <tbody>
+      <tr><td><code>i % 4</code></td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td></tr>
+      <tr><td><code>&ge; 3?</code></td>
+        <td>F</td><td>F</td><td>F</td><td style="color:var(--green);font-weight:650">T</td>
+        <td>F</td><td>F</td><td>F</td><td style="color:var(--green);font-weight:650">T</td>
+        <td>F</td><td>F</td><td>F</td><td style="color:var(--green);font-weight:650">T</td></tr>
+    </tbody>
+  </table>
+  <p>Result: only the segment tails <code>{3, 7, 11}</code> are cached &mdash;
+  identical to the pre-fix #42258 behavior.</p>
+
+  <h4>Example B &mdash; SWA + EAGLE</h4>
+  <p>Same numbers, but <code>use_eagle=True</code>.
+  &rArr; <code>need=tail+1=2</code>, <code>shift=1</code>,
+  <code>threshold=4&minus;2=2</code>. Condition is
+  <code>i &ge; 1 AND (i&minus;1) % 4 &ge; 2</code>:</p>
+
+  <table>
+    <thead><tr><th>i</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th></tr></thead>
+    <tbody>
+      <tr><td><code>i &ge; 1</code></td><td>F</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td></tr>
+      <tr><td><code>(i&minus;1) % 4</code></td><td>&mdash;</td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td></tr>
+      <tr><td>reachable</td>
+        <td>F</td><td>F</td><td>F</td>
+        <td style="color:var(--green);font-weight:650">T</td><td style="color:var(--blue);font-weight:650">T</td>
+        <td>F</td><td>F</td>
+        <td style="color:var(--green);font-weight:650">T</td><td style="color:var(--blue);font-weight:650">T</td>
+        <td>F</td><td>F</td>
+        <td style="color:var(--green);font-weight:650">T</td><td style="color:var(--blue);font-weight:650">T</td></tr>
+    </tbody>
+  </table>
+  <p>Result: <code>{3, 4, 7, 8, 11, 12}</code> &mdash; each segment
+  <span style="color:var(--green);font-weight:650">tail</span> <em>plus</em> the
+  <span style="color:var(--blue);font-weight:650">lookahead block</span> just past
+  the boundary. Two cached blocks per segment instead of one; the middle two are
+  still skipped, so most of the #42258 memory win survives.</p>
+
+  <h4>Example C &mdash; incremental call (<code>start_block &gt; 0</code>)</h4>
+  <p>Same EAGLE setup, but the request already had 4 blocks cached and now has 9
+  full blocks: <code>start_block=4</code>, <code>num_blocks=9</code>. The
+  comprehension iterates absolute <code>i = 4..8</code> and uses the
+  <em>absolute</em> index in the math (the list offset is irrelevant to the
+  formula):</p>
+
+  <table>
+    <thead><tr><th>i (absolute)</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th></tr></thead>
+    <tbody>
+      <tr><td><code>(i&minus;1) % 4</code></td><td>3</td><td>0</td><td>1</td><td>2</td><td>3</td></tr>
+      <tr><td>reachable</td>
+        <td style="color:var(--blue);font-weight:650">T</td><td>F</td><td>F</td>
+        <td style="color:var(--green);font-weight:650">T</td><td style="color:var(--blue);font-weight:650">T</td></tr>
+    </tbody>
+  </table>
+  <p>Returned list: <code>[True, False, False, True, True]</code>, describing
+  blocks 4&ndash;8. Note <code>i=4</code> (a lookahead block) is correctly marked
+  even though it is the <em>first</em> element of this partial mask &mdash;
+  proof that the formula keys off the absolute block index, not the list
+  position.</p>
+
+  <h4>The <code>None</code> short-circuit</h4>
+  <p>If <code>need &ge; per_segment</code>, the run is at least as wide as a whole
+  segment, so every block is reachable and masking saves nothing &mdash; the
+  method returns <code>None</code> ("cache everything"). Example:
+  <code>sliding_window=32</code>, <code>block_size=8</code> &rArr;
+  <code>tail=cdiv(31,8)=4 = per_segment</code>, so even the non-EAGLE
+  <code>need=4 &ge; 4</code> returns <code>None</code>. This is also why a small
+  window like our example (<code>tail=1</code>) is where the optimization &mdash;
+  and therefore the original bug &mdash; actually bites.</p>
+
+  <h3>5c. <code>cache_blocks</code> &mdash; extend the cached range by one block</h3>
+
+  <p>
+    The mask only decides which blocks <em>within the cached range</em> get
+    written. But the coordinator floors the cached range to the aligned
+    boundary, so the lookahead block (which lives <em>past</em> the boundary)
+    was never even offered to the mask. The coordinator now extends the range by
+    one block for EAGLE groups:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>After #44082: <span class="fileref">kv_cache_coordinator.py</span> <code>HybridKVCacheCoordinator.cache_blocks</code></strong>
+<pre><code>aligned_num_computed_tokens = (
+    num_computed_tokens // self.lcm_block_size * self.lcm_block_size
+)
+for manager in self.single_type_managers:
+    num_tokens_to_cache = aligned_num_computed_tokens
+    # EAGLE groups match one block past each aligned boundary and drop
+    # it, so make that lookahead block eligible to be cached.
+    if manager.use_eagle and aligned_num_computed_tokens &gt; 0:
+        num_tokens_to_cache = min(
+            num_computed_tokens,
+            aligned_num_computed_tokens + manager.block_size,
+        )
+    manager.cache_blocks(request, num_tokens_to_cache,
+                         alignment_tokens=self.lcm_block_size)</code></pre>
+  </div>
+
+  <div class="callout good">
+    <strong>Why both changes are needed</strong>
+    <code>cache_blocks</code> widens the <em>range</em> of blocks passed to the
+    manager (now reaching the lookahead block); <code>reachable_block_mask</code>
+    decides <em>which</em> blocks in that range to actually write (the tail +
+    the lookahead, not the skipped middle). One without the other either never
+    sees the block or writes back the blocks we wanted to skip.
+  </div>
+
+  <h2 id="rename">6. The <code>use_eagle</code> &rarr; <code>drop_eagle</code> rename</h2>
+
+  <p>
+    The <code>find_longest_cache_hit</code> parameter <code>use_eagle</code> is
+    renamed to <code>drop_eagle</code> across all manager subclasses. This is
+    not cosmetic &mdash; it disentangles two genuinely different things that
+    used to share one name:
+  </p>
+
+  <table>
+    <thead><tr><th>Name</th><th>Kind</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>self.use_eagle</code></td>
+        <td>instance attribute</td>
+        <td>This group is an EAGLE/MTP group. Fixed for the manager's lifetime. Read by the cache-write path (<code>cache_blocks</code> / <code>reachable_block_mask</code>).</td>
+      </tr>
+      <tr>
+        <td><code>drop_eagle</code></td>
+        <td>per-call argument</td>
+        <td>On <em>this</em> lookup pass, drop the last matched block. Can be <code>False</code> even for an EAGLE manager &mdash; e.g. after the drop has already been applied earlier in the hybrid fixed-point convergence loop.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout code-ref">
+    <strong>The fixed-point loop in <span class="fileref">kv_cache_coordinator.py</span> &mdash; where they diverge</strong>
+<pre><code>drop_eagle = use_eagle and idx not in eagle_verified
+# ... match with drop_eagle, then:
+if drop_eagle:
+    eagle_verified.add(idx)   # next pass for this group: drop_eagle=False</code></pre>
+  </div>
+
+  <p>
+    The hybrid coordinator re-scans groups until the hit length stops changing.
+    An EAGLE group (<code>use_eagle=True</code>) drops its lookahead block on the
+    first pass, then is marked verified, so subsequent passes use
+    <code>drop_eagle=False</code> even though it is still an EAGLE group. The old
+    single name <code>use_eagle</code> conflated "is an eagle group" with "drop
+    on this pass," which is exactly the distinction the cache-write path now
+    depends on.
+  </p>
+
+  <h2 id="specgroup">7. SpecGroup: carrying the eagle bit explicitly</h2>
+
+  <p>
+    Previously the coordinator tracked which attention groups were EAGLE in a
+    separate <code>eagle_attn_group_indices</code> set, recomputed by scanning
+    membership. #44082 replaces this with a <code>SpecGroup</code> NamedTuple
+    that carries the <code>use_eagle</code> bit alongside the spec and member
+    group ids, then propagates that bit onto each
+    <code>SingleTypeKVCacheManager</code> instance:
+  </p>
+
+  <div class="callout code-ref">
+    <strong><span class="fileref">kv_cache_coordinator.py</span></strong>
+<pre><code>class SpecGroup(NamedTuple):
+    spec: KVCacheSpec
+    group_ids: list[int]
+    manager_cls: type[SingleTypeKVCacheManager]
+    use_eagle: bool      # True iff ANY member group is EAGLE/MTP
+
+# ... after grouping by spec:
+for group in self.attention_groups:
+    if group.use_eagle:
+        for gid in group.group_ids:
+            self.single_type_managers[gid].use_eagle = True</code></pre>
+  </div>
+
+  <p>
+    Notice the propagation loop sets <code>use_eagle = True</code> on
+    <em>every</em> manager in the spec group &mdash; even members that are not
+    themselves EAGLE groups. That looks wrong at first glance. The next two
+    sections explain when groups land in the same <code>SpecGroup</code> and why
+    the propagation is necessary.
+  </p>
+
+  <h3 id="batching">7a. When are two groups batched into one SpecGroup?</h3>
+
+  <p>
+    Batching happens once at startup in
+    <code>HybridKVCacheCoordinator.verify_and_split_kv_cache_groups</code>. It
+    walks the KV cache groups in order and, for each, looks for an
+    already-seen <code>SpecGroup</code> whose spec is <strong>equal</strong> to
+    this group's spec. Equal &rarr; append to it; otherwise &rarr; start a new
+    <code>SpecGroup</code>:
+  </p>
+
+  <div class="callout code-ref">
+    <strong><span class="fileref">kv_cache_coordinator.py</span> <code>verify_and_split_kv_cache_groups</code></strong>
+<pre><code>for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+    spec = g.kv_cache_spec
+    use_eagle = i in self.eagle_group_ids
+    for idx, group in enumerate(self.attention_groups):
+        if group.spec == spec:                 # &lt;-- the batching condition
+            assert manager_cls is group.manager_cls
+            group.group_ids.append(i)          # join existing SpecGroup
+            if use_eagle and not group.use_eagle:
+                self.attention_groups[idx] = group._replace(use_eagle=True)
+            break
+    else:
+        self.attention_groups.append(          # new SpecGroup
+            SpecGroup(spec, [i], manager_cls, use_eagle)
+        )</code></pre>
+  </div>
+
+  <p>
+    The whole rule is the single line <code>group.spec == spec</code>. Specs are
+    <strong>frozen dataclasses</strong> (<span class="fileref">vllm/v1/kv_cache_interface.py</span>),
+    so <code>==</code> is field-by-field equality: two groups batch together iff
+    they are the <em>same spec subclass</em> <strong>and</strong> every field
+    matches &mdash; <code>block_size</code>, <code>num_kv_heads</code>,
+    <code>head_size</code>, <code>dtype</code>, <code>kv_quant_mode</code>, and
+    (for SWA) <code>sliding_window</code>.
+  </p>
+
+  <table>
+    <thead><tr><th>Two groups&hellip;</th><th>Batched?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Full attn + SWA</td><td style="color:var(--red);font-weight:650">no</td><td>different spec subclass &mdash; <code>FullAttentionSpec &ne; SlidingWindowSpec</code></td></tr>
+      <tr><td>two SWA, windows 8 vs 4096</td><td style="color:var(--red);font-weight:650">no</td><td><code>sliding_window</code> field differs</td></tr>
+      <tr><td>two SWA, identical fields (e.g. main layer + MTP draft head)</td><td style="color:var(--green);font-weight:650">yes</td><td>same subclass, all fields equal</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Why batch at all?</strong>
+    Groups with the same spec have byte-identical cache geometry, so vLLM runs
+    <em>one</em> cache-hit scan for all of them at once (passing the full
+    <code>group_ids</code> list to <code>find_longest_cache_hit</code>) instead
+    of repeating the same scan per group. That shared scan is precisely what
+    forces the EAGLE bit to be all-or-nothing &mdash; the subject of the next
+    section.
+  </div>
+
+  <h3 id="siblings">7b. Why a non-EAGLE sibling must also cache the lookahead block</h3>
+
+  <p>
+    With the batching rule in hand: two SWA groups with identical specs collapse
+    into one <code>SpecGroup</code> and are looked up <strong>jointly in a
+    single scan</strong>. Here is the concrete config from
+    <code>test_eagle_grouped_swa_siblings_use_same_cache_mask</code>:
+  </p>
+
+  <table>
+    <thead><tr><th>Group id</th><th>Name</th><th>Spec</th><th><code>is_eagle_group</code></th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td><code>full</code></td><td>FullAttention, block_size 32</td><td>&mdash;</td></tr>
+      <tr><td>1</td><td><code>swa_main</code></td><td>SlidingWindow, block_size 8, window 8</td><td><strong>no</strong></td></tr>
+      <tr><td>2</td><td><code>swa_mtp</code></td><td>SlidingWindow, block_size 8, window 8 <em>(same object)</em></td><td><strong>yes</strong></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Groups&nbsp;1 and&nbsp;2 have the <em>same</em> <code>SlidingWindowSpec</code>,
+    so they collapse into one <code>SpecGroup</code> with
+    <code>group_ids = [1, 2]</code>. This pairing is realistic: group&nbsp;1 is
+    the main model's sliding-window layer; group&nbsp;2 is an MTP/EAGLE draft
+    head's sliding-window layer with the identical window &mdash; one is EAGLE,
+    one is not, but their cache geometry is the same.
+  </p>
+
+  <div class="callout info">
+    <strong>The mechanism: a joint lookup requires the block in <em>all</em> siblings</strong>
+    The SWA scan in <code>find_longest_cache_hit</code> probes the block pool with
+    the whole id list at once:
+<pre><code>block_pool.get_cached_block(block_hashes[i], kv_cache_group_ids=[1, 2])</code></pre>
+    This returns a hit <strong>only if block <code>i</code> is cached for
+    <em>both</em> group&nbsp;1 and group&nbsp;2</strong>. The two siblings
+    therefore share one hit length &mdash; a block is "present" only when every
+    member cached it.
+  </div>
+
+  <p>
+    Now the problem is visible. The EAGLE group&nbsp;2 needs the lookahead block
+    (b4, b8, &hellip;) cached. But if only group&nbsp;2 cached it and the
+    non-EAGLE group&nbsp;1 used the narrow <code>tail</code>-only mask, then
+    <code>get_cached_block(b4, [1, 2])</code> would miss &mdash; group&nbsp;1
+    doesn't have b4. The joint contiguous run breaks at the boundary, and EAGLE
+    finds no hit. <strong>The fix is exactly the propagation loop above: because
+    the spec group's <code>use_eagle</code> is True, both managers get
+    <code>use_eagle = True</code>, so group&nbsp;1 also caches b4/b8.</strong>
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Joint lookup of siblings [1, 2]: a block counts only if both cached it</div>
+    <div class="diagram-row">
+      <span class="cell label">grp 1 (swa_main)</span>
+      <div class="cell-row tight">
+        <div class="cell sm evicted">b3?</div><div class="cell sm match">b4</div>
+      </div>
+      <span class="cell label">grp 2 (swa_mtp, eagle)</span>
+      <div class="cell-row tight">
+        <div class="cell sm cached">b3</div><div class="cell sm match">b4</div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <strong>Without the fix</strong>, group&nbsp;1 (non-EAGLE) would skip b4, so
+      the joint probe <code>get_cached_block(b4, [1,&nbsp;2])</code> fails and
+      EAGLE's 2-block run collapses. <strong>With the fix</strong>, the EAGLE bit
+      propagates to group&nbsp;1, both cache b4, and the joint lookahead match
+      succeeds. The test asserts
+      <code>get_cached_block(b4, [1,&nbsp;2])</code> and
+      <code>get_cached_block(b8, [1,&nbsp;2])</code> both hit, and the replay
+      yields a <code>8&nbsp;&times;&nbsp;block_size = 64</code>-token cache hit.
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>One-line takeaway</strong>
+    Siblings sharing a spec are cached and matched as a unit, so "drop the EAGLE
+    lookahead block" can't be decided per-group &mdash; it's all-or-nothing
+    across the spec group. If <em>any</em> member is EAGLE, <em>every</em> member
+    must cache the lookahead block, or the joint lookup can never see it.
+  </div>
+
+  <h2 id="tests">8. Tests &amp; the alternative PR</h2>
+
+  <p>Three new regression tests in <span class="fileref">tests/v1/core/test_prefix_caching.py</span>:</p>
+
+  <ul>
+    <li>
+      <code>test_eagle_swa_alignment_caches_extra_block</code> &mdash; primes a
+      16-block prompt, frees it, replays it; asserts the second request gets a
+      <strong>non-zero</strong> hit (the headline bug) and the hit lands on a
+      32-token boundary.
+    </li>
+    <li>
+      <code>test_eagle_swa_boundary_caches_post_boundary_block</code> &mdash; with
+      a 5-block prompt, asserts both block&nbsp;3 (tail) <em>and</em>
+      block&nbsp;4 (lookahead) are in the cache, and the replayed hit is
+      <code>4 &times; block_size = 32</code> tokens.
+    </li>
+    <li>
+      <code>test_eagle_grouped_swa_siblings_use_same_cache_mask</code> &mdash;
+      two SWA groups sharing a spec (one EAGLE) must both cache the lookahead
+      block.
+    </li>
+  </ul>
+
+  <p>
+    The <code>drop_eagle</code> rename also touches
+    <span class="fileref">test_single_type_kv_cache_manager.py</span> and the
+    Mooncake store coordinator (which calls <code>find_longest_cache_hit</code>
+    directly).
+  </p>
+
+  <div class="callout info">
+    <strong>vs. the alternative fix (#42784)</strong>
+    A competing PR fixed the same bug by <em>disabling the SWA cache mask
+    entirely</em> when EAGLE is active &mdash; caching every SWA block and
+    forfeiting the #42258 memory savings. #44082 instead caches only the one
+    additional block EAGLE actually needs, and additionally handles grouped
+    SWA siblings and the <code>block_size &ne; alignment_tokens</code>
+    (Gemma-style) path where the post-pop re-alignment matters.
+  </div>
+
+  <div class="callout warn">
+    <strong>Mental model in one line</strong>
+    #42258 said "a block is cacheable iff it's in the segment <em>tail</em>."
+    #44082 corrects this to "&hellip;in the <code>need</code>-wide run ending at
+    the boundary's right edge" &mdash; and for EAGLE that edge is shifted one
+    block right, sweeping in the lookahead block that the drop will discard.
+  </div>
+
+  <p class="subtitle" style="margin-top:28px">
+    See also: <a href="KV_CACHE.html">KV_CACHE.html</a> for the prefix-cache
+    design, <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a> for
+    why hybrid groups exist and how LCM alignment arises, and
+    <a href="types/KV_SPECS.html">types/KV_SPECS.html</a> for the
+    <code>SlidingWindowSpec</code> definition.
+  </p>
+</main>
+</body>
+</html>

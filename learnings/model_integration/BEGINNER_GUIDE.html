@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Beginner's Guide to vLLM Model Integration</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body class="dark">
+<main>
+  <div class="crumb">
+    <a href="../kv_cache/index.html">&larr; learnings</a> &nbsp;|&nbsp;
+    companion: <a href="deepseek2_kv_cache_wiring.html">deepseek2_kv_cache_wiring.html</a> &nbsp;|&nbsp;
+    <a href="../kv_cache/BEGINNER_GUIDE.html">kv_cache/BEGINNER_GUIDE.html</a>
+  </div>
+
+  <h1>A Beginner's Guide to vLLM Model Integration</h1>
+  <p class="subtitle">
+    The <code>deepseek2_kv_cache_wiring</code> note is a <em>chronological</em> trace — it follows time, not
+    structure. This guide is the missing <strong>top-down view of the class hierarchy</strong>: which class owns
+    what, how they call each other, and exactly where the KV cache plugs in. Read this first; the trace then reads
+    as a confirmation.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR — five classes, one spine</strong>
+    <p>
+      Every text model in vLLM is the <em>same five-level nesting</em>:
+      <code>*ForCausalLM</code> (the thing the engine holds) &rarr; <code>*Model</code> (the decoder stack) &rarr;
+      <code>*DecoderLayer</code> (one transformer block) &rarr; <code>*Attention</code> (Q/K/V projections + RoPE) &rarr;
+      a leaf <code>Attention</code> / <code>MLAAttention</code> module (<strong>the only class that owns KV cache</strong>).
+      Forward calls flow <em>down</em> this chain; hidden states flow back <em>up</em>. The leaf never receives a cache
+      tensor as an argument — it <em>registers itself</em> at construction and the engine binds a tensor onto it
+      later. Models differ <em>only at the leaves</em>: Gemma-3 swaps in sliding-window vs full layers (&rarr; many
+      KV groups, column-packed memory); DeepSeek-V3.2 swaps in latent MLA + a sparse indexer (&rarr; one group,
+      per-layer tensors). The spine above is identical.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#spine">The spine: five classes, top to bottom</a></li>
+      <li><a href="#who">Who is responsible for what</a></li>
+      <li><a href="#calls">How they call each other (the forward chain)</a></li>
+      <li><a href="#cast">The supporting cast (Linear, Embedding, Norm, MLP)</a></li>
+      <li><a href="#kv">Where the KV cache plugs in</a></li>
+      <li><a href="#runtime">At run time: how kernels read &amp; write the cache</a></li>
+      <li><a href="#contract">The contract: what the engine requires of a model</a></li>
+      <li><a href="#contrast">Contrast: Gemma-3 vs DeepSeek-V3.2</a></li>
+      <li><a href="#takeaways">The big takeaways</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="spine">1. The spine: five classes, top to bottom</h2>
+
+  <p>
+    Open any model file in <code>vllm/model_executor/models/</code> — <code>llama.py</code>, <code>gemma3.py</code>,
+    <code>deepseek_v2.py</code> — and you will find the <em>same skeleton</em>, just with different names. Using Llama
+    as the reference (it is the simplest complete example):
+  </p>
+
+  <div class="trace">
+    <b>The nesting (each line constructs the next)</b> &nbsp;<span class="fileref">vllm/model_executor/models/llama.py</span><br>
+    <span class="step">1</span> <b>LlamaForCausalLM</b> &nbsp;<span class="c"># the engine holds THIS object</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;owns <code>.model</code> + <code>.lm_head</code> + <code>.logits_processor</code><br>
+    <span class="step">2</span> &nbsp;&nbsp;→ <b>LlamaModel</b> &nbsp;<span class="c"># the decoder stack</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;owns <code>.embed_tokens</code> + <code>.layers[]</code> + <code>.norm</code><br>
+    <span class="step">3</span> &nbsp;&nbsp;&nbsp;&nbsp;→ <b>LlamaDecoderLayer</b> &nbsp;<span class="c"># one transformer block, built N times</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;owns <code>.self_attn</code> + <code>.mlp</code> + 2 layernorms<br>
+    <span class="step">4</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ <b>LlamaAttention</b> &nbsp;<span class="c"># projections + RoPE</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;owns <code>.qkv_proj</code> + <code>.o_proj</code> + <code>.rotary_emb</code> + <code>.attn</code><br>
+    <span class="step">5</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ <b>Attention</b> &nbsp;<span class="fileref">layers/attention/attention.py</span> &nbsp;<span class="c"># ★ THE KV CACHE OWNER</span>
+  </div>
+
+  <div class="callout info">
+    <strong>The naming convention is load-bearing.</strong> The HF architecture string (e.g.
+    <code>"LlamaForCausalLM"</code> in <code>config.json</code>) is looked up in the <code>ModelRegistry</code> to find
+    the top class. From there the <code>*Model</code> / <code>*DecoderLayer</code> / <code>*Attention</code> names are
+    just convention — but <em>every</em> model follows it, which is why once you know one model you can read any of
+    them.
+  </div>
+
+  <h2 id="who">2. Who is responsible for what</h2>
+
+  <table>
+    <thead><tr><th>Class</th><th>Owns</th><th>Responsible for</th><th>Does NOT do</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>LlamaForCausalLM</strong><br><span class="c">the "runner-facing" object</span></td>
+        <td><code>model</code>, <code>lm_head</code> (<code>ParallelLMHead</code>), <code>logits_processor</code></td>
+        <td>The <em>outer contract</em>: <code>forward()</code> → hidden states, <code>compute_logits()</code> →
+          vocab logits, <code>load_weights()</code> → maps checkpoint tensors onto submodules. Declares which
+          capabilities it supports (<code>SupportsLoRA</code>, <code>SupportsPP</code>, …).</td>
+        <td>No attention math, no KV cache. It's a thin shell that delegates everything to <code>.model</code>.</td>
+      </tr>
+      <tr>
+        <td><strong>LlamaModel</strong><br><span class="c">the decoder stack</span></td>
+        <td><code>embed_tokens</code> (<code>VocabParallelEmbedding</code>), <code>layers[]</code>, <code>norm</code>
+          (<code>RMSNorm</code>)</td>
+        <td>Token-ids → embeddings, run all N blocks in order, final norm. Handles pipeline-parallel boundaries
+          (receives/returns <code>IntermediateTensors</code>).</td>
+        <td>Doesn't produce logits (that's the head). Doesn't know what attention <em>type</em> each layer is.</td>
+      </tr>
+      <tr>
+        <td><strong>LlamaDecoderLayer</strong><br><span class="c">one transformer block</span></td>
+        <td><code>self_attn</code>, <code>mlp</code> (<code>LlamaMLP</code>), <code>input_layernorm</code>,
+          <code>post_attention_layernorm</code></td>
+        <td>The residual-stream choreography: norm → attention → add residual → norm → MLP → add residual. Built
+          <code>num_hidden_layers</code> times by <code>make_layers</code>, each with a unique <code>prefix</code>.</td>
+        <td>No projections itself — it owns the sub-modules that do them.</td>
+      </tr>
+      <tr>
+        <td><strong>LlamaAttention</strong><br><span class="c">the attention wrapper</span></td>
+        <td><code>qkv_proj</code> (<code>QKVParallelLinear</code>), <code>o_proj</code> (<code>RowParallelLinear</code>),
+          <code>rotary_emb</code>, <code>attn</code></td>
+        <td>Project hidden → Q,K,V; apply RoPE; call the leaf; project the result back. Computes head counts under
+          tensor parallelism (<code>num_heads // tp_size</code>).</td>
+        <td>Does <em>not</em> store K/V or run the attention kernel — it hands Q,K,V to <code>self.attn</code>.</td>
+      </tr>
+      <tr class="hot">
+        <td><strong>Attention</strong> ★<br><span class="c">the leaf — KV cache owner</span></td>
+        <td><code>kv_cache</code> tensor, <code>attn_backend</code>, <code>layer_name</code>, <code>kv_cache_dtype</code></td>
+        <td><strong>Everything KV-cache.</strong> Registers itself in <code>static_forward_context</code>; declares its
+          <code>get_kv_cache_spec()</code>; on forward, writes new K/V into its slots and runs the backend kernel to
+          read the cached range.</td>
+        <td>No projections (those are its parent's job). It receives Q,K,V already computed.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>The one sentence that unlocks the hierarchy.</strong> Levels 1–4 are <em>plumbing</em> — they move
+    tensors around and own weights. Level 5 (<code>Attention</code>) is the <em>only</em> place state persists across
+    decode steps, and it is the only class the KV-cache machinery knows or cares about. Everything in the
+    <a href="deepseek2_kv_cache_wiring.html">wiring trace</a> happens at level 5.
+  </div>
+
+  <h2 id="calls">3. How they call each other (the forward chain)</h2>
+
+  <p>
+    A single decode step calls <code>model.forward()</code> once. That call threads <em>down</em> the spine carrying
+    <code>(input_ids, positions)</code>, and hidden states thread back <em>up</em>. Here is the whole chain with the
+    actual method bodies (condensed from <code>llama.py</code>):</p>
+
+  <pre><span class="c"># LEVEL 1 — LlamaForCausalLM.forward  (the engine calls this)</span>
+hidden = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+<span class="k">return</span> hidden                       <span class="c"># logits computed separately, see §7</span>
+
+<span class="c"># LEVEL 2 — LlamaModel.forward</span>
+hidden = self.embed_tokens(input_ids)    <span class="c"># ids → vectors (first PP rank only)</span>
+residual = <span class="k">None</span>
+<span class="k">for</span> layer <span class="k">in</span> self.layers:           <span class="c"># the decoder stack</span>
+    hidden, residual = layer(positions, hidden, residual)
+hidden, _ = self.norm(hidden, residual)  <span class="c"># final RMSNorm (last PP rank only)</span>
+<span class="k">return</span> hidden
+
+<span class="c"># LEVEL 3 — LlamaDecoderLayer.forward  (residual-stream choreography)</span>
+hidden, residual = self.input_layernorm(hidden, residual)
+hidden = self.self_attn(positions, hidden)             <span class="c"># ↓ into level 4</span>
+hidden, residual = self.post_attention_layernorm(hidden, residual)
+hidden = self.mlp(hidden)
+<span class="k">return</span> hidden, residual
+
+<span class="c"># LEVEL 4 — LlamaAttention.forward  (projections + RoPE)</span>
+qkv, _ = self.qkv_proj(hidden)
+q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+q, k = self.rotary_emb(positions, q, k)
+attn_out = self.attn(q, k, v)                          <span class="c"># ↓ into level 5 — the cache</span>
+out, _ = self.o_proj(attn_out)
+<span class="k">return</span> out
+
+<span class="c"># LEVEL 5 — Attention.forward  (the KV cache owner)</span>
+<span class="c"># writes k,v into self.kv_cache at this step's slots, then</span>
+<span class="c"># the backend kernel reads the whole cached range and attends.</span></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">One forward pass: the call threads down, hidden states bubble up</div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">ForCausalLM</span>input_ids, positions</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><span class="num">Model</span>embed &rarr; loop layers &rarr; norm</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><span class="num">DecoderLayer ×N</span>norm/attn/norm/mlp</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a"><span class="num">Attention (wrapper)</span>qkv &rarr; rope</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step r"><span class="num">Attention (leaf) ★</span>write+read KV cache</div>
+    </div>
+    <div class="diagram-caption">
+      The block loop (level 3) runs N times per forward. Inside each block the leaf is the only step that touches
+      persistent memory — every other box is pure projection / normalization on the current step's tokens.
+    </div>
+  </div>
+
+  <h2 id="cast">4. The supporting cast (you'll see these everywhere)</h2>
+
+  <p>The five spine classes are built out of a small, reused toolbox. You don't need to memorize their internals, but
+    recognizing them removes 80% of the noise in a model file:</p>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>Linear layers</h3>
+      <p><code>QKVParallelLinear</code> — fused Q/K/V projection, sharded by head across TP ranks.<br>
+        <code>MergedColumnParallelLinear</code> — fused gate+up for the MLP.<br>
+        <code>RowParallelLinear</code> — the output projections (<code>o_proj</code>, <code>down_proj</code>); does the
+        all-reduce.<br>
+        <span class="c">These three are why <code>load_weights</code> has a "stacked_params_mapping" — it splits
+          checkpoint <code>q_proj/k_proj/v_proj</code> into one fused <code>qkv_proj</code>.</span></p>
+    </div>
+    <div class="box">
+      <h3>Embedding &amp; head</h3>
+      <p><code>VocabParallelEmbedding</code> — token-id → vector, vocab sharded across TP.<br>
+        <code>ParallelLMHead</code> — hidden → vocab logits; optionally <em>tied</em> to the embedding weights.<br>
+        <code>LogitsProcessor</code> — applies the head and any logit scaling.</p>
+    </div>
+    <div class="box">
+      <h3>Norm, RoPE, MLP</h3>
+      <p><code>RMSNorm</code> / <code>GemmaRMSNorm</code> — the layernorms (fused add-residual variant).<br>
+        <code>get_rope(...)</code> — builds the rotary embedding.<br>
+        <code>LlamaMLP</code> — <code>gate_up_proj</code> → <code>SiluAndMul</code> → <code>down_proj</code>. (MoE
+        models swap this for a <code>FusedMoE</code> block — the attention path is unchanged.)</p>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>How the N blocks get built: <code>make_layers</code></strong>
+<pre><span class="c"># vllm/model_executor/models/utils.py — called by every *Model.__init__</span>
+self.start_layer, self.end_layer, self.layers = make_layers(
+    config.num_hidden_layers,
+    <span class="k">lambda</span> prefix: LlamaDecoderLayer(vllm_config, prefix=prefix),
+    prefix=<span class="s">f"{prefix}.layers"</span>,        <span class="c"># "model.layers.0", "model.layers.1", ...</span>
+)</pre>
+    The growing <code>prefix</code> is what gives every leaf <code>Attention</code> its globally-unique
+    <code>layer_name</code> — and that name is the key it registers under in §5. <code>make_layers</code> also
+    handles pipeline parallelism: ranks that don't own a layer get a cheap <code>PPMissingLayer</code> placeholder.
+  </div>
+
+  <h2 id="kv">5. Where the KV cache plugs in</h2>
+
+  <p>
+    This is the crux, and it's the part the class hierarchy hides until you look at level 5. The model code
+    <strong>never allocates KV memory and never passes a cache tensor as an argument</strong>. Instead the leaf
+    <code>Attention</code> module does three things across its lifetime, and the engine meets it halfway.
+  </p>
+
+  <div class="trace">
+    <b>A. AT CONSTRUCTION (inside <code>Attention.__init__</code>)</b> &nbsp;<span class="fileref">layers/attention/attention.py</span><br>
+    &nbsp;&nbsp;<code>self.layer_name = prefix</code> &nbsp;<span class="c"># its unique id from make_layers</span><br>
+    &nbsp;&nbsp;<code>compilation_config.static_forward_context[prefix] = self</code> &nbsp;<span class="c"># ← REGISTERS itself</span><br>
+    &nbsp;&nbsp;<code>self.kv_cache = torch.tensor([])</code> &nbsp;<span class="c"># placeholder; real tensor bound later</span><br>
+    <br>
+    <b>B. AT STARTUP (engine asks each registered layer)</b> &nbsp;<span class="fileref">v1/engine/core.py</span><br>
+    &nbsp;&nbsp;<code>spec = attn.get_kv_cache_spec(vllm_config)</code> &nbsp;<span class="c"># "how big is one token of my cache?"</span><br>
+    &nbsp;&nbsp;<span class="c"># engine profiles memory → computes num_blocks → allocates one tensor per layer</span><br>
+    &nbsp;&nbsp;<code>forward_context[layer_name].kv_cache = real_tensor</code> &nbsp;<span class="c"># bind_kv_cache — the wiring moment</span><br>
+    <br>
+    <b>C. AT RUN TIME (inside <code>Attention.forward</code>)</b><br>
+    &nbsp;&nbsp;write this step's K/V into <code>self.kv_cache</code> at the scheduler-assigned slots, then<br>
+    &nbsp;&nbsp;the backend kernel reads the cached range and returns the attention output.
+  </div>
+
+  <div class="callout good">
+    <strong>Register, don't allocate.</strong> Because the leaf <em>registers itself</em> by name, the engine can
+    discover every cache owner in the model generically — it never needs the model to hand its caches over. This is
+    exactly why adding a new model rarely means touching the KV-cache code: as long as your attention is built on the
+    <code>Attention</code> (or <code>MLAAttention</code>) base, registration and binding are inherited for free.
+  </div>
+
+  <p>
+    The single decision the leaf makes that ripples through the <em>entire</em> cache system is its
+    <strong>spec</strong>. <code>Attention.get_kv_cache_spec</code> returns a different spec class depending on how the
+    layer was configured:</p>
+
+  <pre><span class="c"># Attention.get_kv_cache_spec — attention.py:566 (condensed)</span>
+<span class="k">if</span> self.sliding_window <span class="k">is</span> <span class="k">not</span> <span class="k">None</span>:
+    <span class="k">return</span> SlidingWindowSpec(block_size, num_kv_heads, head_size, ...)   <span class="c"># windowed lifecycle</span>
+<span class="k">else</span>:
+    <span class="k">return</span> FullAttentionSpec(block_size, num_kv_heads, head_size, ...)    <span class="c"># lives until request ends</span></pre>
+
+  <p>
+    The spec is what the cache machinery groups, sizes, and allocates by. <em>That</em> is the bridge from "model
+    integration" into the KV-cache world — and it's exactly where Gemma-3 and DeepSeek-V3.2 diverge.
+  </p>
+  <p>&rarr; full byte-level walk in <a href="deepseek2_kv_cache_wiring.html">deepseek2_kv_cache_wiring.html</a>;
+    the cache-side design in <a href="../kv_cache/BEGINNER_GUIDE.html">kv_cache/BEGINNER_GUIDE.html</a>.</p>
+
+  <h2 id="runtime">6. At run time: how the kernels read &amp; write the cache</h2>
+
+  <p>
+    §5 ended with "the leaf writes its K/V and the backend kernel reads the cached range" — true for a vanilla model,
+    but the <em>shape</em> of that read/write is exactly what an exotic attention type changes. Here are the three
+    families you'll meet, each a different answer to two questions: <strong>what does <code>self.kv_cache</code>
+    physically hold</strong>, and <strong>how does the kernel address it</strong>. All three run inside the same
+    <code>Attention.forward</code> slot of the spine (§3) — only the leaf class differs.
+  </p>
+
+  <div class="callout info">
+    <strong>The forward splits into two ops.</strong> Look at <code>Attention.forward</code>
+    (<span class="fileref">attention.py:437</span>): it first calls a <em>KV-cache update</em> op (the WRITE), then an
+    <em>attention</em> op (the READ). The backend implements both — for FlashAttention they are
+    <code>do_kv_cache_update</code> → <code>reshape_and_cache_flash</code> (write) and <code>flash_attn_varlen_func</code>
+    (read). Both are handed <code>self.kv_cache</code> and the per-step addressing metadata (slot mapping for the write,
+    block table for the read).
+  </div>
+
+  <h3 id="rt-setup">6.1 First: where <code>block_table</code> and <code>slot_mapping</code> come from</h3>
+
+  <p>
+    The two ops above are handed two pieces of addressing metadata — the <strong>WRITE</strong> takes a
+    <code>slot_mapping</code> (one physical slot per token of <em>this</em> step) and the <strong>READ</strong> takes a
+    <code>block_table</code> (the per-request list of block ids). Neither is built by the model. Both are constructed by
+    the <code>GPUModelRunner</code> in <code>_prepare_inputs</code>, <em>before</em> the forward runs, out of the block
+    ids the scheduler already allocated (<a href="deepseek2_kv_cache_wiring.html">wiring note §6</a>). It happens in
+    two phases.</p>
+
+  <div class="trace">
+    <b>PHASE A — build the <code>block_table</code> (CPU, persists &amp; grows across steps)</b> &nbsp;<span class="fileref">v1/worker/gpu_model_runner.py · block_table.py</span><br>
+    <span class="step">1</span> scheduler's <code>allocate_slots</code> popped block ids → carried on <code>SchedulerOutput.new_block_ids</code><br>
+    <span class="step">2</span> <b>runner <code>_update_states</code></b> writes one row per request into the CPU block-table buffer:<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;• new request → <code>block_table.add_row(block_ids, row)</code> &nbsp;<span class="c"># the whole row</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;• running request → <code>block_table.append_row(new_block_ids, row)</code> &nbsp;<span class="c"># ONLY the new ids (the shortfall)</span><br>
+    <span class="step">3</span> <b><code>commit_block_table(num_reqs)</code></b> → <code>copy_to_gpu()</code> &nbsp;<span class="c"># the kernel reads it on GPU</span><br>
+    <br>
+    <b>PHASE B — compute the <code>slot_mapping</code> (GPU, rebuilt fresh every step)</b><br>
+    <span class="step">4</span> <b><code>compute_slot_mapping(num_reqs, query_start_loc, positions)</code></b> launches a Triton kernel that, per scheduled token:<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>block_index = pos // block_size</code><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>block_id&nbsp;&nbsp;&nbsp; = block_table[req, block_index]</code> &nbsp;<span class="c"># the row from Phase A</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>offset&nbsp;&nbsp;&nbsp;&nbsp; = pos %&nbsp; block_size</code><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<b><code>slot = block_id · block_size + offset</code></b><br>
+    <span class="step">5</span> tail of the buffer (CUDA-graph padding tokens) is filled with <code>PAD_SLOT_ID = -1</code> &nbsp;<span class="c"># backends skip those writes</span>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Worked example — request <code>r0</code>, <code>block_size = 16</code>, persistent block-table row <code>[40, 41, 42]</code></div>
+    <div class="diagram-row">
+      <span class="cell label">block_table[r0]</span>
+      <div class="cell-row">
+        <div class="cell wide head">idx0 → 40<br><span class="lo">pos 0–15 → slots 640–655</span></div>
+        <div class="cell wide head">idx1 → 41<br><span class="lo">pos 16–31 → slots 656–671</span></div>
+        <div class="cell wide full-grp hot">idx2 → 42<br><span class="lo">pos 32–47 → slots 672–687</span></div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      One persistent row of block ids (Phase A). The <code>slot_mapping</code> below is recomputed each step from this
+      row + only the positions scheduled <em>that</em> step. Slot for any position = <code>block_id·16 + (pos%16)</code>.
+    </div>
+  </div>
+
+  <p>
+    Here is what "covers only the scheduled tokens" means concretely. <strong>The length of <code>slot_mapping</code>
+    equals the number of tokens being <em>written</em> this step — not the sequence length.</strong> Watch it change
+    between prefill and decode for the <em>same</em> request:</p>
+
+  <div class="trace">
+    <b><span class="tag">STEP 1 — PREFILL</span> r0's 33-token prompt → all 33 positions (0–32) are scheduled</b><br>
+    &nbsp;&nbsp;<code>positions = [0, 1, …, 32]</code> &nbsp;(33 tokens processed this step)<br>
+    &nbsp;&nbsp;pos 0&nbsp; → 40·16 + 0&nbsp; = slot 640<br>
+    &nbsp;&nbsp;pos 16 → 41·16 + 0&nbsp; = slot 656<br>
+    &nbsp;&nbsp;pos 32 → 42·16 + 0&nbsp; = slot 672<br>
+    &nbsp;&nbsp;<b><code>slot_mapping = [640, 641, …, 671, 672]</code></b> &nbsp;<span class="c"># length 33 — one per prompt token</span><br>
+    <br>
+    <b><span class="tag">STEP 2 — DECODE</span> r0 generates position 33 → only 1 token is scheduled</b><br>
+    &nbsp;&nbsp;<code>positions = [33]</code> &nbsp;(1 token processed this step)<br>
+    &nbsp;&nbsp;block_index = 33 // 16 = <b>2</b> → block_id = block_table[r0, 2] = <b>42</b><br>
+    &nbsp;&nbsp;offset = 33 % 16 = <b>1</b> → slot = 42·16 + 1 = <b>673</b><br>
+    &nbsp;&nbsp;<b><code>slot_mapping = [673]</code></b> &nbsp;<span class="c"># length 1 — even though the sequence is now 34 tokens long</span>
+  </div>
+
+  <div class="callout good">
+    <strong>That's the whole point.</strong> At decode step 2 the sequence has 34 tokens, but
+    <code>slot_mapping</code> has <strong>one</strong> entry, because positions 0–32 were already written to slots
+    640–672 back in step 1. Those cached tokens are never re-written — they are only <em>read</em>, and the read finds
+    them through the <code>block_table</code>, not the <code>slot_mapping</code>. So:
+    <ul>
+      <li><code>slot_mapping</code> = the WRITE targets = <em>this step's</em> new tokens. Grows to the prompt length at
+        prefill, shrinks to 1 (or a few, with spec decode) at each decode step.</li>
+      <li><code>block_table</code> = the READ map = <em>every</em> token the request has ever cached. Only grows, by
+        one block id every <code>block_size</code> tokens.</li>
+    </ul>
+  </div>
+
+  <div class="callout info">
+    <strong>Chunked prefill: yes, only the chunk.</strong> "Scheduled tokens" is literally
+    <code>num_scheduled_tokens[req]</code> for that step. A decode request schedules 1; an <em>unchunked</em> prefill
+    schedules the whole prompt; a <strong>chunked</strong> prefill schedules only its chunk (e.g. a 4000-token prompt
+    at a 2048 budget → step A schedules positions 0–2047, step B schedules 2048–3999). So in step A
+    <code>slot_mapping</code> has 2048 entries, in step B it has 1952 — each covering <em>only</em> that chunk. The
+    positions are absolute (<code>pos = num_computed_tokens + i</code>, <span class="fileref">gpu_model_runner.py:1390</span>),
+    so <code>block_index = pos // block_size</code> still lands each chunk's tokens in the correct already-allocated
+    blocks. The <code>block_table</code> row is unchanged by chunking — it's the same growing list of blocks regardless
+    of how the prefill is sliced.
+  </div>
+
+  <p>
+    A real step batches many requests, and <code>slot_mapping</code> is a <strong>single flat 1-D tensor over the
+    whole batch's scheduled tokens</strong>, partitioned per request by <code>query_start_loc</code> (the Triton kernel
+    launches one program per request and fills that request's slice — <span class="fileref">block_table.py:354</span>).
+    E.g. r0 decoding (1 token) batched with r1 prefilling a 4-token prompt into row <code>[50, …]</code>:</p>
+
+  <div class="diagram">
+    <div class="diagram-title">One flat slot_mapping for a 2-request batch (5 scheduled tokens total)</div>
+    <div class="diagram-row">
+      <span class="cell label">slot_mapping</span>
+      <div class="cell-row tight">
+        <div class="cell xs used">673</div>
+        <div class="cell xs cached">800</div><div class="cell xs cached">801</div><div class="cell xs cached">802</div><div class="cell xs cached">803</div>
+      </div>
+    </div>
+    <div class="eq">query_start_loc = [0, 1, 5]   <span class="c"># r0 owns slot_mapping[0:1], r1 owns slot_mapping[1:5]</span><br>
+r0: 1 decode token (pos 33 → slot 673)   ·   r1: 4 prefill tokens (pos 0–3 → block 50 → slots 800–803)</div>
+    <div class="diagram-caption">
+      The batch dimension is "scheduled tokens," not "requests" — a decode request contributes 1 entry, a prefilling
+      request contributes its whole prompt. <code>query_start_loc</code> is the only thing that says where one
+      request's tokens end and the next begins. The <code>block_table</code> meanwhile has one <em>row per request</em>
+      (r0's <code>[40,41,42]</code>, r1's <code>[50,…]</code>) — different shape, different lifetime.
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>One translation table, three readers.</strong> The <code>block_table</code> is dereferenced by the write
+    (to build <code>slot_mapping</code>), by the read (to gather cached K/V), and by any sparse-index conversion
+    (DeepSeek's indexer, §6.4) — all in units of <code>block_size</code>. That shared unit is why the cache block size
+    must equal the kernel's block granularity (<a href="deepseek2_kv_cache_wiring.html">wiring note §9</a>).
+  </div>
+
+  <div class="callout warn">
+    <strong>Two different lifetimes, and one per group.</strong> The <code>block_table</code> <em>grows</em> — each
+    step <code>append_row</code>s only the newly allocated ids onto a persistent row. The <code>slot_mapping</code> is
+    <em>rebuilt from scratch</em> every step and covers only the tokens scheduled <em>this</em> step. And there is one
+    <code>block_table</code> <strong>per KV-cache group</strong> (a <code>MultiGroupBlockTable</code>) but one
+    <code>slot_mapping</code> per layer in the forward context — so Gemma-3's full and sliding groups each get their
+    own block table, while DeepSeek's 122 same-group layers all share one (§8). With those two tensors in hand, the
+    per-family ops below are just "scatter to <code>slot_mapping</code>" and "gather via <code>block_table</code>."
+  </div>
+
+  <h3 id="rt-gemma">6.2 <span class="tag full">Gemma-3</span> paged K/V — scatter write, block-table gather read</h3>
+
+  <p>
+    The standard <code>Attention</code> leaf. <code>self.kv_cache</code> is a tensor shaped
+    <code>(2, num_blocks, block_size, num_kv_heads, head_size)</code> — dim 0 is K vs V (the kernel does
+    <code>key_cache, value_cache = kv_cache.unbind(0)</code>). Each token-slot stores a real K and V vector. (In a
+    <em>vanilla</em> model that tensor is one private allocation per layer; in <em>hybrid</em> Gemma-3 it's a
+    per-<strong>column</strong> allocation shared across layers — see §6.2.1 below, which is exactly your question.)</p>
+
+  <pre><span class="c"># WRITE — do_kv_cache_update → reshape_and_cache_flash  (flash_attn.py:874)</span>
+<span class="k">for</span> t <span class="k">in</span> new_tokens:                        <span class="c"># this step's tokens only</span>
+    slot = slot_mapping[t]                  <span class="c"># = block_id·block_size + offset  (see wiring note)</span>
+    key_cache[slot]   = key[t]              <span class="c"># scatter: one token → one slot</span>
+    value_cache[slot] = value[t]
+
+<span class="c"># READ — flash_attn_varlen_func  (flash_attn.py:796)</span>
+out[t] = attend(query[t],
+                K, V  gathered via block_table[req],   <span class="c"># follows the page table</span>
+                window_size = <span class="k">None</span>        <span class="c"># FULL layer: see the whole prefix</span>
+                           | [W-1, 0])      <span class="c"># SLIDING layer: kernel masks tokens older than W</span></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Gemma-3: same write, two read widths (request holds blocks [40, 41, 42], new token at block 42)</div>
+    <div class="diagram-row">
+      <span class="cell label">K cache</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">b40</div><div class="cell xs cached">b40</div><div class="cell xs cached">…</div><div class="cell xs cached">b41</div>
+        <div class="cell xs cached">b41</div><div class="cell xs cached">…</div><div class="cell xs cached">b42</div><div class="cell xs used">b42←write</div>
+      </div>
+    </div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">WRITE</span>scatter new token → 1 slot in b42</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a"><span class="num">READ (full layer)</span>gather <em>all</em> of b40,b41,b42 via block table</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g"><span class="num">READ (sliding layer)</span>same gather, kernel keeps only the last W; old blocks already freed (NULL)</div>
+    </div>
+    <div class="diagram-caption">
+      The write is identical for every layer. The <em>read</em> is where Gemma-3's two layer types split: a single
+      <code>window_size</code> argument turns the same paged gather into "whole prefix" (full) or "last W tokens"
+      (sliding). The sliding group's block table also drops expired blocks to NULL, so they're freed early — that's
+      why sliding and full layers land in <strong>different KV-cache groups</strong> (§8).
+    </div>
+  </div>
+
+  <h4 id="rt-gemma-col">6.2.1 Column-packing: <code>self.kv_cache</code> is bound per layer, but allocated per column</h4>
+
+  <p>
+    Your question, precisely. For a vanilla single-group model, each layer gets its <em>own</em> private buffer
+    (<code>shared_by=[layer_name]</code>). Gemma-3 is different: its full and sliding layers form
+    <strong>multiple equal-sized groups</strong>, and the allocator takes the <em>general</em> column-packed branch.
+    The physical allocation count is <strong>per column, not per layer</strong> — but each layer's
+    <code>self.kv_cache</code> is still set individually (it's a <em>view</em> that aliases its column's buffer).</p>
+
+  <pre><span class="c"># get_kv_cache_config_from_groups — the general (column-packed) branch  (kv_cache_utils.py:1289)</span>
+group_size = max(len(g.layer_names) <span class="k">for</span> g <span class="k">in</span> kv_cache_groups)   <span class="c"># = layers per group</span>
+<span class="k">for</span> i <span class="k">in</span> range(group_size):                 <span class="c"># ONE tensor per column i, NOT per layer</span>
+    shared_by = [groups[j].layer_names[i] <span class="k">for</span> j <span class="k">in</span> range(len(groups))]  <span class="c"># one layer from EACH group</span>
+    kv_cache_tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by))
+
+<span class="c"># _allocate_kv_cache_tensors — one raw buffer per KVCacheTensor  (gpu_model_runner.py:6833)</span>
+<span class="k">for</span> kv_cache_tensor <span class="k">in</span> config.kv_cache_tensors:
+    tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8)   <span class="c"># the single physical buffer</span>
+    <span class="k">for</span> layer_name <span class="k">in</span> kv_cache_tensor.shared_by:
+        kv_cache_raw_tensors[layer_name] = tensor                  <span class="c"># SAME object → every layer in the column</span>
+
+<span class="c"># bind_kv_cache — each layer still gets its own self.kv_cache (a reshaped view)  (worker/utils.py:512)</span>
+forward_context[layer_name].kv_cache = kv_caches[layer_name]       <span class="c"># aliases the column buffer</span></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Gemma-3 toy layout — 3 groups, <code>group_size = 2</code> → 2 physical buffers (the code's own example)</div>
+    <div class="grid-2d" style="grid-template-columns: 110px 90px 90px">
+      <div class="lbl"></div><div class="lbl col">column 0 → T<sub>0</sub></div><div class="lbl col">column 1 → T<sub>1</sub></div>
+      <div class="lbl row">G0 <span class="tag full">FULL</span></div><div class="cell sm full-grp">full.0</div><div class="cell sm full-grp">full.1</div>
+      <div class="lbl row">G1 <span class="tag swa">SWA</span></div><div class="cell sm swa-grp">sw.0</div><div class="cell sm swa-grp">sw.2</div>
+      <div class="lbl row">G2 <span class="tag swa">SWA</span></div><div class="cell sm swa-grp">sw.1</div><div class="cell sm null">padding</div>
+    </div>
+    <div class="eq">T<sub>0</sub>.shared_by = [full.0, sw.0, sw.1]   ·   T<sub>1</sub>.shared_by = [full.1, sw.2]<br>
+self.kv_cache of full.0, sw.0, sw.1  →  all VIEWS of the one buffer T<sub>0</sub></div>
+    <div class="diagram-caption">
+      Two physical buffers for five layers — count = <code>group_size</code> (layers-per-group), not layer count. Each
+      layer's <code>self.kv_cache</code> is its own view object, but full.0 / sw.0 / sw.1 alias the <em>same</em>
+      storage T<sub>0</sub>.
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>Why aliasing is safe — the slots never collide.</strong> full.0, sw.0, sw.1 share T<sub>0</sub>'s bytes,
+    but they're in <em>different groups</em> with <em>different block tables</em>, and every block id comes from
+    <strong>one global pool</strong> (§6.1). So a given request gets <em>distinct</em> block ids per group → distinct
+    slot ranges → the three layers write to disjoint regions of T<sub>0</sub>. The shared buffer is just a memory pool;
+    the global block-id space is what keeps the columns from stepping on each other. This is the cross-group physical
+    pooling win: when SWA layers free blocks early (windowing), those slots return to the shared pool and a full layer
+    can reuse them. &rarr; <a href="../kv_cache/BEGINNER_GUIDE.html#columns">kv_cache/BEGINNER_GUIDE.html §7</a> has the
+    byte-level walk-through.
+  </div>
+
+  <div class="callout warn">
+    <strong>So, to answer directly:</strong> the <em>binding</em> (<code>layer.kv_cache = …</code>) is per layer — every
+    layer object has its own <code>self.kv_cache</code> view, and the forward pass looks <em>itself</em> up by name as
+    always. The <em>allocation</em> is per column — there are <code>group_size</code> physical buffers, each aliased by
+    one layer from each group. Contrast DeepSeek-V3.2 (§8): it's one group, so <em>no</em> aliasing — 122 genuinely
+    separate per-layer tensors, differing in byte width.
+  </div>
+
+  <h3 id="rt-kimi">6.3 <span class="tag swa">Kimi Linear (KDA)</span> a fixed-size recurrent state — read-modify-write, no paging</h3>
+
+  <p>
+    Kimi Linear interleaves <code>KimiMLAAttention</code> (full, §6.4) with <code>KimiDeltaAttention</code> — a
+    <em>linear-attention</em> leaf that inherits <code>MambaBase</code>, not the paged <code>Attention</code>. Its
+    <code>self.kv_cache</code> is <strong>not</strong> a paged token cache; it's a tuple of <em>fixed-size state</em>
+    tensors <code>(conv_state_q, conv_state_k, conv_state_v, recurrent_state)</code>, with <strong>one slot per
+    request</strong> (indexed by <code>state_indices</code>, not by token position). There is no block table and no
+    per-token slot mapping — the whole history is compressed into that one state.</p>
+
+  <pre><span class="c"># READ-MODIFY-WRITE — KimiDeltaAttention.forward  (kda.py:309-452)</span>
+idx = state_indices[req]                          <span class="c"># one slot for the WHOLE sequence</span>
+s   = recurrent_state[idx]                         <span class="c"># READ: fixed-size state, size independent of context length</span>
+out, s_new = chunk_kda(q, k, v, initial_state=s)   <span class="c"># prefill kernel  (or fused_recurrent_kda for decode)</span>
+recurrent_state[idx] = s_new                       <span class="c"># WRITE BACK in place — overwrites, never grows</span>
+<span class="c"># conv_state_{q,k,v} updated the same way via causal_conv1d_update</span></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Kimi Linear (KDA): one state slot, overwritten every step — context length is irrelevant</div>
+    <div class="flow">
+      <div class="flow-step v"><span class="num">state[slot 3]</span>fixed-size S (e.g. head_dim × head_dim)</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><span class="num">READ</span>load S for this request</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step r"><span class="num">KERNEL</span>S′ = f(S, q,k,v) — fold new tokens in</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g"><span class="num">WRITE</span>state[slot 3] ← S′ (same bytes)</div>
+    </div>
+    <div class="diagram-caption">
+      No <code>block_table</code>, no <code>slot_mapping</code>, no growth. A 100-token and a 100k-token request use the
+      <em>same</em> state bytes. The flip side: you can't ask "what was K at position 47?" — it's been irreversibly
+      mixed into S, so partial prefix sharing works only at coarse checkpoints. This is why linear-attention layers get
+      a <code>MambaSpec</code>, not a <code>FullAttentionSpec</code>.
+      &rarr; <a href="../kv_cache/LINEAR_ATTENTION.html">kv_cache/LINEAR_ATTENTION.html</a>,
+      <a href="../kv_cache/MAMBA.html">MAMBA.html</a>.
+    </div>
+  </div>
+
+  <h3 id="rt-ds">6.4 <span class="tag full">DeepSeek-V3.2 (MLA)</span> one latent vector/token — write all, read a sparse subset</h3>
+
+  <p>
+    The <code>MLAAttention</code> leaf. <code>self.kv_cache</code> is paged like Gemma-3, but each token-slot holds a
+    <em>single latent vector</em> (<code>num_kv_heads = 1</code>, 656 B in the <code>fp8_ds_mla</code> layout), not
+    separate per-head K and V. Because <code>index_topk</code> is set, a second cache — the indexer's
+    <code>k_cache</code> (132 B/token) — rides alongside in the same block ids.</p>
+
+  <pre><span class="c"># WRITE — do_kv_cache_update (MLA variant)  (mla_attention.py:565)</span>
+slot = slot_mapping[t]
+kv_cache[slot] = pack(kv_c_normed[t], k_pe[t])     <span class="c"># latent KV + RoPE, one slot per token</span>
+indexer.k_cache[slot] = quantized_index_k[t]       <span class="c"># the 132 B scorer key</span>
+
+<span class="c"># READ — two stages (sparse)</span>
+<span class="c"># 1) indexer scores EVERY cached token, emits ≤ index_topk (2048) selected logical ids</span>
+sel = indexer.topk(query[t], indexer.k_cache, block_table[req])
+<span class="c"># 2) sparse MLA kernel converts sel → global slots via block_table, gathers ONLY those</span>
+out[t] = sparse_attend(query[t], kv_cache, selected_slots=to_global(sel, block_table))</pre>
+
+  <div class="diagram">
+    <div class="diagram-title">DeepSeek-V3.2 (MLA): full write, sparse read (blocks [40, 41, 42, 43])</div>
+    <div class="diagram-row">
+      <span class="cell label">latent cache</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">s0</div><div class="cell xs cached">s1</div><div class="cell xs cached">s2</div><div class="cell xs cached">s3</div>
+        <div class="cell xs cached">s4</div><div class="cell xs cached">s5</div><div class="cell xs cached">s6</div><div class="cell xs used">s7←write</div>
+      </div>
+    </div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">WRITE</span>1 latent vector → newest slot (+ indexer key)</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">INDEXER</span>score all cached tokens → pick top-k (e.g. s1, s4, s6)</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step r"><span class="num">READ (sparse)</span>gather <em>only</em> the selected slots via block table → attend</div>
+    </div>
+    <div class="diagram-caption">
+      Unlike Gemma-3's full gather (read the <em>whole</em> block-table range), MLA reads a <strong>sparse subset</strong>
+      chosen per query by the indexer — but it still dereferences the cache through the same block table, in
+      <code>block_size = 64</code> units (that alignment is forced; see the wiring note §9). Below
+      <code>index_topk</code> tokens the subset is "everything," so short requests behave like dense MLA.
+      &rarr; <a href="deepseek2_kv_cache_wiring.html">deepseek2_kv_cache_wiring.html</a>.
+    </div>
+  </div>
+
+  <h3>6.5 The three read/write models side by side</h3>
+  <table>
+    <thead><tr><th></th><th><span class="tag full">Gemma-3</span> paged K/V</th><th><span class="tag swa">Kimi Linear</span> recurrent state</th><th><span class="tag full">DeepSeek-V3.2</span> latent MLA</th></tr></thead>
+    <tbody>
+      <tr><td>Leaf class</td><td><code>Attention</code></td><td><code>KimiDeltaAttention</code> (<code>MambaBase</code>)</td><td><code>MLAAttention</code></td></tr>
+      <tr><td><code>self.kv_cache</code> holds</td><td>K &amp; V per token, per head</td><td>fixed-size state (1 per request)</td><td>1 latent vector per token (+ indexer key)</td></tr>
+      <tr><td>Indexed by</td><td>slot = block·B + offset</td><td><code>state_indices</code> (per request)</td><td>slot = block·64 + offset</td></tr>
+      <tr><td>WRITE</td><td>scatter new tokens</td><td>overwrite the one state in place</td><td>scatter new latent + indexer key</td></tr>
+      <tr><td>READ</td><td>gather whole prefix (or window)</td><td>load the one state, run recurrence</td><td>gather indexer-selected subset</td></tr>
+      <tr><td>Grows with context?</td><td>yes, O(N)</td><td><strong>no</strong>, O(1)</td><td>yes, O(N) latent</td></tr>
+      <tr><td>Position lookup?</td><td>yes (any token)</td><td><strong>no</strong> (mixed into state)</td><td>yes (any selected token)</td></tr>
+      <tr><td>Spec</td><td><code>FullAttentionSpec</code> / <code>SlidingWindowSpec</code></td><td><code>MambaSpec</code></td><td><code>MLAAttentionSpec</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="contract">7. The contract: what the engine requires of a model</h2>
+
+  <p>
+    "Integrating a model" really means: implement a handful of methods on the top class so the
+    <code>GPUModelRunner</code> can drive it. The runner only ever calls these:</p>
+
+  <table>
+    <thead><tr><th>Method / attribute</th><th>On</th><th>What the runner does with it</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(vllm_config, prefix)</code></td><td><code>*ForCausalLM</code></td><td>Builds the whole tree (§1). Called once during <code>load_model</code>.</td></tr>
+      <tr><td><code>load_weights(weights)</code></td><td><code>*ForCausalLM</code></td><td>Maps checkpoint tensors onto submodules (handles fused QKV / gate-up splits).</td></tr>
+      <tr><td><code>forward(input_ids, positions, ...)</code></td><td><code>*ForCausalLM</code></td><td>Runs the stack, returns hidden states. Called every step.</td></tr>
+      <tr><td><code>compute_logits(hidden)</code></td><td><code>*ForCausalLM</code></td><td>Hidden → vocab logits via the LM head, just before sampling.</td></tr>
+      <tr><td><code>get_kv_cache_spec(vllm_config)</code></td><td>each leaf <code>Attention</code></td><td>Collected across all registered leaves at startup to size the cache.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>Capabilities are opt-in mixins.</strong> The base classes <code>SupportsPP</code>,
+    <code>SupportsLoRA</code>, <code>SupportsEagle</code>, … in <code>models/interfaces.py</code> are
+    <code>Protocol</code>s. <code>LlamaForCausalLM</code> inherits the ones it supports, and the runner checks
+    <code>isinstance</code> at startup to decide which features to enable. Adding pipeline-parallel support, for
+    example, is "inherit <code>SupportsPP</code> and return <code>IntermediateTensors</code> at the PP boundary" —
+    both visible in <code>LlamaModel.forward</code> above.
+  </div>
+
+  <h2 id="contrast">8. Contrast: Gemma-3 vs DeepSeek-V3.2</h2>
+
+  <p>
+    Both models use the <strong>identical spine</strong> from §1 — <code>*ForCausalLM</code> → <code>*Model</code> →
+    <code>*DecoderLayer</code> → <code>*Attention</code>. If you diff their files, the
+    <code>ForCausalLM</code>/<code>Model</code> levels are nearly copy-paste. <strong>All the interesting
+    divergence is at the leaf and in the spec it returns</strong> — and the two models diverge in <em>opposite</em>
+    directions, which makes them the perfect pair to study.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3><span class="tag swa">Gemma-3</span> heterogeneous <em>lifecycles</em></h3>
+      <p>
+        Gemma-3 <strong>alternates</strong> attention types: <code>config.layer_types[i]</code> is either
+        <code>"sliding_attention"</code> or <code>"full_attention"</code> (typically 5 sliding : 1 full).
+        <code>Gemma3Attention.__init__</code> reads that and sets <code>per_layer_sliding_window</code> on its leaf
+        accordingly. It also adds <code>q_norm</code>/<code>k_norm</code> and a per-layer RoPE base — but those are
+        local details.</p>
+      <p>
+        <strong>KV-cache consequence:</strong> sliding layers return <code>SlidingWindowSpec</code>, full layers
+        return <code>FullAttentionSpec</code>. <em>Different spec types</em> &rArr; <strong>multiple KV-cache
+        groups</strong> &rArr; the <strong>column-packed</strong> tensor layout, NULL blocks for expired window
+        positions, and per-group block tables. This is the canonical <em>hybrid</em> case.</p>
+    </div>
+    <div class="box">
+      <h3><span class="tag full">DeepSeek-V3.2</span> heterogeneous <em>byte widths</em></h3>
+      <p>
+        DeepSeek keeps one attention <em>type</em> everywhere, but it's an exotic one: the leaf is
+        <code>MLAAttention</code> (latent KV, <code>num_kv_heads=1</code>, <code>head_size=576</code>), reached
+        through a <code>DeepseekV2MLAAttention</code> → <code>MultiHeadLatentAttentionWrapper</code> wrapper. Because
+        <code>index_topk</code> is set, each layer <em>also</em> builds a sparse <code>Indexer</code> whose
+        <code>DeepseekV32IndexerCache</code> registers a <strong>second</strong> cache owner.</p>
+      <p>
+        <strong>KV-cache consequence:</strong> all caches are <code>MLAAttentionSpec</code> (a
+        <code>FullAttentionSpec</code> subclass) at <code>block_size 64</code>. Same <em>type</em> &rArr;
+        <strong>one</strong> uniform-type group &rArr; one block table, but <strong>per-layer tensors</strong> (main
+        rows 656 B, indexer rows 132 B). NOT column-packed.</p>
+    </div>
+  </div>
+
+  <table>
+    <thead><tr><th>Dimension</th><th>Gemma-3</th><th>DeepSeek-V3.2</th></tr></thead>
+    <tbody>
+      <tr><td>Top class</td><td><code>Gemma3ForCausalLM</code></td><td><code>DeepseekV2ForCausalLM</code></td></tr>
+      <tr><td>Decoder layer</td><td><code>Gemma3DecoderLayer</code> (4 layernorms — sandwich norms)</td><td><code>DeepseekV2DecoderLayer</code> (dense MLP for first 3, MoE after)</td></tr>
+      <tr><td>Attention wrapper</td><td><code>Gemma3Attention</code> (+ q/k norm, per-layer RoPE)</td><td><code>DeepseekV2MLAAttention</code> → <code>MultiHeadLatentAttentionWrapper</code></td></tr>
+      <tr class="hot"><td>Leaf cache owner</td><td><code>Attention</code> (standard, GQA)</td><td><code>MLAAttention</code> (+ a 2nd <code>indexer.k_cache</code> owner)</td></tr>
+      <tr><td>What varies per layer</td><td><strong>attention TYPE</strong> (sliding vs full)</td><td><strong>byte WIDTH</strong> (main 656 B vs indexer 132 B)</td></tr>
+      <tr><td>Spec(s) returned</td><td><code>SlidingWindowSpec</code> + <code>FullAttentionSpec</code></td><td><code>MLAAttentionSpec</code> only (uniform type)</td></tr>
+      <tr><td>KV-cache groups</td><td><strong>multiple</strong> (one per type, SWA split to equalize sizes)</td><td><strong>one</strong> (uniform-type fold)</td></tr>
+      <tr><td>Memory layout</td><td><strong>column-packed</strong> across groups</td><td><strong>per-layer tensors</strong>, one block table</td></tr>
+      <tr><td>Block table(s)</td><td>one per group; SWA tables hold NULL for expired positions</td><td>one shared by all 122 owners (same block ids)</td></tr>
+      <tr><td>Why it's "special"</td><td>layers disagree about <em>when K/V can be freed</em></td><td>layers agree on lifecycle but disagree on <em>bytes per slot</em></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>The mental model.</strong> Two independent axes can make a model "non-vanilla":
+    <ul>
+      <li><strong>Lifecycle</strong> (when is a position's K/V still needed?) — if layers disagree, you get
+        <em>multiple groups</em> and column packing. <span class="tag swa">Gemma-3</span></li>
+      <li><strong>Byte width</strong> (how many bytes per token-slot?) — if layers agree on lifecycle but differ in
+        width, you stay in <em>one group</em> with per-layer tensors. <span class="tag full">DeepSeek-V3.2</span></li>
+    </ul>
+    A plain Llama varies on <em>neither</em> axis: one type, one width &rArr; one group, one uniform tensor per layer.
+    Read the two contrast cases and the vanilla case and you've seen every layout vLLM has.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Same spine, different leaves &rarr; different cache layout</div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">shared spine</span>ForCausalLM / Model / DecoderLayer</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a"><span class="num">leaf choice</span>which Attention + which spec</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">grouping</span>by spec type &amp; block_size</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g"><span class="num">layout</span>uniform / per-layer / column-packed</div>
+    </div>
+    <div class="diagram-caption">
+      Model integration = picking the leaf and its spec. Everything downstream (grouping, allocation, block tables)
+      is decided <em>for</em> you by the spec types your leaves return.
+    </div>
+  </div>
+
+  <h2 id="takeaways">9. The big takeaways</h2>
+
+  <ol>
+    <li><strong>One spine, five levels.</strong> <code>*ForCausalLM</code> → <code>*Model</code> →
+      <code>*DecoderLayer</code> → <code>*Attention</code> → leaf <code>Attention</code>. Learn it once, read any
+      model.</li>
+    <li><strong>Levels 1–4 are plumbing; level 5 is the only stateful one.</strong> The leaf <code>Attention</code> is
+      the sole owner of KV cache.</li>
+    <li><strong>Forward threads down, hidden states bubble up.</strong> Cache tensors are never arguments — the leaf
+      finds its own via <code>self.kv_cache</code>, bound by name.</li>
+    <li><strong>Register, don't allocate.</strong> The leaf registers itself in <code>static_forward_context</code> at
+      construction; the engine discovers it, asks for its <code>get_kv_cache_spec()</code>, and binds a tensor.</li>
+    <li><strong>The spec is the bridge.</strong> Which spec class a leaf returns decides grouping and memory layout —
+      it's where "model integration" hands off to "KV cache".</li>
+    <li><strong>Models differ only at the leaves.</strong> Gemma-3 varies the <em>lifecycle</em> (sliding vs full →
+      many groups, column-packed); DeepSeek-V3.2 varies the <em>byte width</em> (MLA + indexer → one group, per-layer
+      tensors). The spine above is identical.</li>
+  </ol>
+
+  <div class="callout info">
+    <strong>When you're ready for more depth</strong>
+    <ul>
+      <li><a href="deepseek2_kv_cache_wiring.html">deepseek2_kv_cache_wiring.html</a> — the chronological trace of all
+        of §5, with real DeepSeek-V3.2 byte numbers and the four-phase startup.</li>
+      <li><a href="../kv_cache/BEGINNER_GUIDE.html">kv_cache/BEGINNER_GUIDE.html</a> — the cache side: blocks, groups,
+        column packing, and the worked Gemma-3-style hybrid example.</li>
+      <li><a href="../kv_cache/KV_CACHE_ALLOCATION.html">kv_cache/KV_CACHE_ALLOCATION.html</a> — why groups exist and
+        the byte-level column-packed layout.</li>
+    </ul>
+  </div>
+
+  <div class="foot">
+    Generated from the local checkout on 2026-05-30. Class hierarchy verified against
+    <span class="fileref">vllm/model_executor/models/llama.py</span> (spine),
+    <span class="fileref">gemma3.py</span> (sliding/full leaves, <code>layer_types</code>),
+    <span class="fileref">deepseek_v2.py</span> (MLA + indexer), and
+    <span class="fileref">vllm/model_executor/layers/attention/attention.py</span> (the <code>Attention</code> leaf:
+    self-registration at line 398, <code>get_kv_cache_spec</code> at line 566). This is a learning note, not a
+    source-code change.
+  </div>
+</main>
+</body>
+</html>

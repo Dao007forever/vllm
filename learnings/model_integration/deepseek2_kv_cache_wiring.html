@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek-V2 KV Cache — Engine Execution Trace</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body class="dark">
+<main>
+  <h1>DeepSeek-V3.2 KV Cache — Engine Execution Trace</h1>
+  <p class="subtitle">A chronological walk from <code>EngineCore.__init__</code> to the fourth decode step, using the real
+    <code>deepseek-ai/DeepSeek-V3.2</code> config: read the config, build the 61 layers, derive KV cache specs,
+    allocate and bind the cache, then watch the scheduler hand out blocks and <code>step()</code> drive the model.
+    DeepSeek-V3.2 runs through the shared V2-family path (<code>DeepseekV2*</code> classes) plus a sparse indexer.</p>
+  <p class="subtitle">
+    Config: <span class="fileref">huggingface.co/deepseek-ai/DeepSeek-V3.2 · config.json</span> ·
+    Engine: <span class="fileref">vllm/v1/engine/core.py</span> ·
+    Model: <span class="fileref">vllm/model_executor/models/deepseek_v2.py</span> ·
+    MLA layer: <span class="fileref">vllm/model_executor/layers/attention/mla_attention.py</span> ·
+    Runner: <span class="fileref">vllm/v1/worker/gpu_model_runner.py</span>
+  </p>
+
+  <div class="callout">
+    <strong>Short version.</strong> Startup is one method — <code>EngineCore._initialize_kv_caches</code> — running in
+    four phases: <b>collect specs → profile free memory → compute <code>num_blocks</code> → allocate + bind</b>. The
+    model never allocates KV memory itself: each of V3.2's <b>61</b> <code>MLAAttention</code> layers (and, because
+    <code>index_topk</code> is set, <b>61</b> indexer caches too) registers itself in
+    <code>static_forward_context</code> under a unique name and exposes a <code>get_kv_cache_spec()</code> returning an
+    <code>MLAAttentionSpec</code>. For V3.2 the main MLA spec is <code>num_kv_heads=1</code>,
+    <code>head_size = 512+64 = 576</code>, stored in the <code>fp8_ds_mla</code> layout at <b>656 bytes/token</b>; the
+    indexer spec is <b>132 bytes/token</b>. The runner collects all <b>122</b> specs, the planner turns free GPU bytes
+    into a block count, the worker allocates one tensor per layer, and <code>bind_kv_cache</code> writes each tensor
+    back onto the layer's <code>.kv_cache</code>. At run time the scheduler allocates block ids per request and
+    <code>step()</code> maps positions to physical slots with <code>slot = block_id·64 + offset</code>.
+  </div>
+
+  <h2>0. The whole lifecycle on one page</h2>
+  <div class="trace">
+    <b>STARTUP (once)</b><br>
+    <span class="step">1</span> <b>EngineCore.__init__</b> builds the executor → worker → <code>load_model()</code><br>
+    <span class="step">2</span> <b>DeepseekV2ForCausalLM</b> reads HF config, <code>make_layers</code> builds N decoder layers<br>
+    <span class="step">3</span> each <b>MLAAttention.__init__</b> registers <code>{prefix}.self_attn.attn</code> into <code>static_forward_context</code><br>
+    <span class="step">4</span> <b>_initialize_kv_caches</b>: <code>get_kv_cache_specs()</code> → <code>determine_available_memory()</code> → <code>get_kv_cache_configs()</code> → <code>initialize_from_config()</code><br>
+    <span class="step">5</span> <b>GPUModelRunner.initialize_kv_cache</b> allocates tensors → <code>bind_kv_cache</code> binds them to each layer's <code>.kv_cache</code><br>
+    <br>
+    <b>PER REQUEST / PER STEP (loop)</b><br>
+    <span class="step">6</span> request arrives → <b>Scheduler.schedule()</b> → <code>kv_cache_manager.allocate_slots()</code> → block ids<br>
+    <span class="step">7</span> <b>EngineCore.step()</b>: <code>schedule()</code> → <code>execute_model()</code> → <code>update_from_output()</code><br>
+    <span class="step">8</span> <b>execute_model</b> → <code>_prepare_inputs</code> (commit block table, <code>compute_slot_mapping</code>) → <code>set_forward_context</code> → model forward<br>
+    <span class="step">9</span> inside each layer: write new KV to its slots, then attention reads via block table → sample token → repeat
+  </div>
+
+  <h2>1. Startup — EngineCore builds the executor and loads the model</h2>
+  <p>The V1 engine core constructs an executor, which spins up a worker, which loads the model onto the device. This
+    is all synchronous and happens before a single request is accepted.</p>
+
+  <div class="trace">
+    <b>EngineCore.__init__</b> &nbsp;<span class="fileref">vllm/v1/engine/core.py</span><br>
+    &nbsp;&nbsp;→ <code>executor_class(vllm_config)</code> &nbsp;<span class="c"># e.g. UniProcExecutor</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;→ <b>UniProcExecutor._init_executor</b> → <code>WorkerWrapperBase</code> → <code>init_device()</code> → <code>load_model()</code><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ <b>Worker.load_model</b> &nbsp;<span class="fileref">vllm/v1/worker/gpu_worker.py</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ <b>GPUModelRunner.load_model</b> → builds <code>DeepseekV2ForCausalLM</code><br>
+    &nbsp;&nbsp;→ <b>EngineCore._initialize_kv_caches(vllm_config)</b> &nbsp;<span class="c"># §4 — runs after weights are on the GPU</span>
+  </div>
+
+  <p>Two distinct objects carry the cache-shaping inputs the whole way through:</p>
+  <div class="grid three">
+    <div class="box">
+      <h3>vllm_config.model_config</h3>
+      <p>Wraps the HF config. Supplies <code>num_hidden_layers</code>, the MLA dims
+        (<code>kv_lora_rank</code>, <code>qk_rope_head_dim</code>, …), <code>max_model_len</code>, and
+        <code>use_mla</code>.</p>
+    </div>
+    <div class="box">
+      <h3>vllm_config.cache_config</h3>
+      <p>Runtime cache knobs: <code>block_size</code>, <code>cache_dtype</code>,
+        <code>gpu_memory_utilization</code>, prefix-caching flags. <code>num_gpu_blocks</code> is filled in later by
+        startup phase 3.</p>
+    </div>
+    <div class="box">
+      <h3>compilation_config<br>.static_forward_context</h3>
+      <p>The registry every attention layer writes itself into, keyed by layer name. This is how the runner later
+        discovers all cache owners without the model handing them over explicitly.</p>
+    </div>
+  </div>
+
+  <h2>2. Startup — read the config, create the layers</h2>
+  <p><code>DeepseekV2ForCausalLM.__init__</code> reads the HF config to decide the attention family, then
+    <code>DeepseekV2Model</code> loops <code>num_hidden_layers</code> times through <code>make_layers</code>, building
+    one <code>DeepseekV2DecoderLayer</code> per layer with a unique <code>prefix</code>. The exact values that flow
+    into the cache for DeepSeek-V3.2:</p>
+
+  <table>
+    <thead><tr><th>config field</th><th>value</th><th>what it drives</th></tr></thead>
+    <tbody>
+      <tr><td>model_type</td><td><code>deepseek_v32</code></td><td>Selects the V3.2 path; <code>index_topk</code> present → sparse indexer is built.</td></tr>
+      <tr><td>num_hidden_layers</td><td><code>61</code></td><td>61 decoder layers → 61 <code>MLAAttention</code> cache owners (+61 indexer caches = 122 total).</td></tr>
+      <tr><td>first_k_dense_replace</td><td><code>3</code></td><td>Layers 0–2 use a dense MLP; layers 3–60 use MoE (256 experts). <em>MLP only — KV cache is identical across all 61.</em></td></tr>
+      <tr><td>kv_lora_rank</td><td><code>512</code></td><td>Compressed latent KV width — the bulk of <code>head_size</code>.</td></tr>
+      <tr><td>qk_rope_head_dim</td><td><code>64</code></td><td>RoPE positional part. <code>head_size = 512 + 64 = 576</code>.</td></tr>
+      <tr><td>qk_nope_head_dim / v_head_dim</td><td><code>128</code> / <code>128</code></td><td>Per-head Q/V dims (used in the projections, not the cache).</td></tr>
+      <tr><td>num_attention_heads</td><td><code>128</code></td><td>128 query heads share the single latent KV vector (<code>num_kv_heads=1</code>).</td></tr>
+      <tr><td>index_topk</td><td><code>2048</code></td><td>Sparse token budget: each query attends at most 2048 selected tokens.</td></tr>
+      <tr><td>index_n_heads / index_head_dim</td><td><code>64</code> / <code>128</code></td><td>Indexer scorer → its FP8 K-cache head_dim = <code>128 + 128//128·4 = 132</code>.</td></tr>
+      <tr><td>quantization_config</td><td><code>fp8 (e4m3)</code></td><td>Weights FP8 128×128 block-quant; KV cache uses the <code>fp8_ds_mla</code> layout.</td></tr>
+      <tr><td>max_position_embeddings</td><td><code>163840</code></td><td>Upper bound on sequence length the block table must address.</td></tr>
+    </tbody>
+  </table>
+
+  <pre><span class="c"># vllm/model_executor/models/deepseek_v2.py — DeepseekV2Model.__init__</span>
+self.start_layer, self.end_layer, self.layers = make_layers(
+    config.num_hidden_layers,
+    <span class="k">lambda</span> prefix: DeepseekV2DecoderLayer(
+        vllm_config,
+        prefix,                                  <span class="c"># "model.layers.0", "model.layers.1", ...</span>
+        topk_indices_buffer=topk_indices_buffer, <span class="c"># None for plain V2/V3</span>
+    ),
+    prefix=<span class="s">f"{prefix}.layers"</span>,
+)</pre>
+
+  <p>Each decoder layer selects its attention class from config. For DeepSeek-V2/V3 with MLA enabled, that is
+    <code>DeepseekV2MLAAttention</code>; the dense vs. MoE choice for the <em>MLP</em> is separate and does not affect
+    the KV cache.</p>
+
+  <pre><span class="c"># DeepseekV2DecoderLayer.__init__ — attention class selection</span>
+<span class="k">if</span> use_mha:                          <span class="c"># model_type == "deepseek", legacy MHA</span>
+    attn_cls = DeepseekV2Attention
+<span class="k">elif</span> model_config.use_mla:          <span class="c"># DeepSeek-V2 / V3 — the MLA path</span>
+    attn_cls = DeepseekV2MLAAttention
+<span class="k">else</span>:
+    attn_cls = DeepseekV2Attention
+
+self.self_attn = attn_cls(
+    vllm_config=vllm_config,
+    config=config,
+    prefix=<span class="s">f"{prefix}.self_attn"</span>,   <span class="c"># "model.layers.0.self_attn"</span>
+    topk_indices_buffer=topk_indices_buffer,
+    ...
+)</pre>
+
+  <p>The construction nests three deep before reaching the layer that actually owns a cache. The <code>prefix</code>
+    grows at each level, and the leaf <code>MLAAttention</code> is what gets registered:</p>
+
+  <table>
+    <thead><tr><th>Class</th><th>prefix it receives</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>DeepseekV2DecoderLayer</td><td><code>model.layers.{i}</code></td><td>Holds <code>self_attn</code> + MLP.</td></tr>
+      <tr><td>DeepseekV2MLAAttention</td><td><code>model.layers.{i}.self_attn</code></td><td>Builds Q/KV projections, RoPE; for V2 <code>indexer=None</code>.</td></tr>
+      <tr><td>MultiHeadLatentAttentionWrapper</td><td><code>model.layers.{i}.self_attn</code></td><td>Preprocessor wrapper around the core attention.</td></tr>
+      <tr><td><strong>MLAAttention</strong></td><td><code>model.layers.{i}.self_attn.attn</code></td><td><strong>The cache owner.</strong> Registered into <code>static_forward_context</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. Startup — the layer registers itself and declares its spec</h2>
+  <p><code>MLAAttention.__init__</code> computes the latent head size, stores its own name, creates a placeholder
+    cache, and — critically — inserts itself into the global forward-context registry under its unique prefix.</p>
+
+  <pre><span class="c"># vllm/model_executor/layers/attention/mla_attention.py — MLAAttention.__init__</span>
+self.head_size   = kv_lora_rank + qk_rope_head_dim   <span class="c"># latent KV + RoPE; e.g. 512 + 64 = 576</span>
+self.layer_name  = prefix                            <span class="c"># "model.layers.{i}.self_attn.attn"</span>
+self.num_kv_heads = <span class="n">1</span>                            <span class="c"># MLA stores ONE latent vector per token</span>
+...
+self.kv_cache = torch.tensor([])                     <span class="c"># placeholder — real tensor bound in §5</span>
+
+compilation_config = get_current_vllm_config().compilation_config
+<span class="k">if</span> prefix <span class="k">in</span> compilation_config.static_forward_context:
+    <span class="k">raise</span> ValueError(<span class="s">f"Duplicate layer name: {prefix}"</span>)
+compilation_config.static_forward_context[prefix] = self   <span class="c"># ← the model never hands</span>
+                                                           <span class="c">#   caches over; it registers</span></pre>
+
+  <p>The spec is not built at construction time — it is a method the runner calls later, so it always reads the
+    <em>current</em> <code>cache_config</code> (after any block-size defaulting). For MLA it returns an
+    <code>MLAAttentionSpec</code>:</p>
+
+  <pre><span class="c"># MLAAttention.get_kv_cache_spec</span>
+<span class="k">def</span> <span class="fn">get_kv_cache_spec</span>(self, vllm_config) -&gt; KVCacheSpec:
+    kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+        self.kv_cache_dtype, vllm_config.model_config
+    )
+    <span class="k">return</span> MLAAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=<span class="n">1</span>,
+        head_size=self.head_size,                       <span class="c"># kv_lora_rank + qk_rope_head_dim</span>
+        dtype=kv_cache_dtype,
+        cache_dtype_str=vllm_config.cache_config.cache_dtype,
+    )</pre>
+
+  <table>
+    <thead><tr><th>Field</th><th>Value source</th><th>Meaning for DeepSeek MLA</th></tr></thead>
+    <tbody>
+      <tr><td>block_size</td><td><code>cache_config.block_size</code></td><td>Logical token slots in one paged block. <b>= 64</b> for V3.2 — FlashMLA sparse only supports block size 64.</td></tr>
+      <tr><td>num_kv_heads</td><td>constant <code>1</code></td><td>One latent KV vector per token, not per Q head — this is why MLA is so cache-cheap.</td></tr>
+      <tr><td>head_size</td><td><code>kv_lora_rank + qk_rope_head_dim</code></td><td>Compressed KV (512) plus the RoPE positional part (64) = 576.</td></tr>
+      <tr><td>dtype</td><td><code>kv_cache_dtype_str_to_dtype(...)</code></td><td>Tensor dtype of the allocated cache.</td></tr>
+      <tr><td>cache_dtype_str</td><td><code>cache_config.cache_dtype</code></td><td>Preserves layout choice (e.g. <code>fp8_ds_mla</code> for V3.2 sparse).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>V3.2 adds a second cache per layer.</strong> Because the config has <code>index_topk</code>,
+    <code>DeepseekV2MLAAttention</code> also builds an <code>Indexer</code> whose
+    <code>DeepseekV32IndexerCache</code> registers a <em>second</em> name —
+    <code>model.layers.{i}.self_attn.indexer.k_cache</code> — into <code>static_forward_context</code> and returns its
+    own <code>MLAAttentionSpec</code>:
+    <pre><span class="c"># Indexer.__init__ — vllm/model_executor/models/deepseek_v2.py</span>
+self.quant_block_size = <span class="n">128</span>
+self.k_cache = DeepseekV32IndexerCache(
+    head_dim=self.head_dim + self.head_dim // self.quant_block_size * <span class="n">4</span>,  <span class="c"># 128 + 1·4 = 132</span>
+    dtype=torch.uint8,                                                  <span class="c"># 132 bytes/token</span>
+    prefix=<span class="s">f"{prefix}.indexer.k_cache"</span>,
+    cache_config=cache_config,
+)</pre>
+    So the 61-layer V3.2 model registers <b>122</b> cache owners: 61 main MLA caches (656 B/token) and 61 indexer
+    caches (132 B/token). Both are <code>MLAAttentionSpec</code> (a subclass of <code>FullAttentionSpec</code>) with
+    <code>block_size = 64</code>, so <code>is_uniform_type</code> folds all 122 into <em>one</em> KV-cache group →
+    <strong>one block table, one block pool, one shared block-id space</strong> (main and indexer get the
+    <em>same</em> ids for a request — they are <em>not</em> separate pools). Storage is still per-layer (§5.1): 122
+    distinct tensors, main rows 656 B, indexer rows 132 B. The indexer scores all cached tokens and emits up to
+    <code>index_topk = 2048</code> logical token ids; the main MLA read uses only those.
+  </div>
+
+  <h2>4. Startup — the four-phase KV cache initialization</h2>
+  <p>With weights resident, <code>EngineCore._initialize_kv_caches</code> turns specs into allocated memory. It is one
+    method with four clear phases.</p>
+
+  <pre><span class="c"># vllm/v1/engine/core.py — EngineCore._initialize_kv_caches (condensed)</span>
+<span class="c"># PHASE 1: collect every layer's spec from the runner</span>
+kv_cache_specs = self.model_executor.get_kv_cache_specs()
+
+<span class="c"># PHASE 2: profile peak activation memory → free bytes available for KV</span>
+available_gpu_memory = self.model_executor.determine_available_memory()
+
+<span class="c"># PHASE 3: turn free bytes + specs into a concrete plan (groups, num_blocks, tensors)</span>
+kv_cache_configs = get_kv_cache_configs(
+    vllm_config, kv_cache_specs, available_gpu_memory
+)
+scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+
+<span class="c"># PHASE 4: allocate the tensors and bind them onto the layers</span>
+self.model_executor.initialize_from_config(kv_cache_configs)</pre>
+
+  <h3>Phase 1 — collect specs</h3>
+  <p>The runner walks every module registered as an <code>AttentionLayerBase</code> in
+    <code>static_forward_context</code> (exactly the layers from §3) and asks each for its spec.</p>
+  <pre><span class="c"># vllm/v1/worker/gpu_model_runner.py — GPUModelRunner.get_kv_cache_spec</span>
+attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+kv_cache_spec = {}
+<span class="k">for</span> layer_name, attn_module <span class="k">in</span> attn_layers.items():
+    <span class="k">if</span> spec := attn_module.get_kv_cache_spec(self.vllm_config):
+        kv_cache_spec[layer_name] = spec
+<span class="k">return</span> kv_cache_spec   <span class="c"># {"model.layers.0.self_attn.attn": MLAAttentionSpec(...), ...}</span></pre>
+
+  <h3>Phase 2 — profile available memory</h3>
+  <p><code>Worker.determine_available_memory</code> runs a dummy forward under a memory-profiling context to measure
+    peak activation usage, then reports how many bytes remain for the cache given
+    <code>gpu_memory_utilization</code>.</p>
+
+  <h3>Phase 3 — compute groups and <code>num_blocks</code></h3>
+  <p><code>get_kv_cache_configs</code> groups layers by cache type, optionally auto-fits
+    <code>max_model_len</code> to the memory, and divides free bytes by the per-block page size to get
+    <code>num_blocks</code>. V3.2's 122 layers do <em>not</em> share an identical spec (656 vs 132 B), but they are the
+    same <em>type</em> (all <code>MLAAttentionSpec</code>, <code>block_size 64</code>), so <code>is_uniform_type</code>
+    folds them into <b>one</b> group with per-layer page sizes — see §5.1.</p>
+  <pre><span class="c"># vllm/v1/core/kv_cache_utils.py (shape of the calculation)</span>
+num_blocks = available_memory // per_block_bytes_across_all_layers
+kv_cache_tensors = [
+    KVCacheTensor(size=per_layer_specs[name].page_size_bytes * num_blocks,
+                  shared_by=[name])
+    <span class="k">for</span> name <span class="k">in</span> group.layer_names
+]</pre>
+
+  <p>The per-block byte cost is the <em>sum across every layer tensor</em> a single block id reserves. For V3.2 with
+    <code>block_size = 64</code>:</p>
+
+  <div class="eq">main MLA  (fp8_ds_mla):  64 tokens × 656 B/token  = <b>41,984 B</b> per block per layer<br>
+indexer K  (uint8):      64 tokens × 132 B/token  = &nbsp;<b>8,448 B</b> per block per layer<br>
+one block id, all 61 layers:  61 × (41,984 + 8,448)  = 61 × 50,432  ≈ <b>2.93 MiB</b><br>
+<span class="c"># worked example: 40 GiB of KV budget</span><br>
+num_blocks  =  42,949,672,960 B  //  3,076,352 B  ≈  <b>13,961 blocks</b>  →  ~893,500 cached tokens</div>
+
+  <p>The page size for the main MLA cache is <em>not</em> the naive
+    <code>block_size · 1 · 576 · sizeof(dtype)</code>: under <code>fp8_ds_mla</code>,
+    <code>MLAAttentionSpec.real_page_size_bytes</code> hard-codes the custom <b>656-byte</b> per-token layout
+    (512 latent + 64 RoPE + scales). The resulting <code>num_blocks</code> is written to
+    <code>cache_config.num_gpu_blocks</code> — the single number the scheduler's block pool hands out from.</p>
+
+  <h2>5. Startup — allocate the tensors and bind them to the layers</h2>
+  <p>Phase 4 reaches the worker, which delegates to the runner. The runner sets up attention backends, allocates raw
+    byte tensors, views them at the right dtype/shape, then binds them back onto each layer object.</p>
+
+  <div class="trace">
+    <b>Worker.initialize_from_config</b><br>
+    &nbsp;&nbsp;→ <b>GPUModelRunner.initialize_kv_cache</b><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;→ <code>initialize_attn_backend</code> / <code>prepare_kernel_block_sizes</code> / <code>initialize_metadata_builders</code><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;→ <b>initialize_kv_cache_tensors</b> → <code>torch.zeros(size, dtype=int8)</code> per layer, then <code>.view(dtype).view(shape)</code><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;→ <b>bind_kv_cache(kv_caches, forward_context, runner_kv_caches)</b>
+  </div>
+
+  <pre><span class="c"># vllm/v1/worker/utils.py — bind_kv_cache (the wiring moment)</span>
+<span class="k">for</span> layer_name, kv_cache <span class="k">in</span> kv_caches.items():
+    forward_context[layer_name].kv_cache = kv_cache   <span class="c"># the §3 placeholder is replaced</span></pre>
+
+  <div class="callout">
+    <strong>This is the wiring.</strong> The same layer object the model built in §2–3, registered in
+    <code>static_forward_context</code> in §3, declared its spec in Phase 1, now has its real tensor written onto
+    <code>self.kv_cache</code>. At forward time the layer reads/writes <em>this</em> tensor by looking itself up in the
+    forward context — no tensor is ever passed down through the module call graph.
+  </div>
+
+  <p>For V3.2 the backend reports the concrete shapes the raw byte tensors are viewed as:</p>
+  <table>
+    <thead><tr><th>layer name</th><th>bound tensor shape</th><th>per token</th></tr></thead>
+    <tbody>
+      <tr><td>model.layers.{i}.self_attn.attn</td><td><code>(num_blocks, 64, 656)</code> bytes</td><td>fp8_ds_mla custom layout — 656 B (one latent KV vector, <code>num_kv_heads=1</code>).</td></tr>
+      <tr><td>model.layers.{i}.self_attn.indexer.k_cache</td><td><code>(num_blocks, 64, 132)</code> uint8</td><td>128 FP8 index-K values + one FP32 scale = 132 B.</td></tr>
+    </tbody>
+  </table>
+  <p>(<code>FlashMLASparseBackend.get_kv_cache_shape</code> returns <code>(num_blocks, block_size, 656)</code> for the
+    <code>fp8_ds_mla</code> case.) Each of the 61 layers gets one tensor of each kind, all sharing the same
+    <code>num_blocks</code>.</p>
+
+  <h3>5.1 Per-layer vs column-packed: which path V3.2 takes</h3>
+  <p>vLLM has three allocation layouts. Which one runs is decided by
+    <code>get_kv_cache_config_from_groups</code> from the <em>number and types</em> of groups:</p>
+  <table>
+    <thead><tr><th>Layout</th><th>Trigger</th><th>Tensors</th></tr></thead>
+    <tbody>
+      <tr><td>uniform spec</td><td>all layers <b>identical</b> spec (most dense models)</td><td>one per layer (<code>shared_by=[name]</code>).</td></tr>
+      <tr><td><b>single-group uniform-type</b></td><td>all layers <b>same type</b>, <em>different</em> page sizes</td><td><b>one per layer</b>, each sized by its own page size. <span class="tag">V3.2 path</span></td></tr>
+      <tr><td>column-packed</td><td><b>multiple groups</b> (requires a <code>SlidingWindowMLASpec</code>)</td><td>one tensor shared by <em>one layer per group</em>.</td></tr>
+    </tbody>
+  </table>
+  <p>V3.2 lands in the middle row, so <strong>each layer has its own physical tensor — 122 of them</strong> (main rows
+    656 B, indexer rows 132 B). It is <em>not</em> column-packed. Two facts force this:</p>
+  <ul>
+    <li><code>group_and_unify_kv_cache_specs</code> (the column-packed/DeepSeek-V4 entry) returns <code>None</code>
+      unless some layer is a <code>SlidingWindowMLASpec</code>. V3.2 has none — its indexer is a plain
+      <code>MLAAttentionSpec</code> — so the multi-group path is never taken.</li>
+    <li><code>MLAAttentionSpec</code> subclasses <code>FullAttentionSpec</code>, and all 122 layers use
+      <code>block_size 64</code>, so <code>UniformTypeKVCacheSpecs.is_uniform_type</code> is <code>True</code> → all
+      122 collapse into <b>one</b> group → the single-group branch allocates one tensor per layer.</li>
+  </ul>
+
+  <h3>5.2 "Uniform type" ≠ "uniform page size"</h3>
+  <p>The obvious objection: if main is 656 B/block and indexer is 132 B/block, how can they live in one
+    <code>UniformTypeKVCacheSpecs</code>? Because <code>is_uniform_type</code> never checks page size. It requires only
+    two things (<span class="fileref">kv_cache_interface.py:688</span>):</p>
+  <ul>
+    <li>same <code>block_size</code> (all 64), and</li>
+    <li>same spec class (all <code>MLAAttentionSpec ⊂ FullAttentionSpec</code>).</li>
+  </ul>
+  <p>The docstring states the intent — <em>"same type means always need the same number of token slots."</em> That is
+    the real invariant: every layer addresses the <strong>same number of token positions with the same block size</strong>,
+    so one block table and one block-id namespace serve all of them. Byte width per slot is free to differ.</p>
+
+  <p>The allocator never packs the differing bytes together. It gives each layer <strong>its own tensor sized by its
+    own page size</strong>; the group-level <code>page_size_bytes</code> is just the <em>sum</em>, used only to compute
+    <code>num_blocks</code>:</p>
+
+  <pre><span class="c"># UniformTypeKVCacheSpecs.page_size_bytes — kv_cache_interface.py:678</span>
+<span class="k">return</span> sum(spec.page_size_bytes <span class="k">for</span> spec <span class="k">in</span> self.kv_cache_specs.values())
+
+<span class="c"># get_kv_cache_config_from_groups — single-group branch, kv_cache_utils.py:1262</span>
+num_blocks = available_memory // group.kv_cache_spec.page_size_bytes      <span class="c"># ← the SUM</span>
+per_layer_specs = group.kv_cache_spec.kv_cache_specs
+kv_cache_tensors = [
+    KVCacheTensor(
+        size=per_layer_specs[name].page_size_bytes * num_blocks,         <span class="c"># ← each layer's OWN size</span>
+        shared_by=[name],                                                <span class="c"># ← one layer per tensor</span>
+    )
+    <span class="k">for</span> name <span class="k">in</span> group.layer_names
+]</pre>
+
+  <div class="eq">one block id costs:  61·41,984 (main) + 61·8,448 (indexer)  =  3,076,352 B  ≈ 2.93 MiB<br>
+num_blocks        =  available_memory // 3,076,352<br>
+<br>
+per-layer tensors — all <b>num_blocks</b> rows, different row widths:<br>
+&nbsp;&nbsp;main_Li.kv_cache    : (num_blocks, 64, 656)  → row = 41,984 B<br>
+&nbsp;&nbsp;indexer_Li.kv_cache : (num_blocks, 64, 132)  → row = &nbsp;8,448 B</div>
+
+  <p>So block id <code>42</code> is row 42 in <em>every</em> tensor — but that row is 41,984 B in a main tensor and
+    8,448 B in an indexer tensor. <strong>Same row index, different byte width.</strong> The differing page sizes are
+    fine <em>because nothing is shared</em>: each <code>KVCacheTensor</code> is its own allocation, so its width is
+    independent. This is exactly why column packing needs uniform page size (multiple layers reinterpret the
+    <em>same</em> raw bytes, so the byte count must match — <code>get_uniform_page_size</code> asserts it at
+    <span class="fileref">kv_cache_utils.py:960</span>) while the single-group per-layer path does not.</p>
+
+  <div class="callout warn">
+    <strong>One group, but still per-layer storage.</strong> Because there is only one group, there is <em>one</em>
+    block table and <em>one</em> block-id space shared by all 122 layers — a request's main and indexer caches use the
+    <strong>same block ids</strong>. The bytes are still separate per layer. So block id <code>42</code> names row 42
+    in <em>every</em> one of the 122 tensors at once: <code>main_L0.kv_cache[42]</code> (656 B),
+    <code>indexer_L0.kv_cache[42]</code> (132 B), … one slot index, 122 distinct physical rows.
+    <b>Column packing is the opposite axis</b> — it shares one tensor <em>across</em> groups (one layer from each),
+    and only ever appears in multi-group hybrids (Gemma-3 SWA+full, DeepSeek-V4). It never shares storage between two
+    layers of the <em>same</em> group.
+  </div>
+
+  <h2>6. A request arrives — the scheduler allocates blocks</h2>
+  <p>Startup is over. A request enters the waiting queue. On the next <code>step()</code>,
+    <code>Scheduler.schedule()</code> decides how many tokens of this request to run and asks the KV cache manager for
+    blocks to hold their KV.</p>
+
+  <div class="callout">
+    <strong>How this connects to §5.</strong> <code>bind_kv_cache</code> and <code>allocate_slots</code> never touch the
+    same objects — they sit on opposite sides of a boundary and meet only through a shared block-id space
+    <code>[0, num_blocks)</code>. Think <em>physical RAM vs. page allocator</em>:
+    <table style="margin-top:10px">
+      <thead><tr><th></th><th>bind_kv_cache (§5)</th><th>allocate_slots (§6)</th></tr></thead>
+      <tbody>
+        <tr><td>side</td><td>worker / GPU</td><td>scheduler / CPU</td></tr>
+        <tr><td>owns</td><td>the <b>bytes</b>: tensors <code>(num_blocks, 64, 656)</code> per layer</td><td>the <b>ids</b>: <code>KVCacheBlock(0…num_blocks−1)</code>, no tensors</td></tr>
+        <tr><td>when</td><td>once, at startup</td><td>every step, per request</td></tr>
+        <tr><td>role</td><td>fixed arena of <code>num_blocks</code> physical pages</td><td><code>malloc</code> returning page indices, not pointers</td></tr>
+      </tbody>
+    </table>
+    The single thing that couples them is <code>num_blocks</code>:
+    <code>cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks</code> (set in
+    <code>_initialize_kv_caches</code>) sizes both the worker's tensors and the scheduler's
+    <code>BlockPool(num_gpu_blocks)</code>. A block id <code>42</code> from <code>allocate_slots</code> is meaningful
+    only because §5 bound a tensor whose row 42 exists. The id rides <code>SchedulerOutput</code> to the worker, where
+    <code>compute_slot_mapping</code> turns <code>(block_id, offset)</code> into the slot that indexes
+    <code>layer.kv_cache</code> — the block table is the page table between the two halves.
+  </div>
+
+  <div class="flow">
+    <div class="flow-step b">
+      <div class="num">A. schedule()</div>
+      Picks waiting/running requests, computes <code>num_new_tokens</code> for each.
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step b">
+      <div class="num">B. allocate_slots</div>
+      Asks the KV cache manager for enough blocks to cover the new token count.
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step b">
+      <div class="num">C. block pool</div>
+      Pops free <code>KVCacheBlock</code> objects, bumps ref counts, returns their ids.
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step b">
+      <div class="num">D. SchedulerOutput</div>
+      Carries block ids per request to the worker as <code>NewRequestData</code>.
+    </div>
+  </div>
+
+  <pre><span class="c"># vllm/v1/core/sched/scheduler.py — inside schedule()</span>
+new_blocks = self.kv_cache_manager.allocate_slots(
+    request,
+    num_new_tokens,
+    num_lookahead_tokens=self.num_lookahead_tokens,
+)
+...
+NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())</pre>
+
+  <p>The actual "how many blocks" arithmetic lives in the per-type manager. It is a ceiling division minus what the
+    request already holds:</p>
+
+  <pre><span class="c"># vllm/v1/core/single_type_kv_cache_manager.py — allocate_new_blocks</span>
+num_required_blocks = cdiv(num_tokens, self.block_size)        <span class="c"># ceil(total / block_size)</span>
+num_new_blocks      = num_required_blocks - len(req_blocks)    <span class="c"># only the shortfall</span>
+<span class="k">if</span> num_new_blocks &gt; <span class="n">0</span>:
+    new_blocks = self.block_pool.get_new_blocks(num_new_blocks) <span class="c"># pops from the free list</span>
+    req_blocks.extend(new_blocks)</pre>
+
+  <div class="callout">
+    <strong>What a block id means.</strong> A block id is an index into the cache tensor's first dimension, not a
+    token position. For a tensor shaped <code>(num_blocks, block_size, …)</code>, block id <code>12</code> names row
+    <code>kv_cache[12]</code>, which holds <code>block_size</code> consecutive tokens.
+  </div>
+
+  <h2>7. <code>step()</code> — schedule, execute, update</h2>
+  <p>The engine loop is three calls. Everything in §6 happens inside the first; the model runs in the second; sampled
+    tokens are folded back into request state in the third.</p>
+
+  <pre><span class="c"># vllm/v1/engine/core.py — EngineCore.step()</span>
+<span class="k">if</span> <span class="k">not</span> self.scheduler.has_requests():
+    <span class="k">return</span> {}, <span class="k">False</span>
+scheduler_output = self.scheduler.schedule()                       <span class="c"># §6: pick reqs, allocate blocks</span>
+future = self.model_executor.execute_model(scheduler_output, non_block=<span class="k">True</span>)
+grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+model_output = future.result()
+<span class="k">if</span> model_output <span class="k">is</span> <span class="k">None</span>:
+    model_output = self.model_executor.sample_tokens(grammar_output)
+engine_core_outputs = self.scheduler.update_from_output(           <span class="c"># advance num_computed_tokens,</span>
+    scheduler_output, model_output                                 <span class="c">#   append sampled tokens</span>
+)</pre>
+
+  <h3>Inside execute_model: positions → slots</h3>
+  <p><code>GPUModelRunner.execute_model</code> first reconciles request state (<code>_update_states</code>: new requests
+    call <code>InputBatch.add_request</code> and write a full block-table row; running requests append only the newly
+    allocated ids). Then <code>_prepare_inputs</code> moves the block table to GPU and computes the slot mapping.</p>
+
+  <pre><span class="c"># vllm/v1/worker/gpu_model_runner.py — _prepare_inputs (key calls)</span>
+self.input_batch.block_table.commit_block_table(num_reqs)          <span class="c"># CPU block ids → GPU</span>
+...
+self.input_batch.block_table.compute_slot_mapping(                 <span class="c"># one flat slot per scheduled token</span>
+    num_reqs,
+    self.query_start_loc.gpu[: num_reqs + <span class="n">1</span>],
+    self.positions[:total_num_scheduled_tokens],
+)</pre>
+
+  <div class="eq">block_index      = position // block_size<br>
+block_id         = block_table[request_row, block_index]<br>
+offset_in_block  = position %  block_size<br>
+<b>slot             = block_id * block_size + offset_in_block</b></div>
+
+  <p>The slot mapping (one int per token, keyed by layer) goes into the forward context; the block table (keyed by
+    KV cache group) goes into the attention metadata. Then the model runs.</p>
+
+  <pre><span class="c"># the forward call</span>
+<span class="k">with</span> set_forward_context(attn_metadata, self.vllm_config,
+                         slot_mapping=slot_mappings_by_layer):
+    model_output = self._model_forward(input_ids=input_ids, positions=positions, ...)</pre>
+
+  <p>Inside each MLA layer, the write happens before the read: the layer looks itself up in the forward context, gets
+    its slot mapping, and writes the current tokens' latent KV into <code>self.kv_cache</code> (the tensor bound in
+    §5), then attention reads back over the cached range using the block table.</p>
+
+  <pre><span class="c"># vllm/model_executor/layers/attention/mla_attention.py (conceptual write)</span>
+slot = slot_mapping[t]
+<span class="k">if</span> slot &gt;= <span class="n">0</span>:
+    block_id, off = slot // block_size, slot % block_size
+    kv_cache[block_id, off] = pack(kv_c_normed[t], k_pe[t])   <span class="c"># latent KV + RoPE</span></pre>
+
+  <h2>8. Four consecutive steps, with real V3.2 numbers</h2>
+  <p class="subtitle">Real constants: <code>block_size = 64</code>, one request <code>r0</code> with a <b>190-token</b> prompt
+    (chosen to sit two slots short of a block boundary), no prefix-cache hit, <code>index_topk = 2048</code>. All 122
+    layers share <em>one</em> block table (§5.1), so the main and indexer caches use the <strong>same</strong> block
+    ids and the <strong>same</strong> slot values — the only difference is which per-layer tensor each slot indexes.</p>
+
+  <p>After the waiting-queue allocation (§6), the single pool gives <code>r0</code> three blocks
+    (<code>ceil(190/64) = 3</code>):</p>
+  <div class="eq">block table[r0] = [40, 41, 42]   <span class="c"># shared by all 122 layers (main MLA + indexer)</span><br>
+slot = block_id·64 + offset      <span class="c"># one value per token; indexes row in EACH layer's own tensor</span></div>
+
+  <h3><span class="tag">STEP 1</span>Prefill — 190 prompt tokens (positions 0–189)</h3>
+  <p>Required = <code>ceil(190/64) = 3</code> blocks; request holds 0, so <code>+3</code> from the single pool. The slot
+    mapping is computed once for the group from that one block table. Slot values for sample positions:</p>
+  <div class="cell-row wrap">
+    <div class="cell"><strong>pos 0</strong><span class="lo">blk 40 · off 0</span><span class="lo">slot 2560</span></div>
+    <div class="cell"><strong>pos 63</strong><span class="lo">blk 40 · off 63</span><span class="lo">slot 2623</span></div>
+    <div class="cell"><strong>pos 64</strong><span class="lo">blk 41 · off 0</span><span class="lo">slot 2624</span></div>
+    <div class="cell"><strong>pos 127</strong><span class="lo">blk 41 · off 63</span><span class="lo">slot 2687</span></div>
+    <div class="cell"><strong>pos 128</strong><span class="lo">blk 42 · off 0</span><span class="lo">slot 2688</span></div>
+    <div class="cell"><strong>pos 189</strong><span class="lo">blk 42 · off 61</span><span class="lo">slot 2749</span></div>
+    <div class="cell free"><strong>free</strong><span class="lo">blk 42 · off 62</span></div>
+    <div class="cell free"><strong>free</strong><span class="lo">blk 42 · off 63</span></div>
+  </div>
+  <p>Block 42 now holds positions 128–189 (62 tokens); offsets 62 and 63 are free. The <em>same</em> slots address both
+    caches: slot 2749 writes <code>main_Li.kv_cache[42, 61]</code> (656 B) and <code>indexer_Li.kv_cache[42, 61]</code>
+    (132 B) — same coordinate, different per-layer tensors. <code>num_computed_tokens = 190</code>; the sampled token is
+    position 190. Since 190 &lt; 2048, the indexer selects <em>all</em> tokens — no subselection yet.</p>
+
+  <h3><span class="tag">STEP 2</span>Decode — position 190</h3>
+  <p>Total = 191, required = <code>ceil(191/64) = 3</code>, held 3 → <b>no</b> new block.
+    <code>block_index = 190//64 = 2</code>, <code>off = 190%64 = 62</code>. Slot = <code>42·64 + 62 = 2750</code> →
+    row <code>[42, 62]</code> in <em>every</em> layer's tensor (main and indexer alike).
+    <code>num_computed_tokens = 191</code>.</p>
+
+  <h3><span class="tag">STEP 3</span>Decode — position 191 (both blocks fill)</h3>
+  <p>Total = 192, required = <code>ceil(192/64) = 3</code>, held 3 → <b>no</b> new block.
+    <code>off = 191%64 = 63</code>. Slot = <code>42·64 + 63 = 2751</code> → row <code>[42, 63]</code> everywhere;
+    block 42 is now full in all 122 tensors at once. <code>num_computed_tokens = 192</code>.</p>
+
+  <h3><span class="tag">STEP 4</span>Decode — position 192 (boundary crossed → new block)</h3>
+  <p>Total = 193, required = <code>ceil(193/64) = 4</code>, held 3 → <code>num_new_blocks = 1</code> from the single
+    pool. The scheduler pops one block (say <code>43</code>) and <code>append_row</code> extends the one block table.
+    <code>block_index = 192//64 = 3</code>, <code>off = 0</code>: slot = <code>43·64 + 0 = 2752</code> → row
+    <code>[43, 0]</code> in all 122 tensors. The block table is now <code>[40,41,42,43]</code> — used by main and
+    indexer alike.</p>
+
+  <table>
+    <thead><tr><th>step</th><th>kind</th><th>pos</th><th>total</th><th>blocks held</th><th>new?</th><th>slot (shared by all 122 layers)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>prefill</td><td>0–189</td><td>190</td><td>3 ([40,41,42])</td><td>+3</td><td>2560…2749</td></tr>
+      <tr><td>2</td><td>decode</td><td>190</td><td>191</td><td>3</td><td>no</td><td>2750</td></tr>
+      <tr><td>3</td><td>decode</td><td>191</td><td>192</td><td>3</td><td>no</td><td>2751</td></tr>
+      <tr><td>4</td><td>decode</td><td>192</td><td>193</td><td>4 ([40,41,42,43])</td><td><b>+1</b></td><td>2752</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Allocation only happens on block boundaries.</strong> Steps 2–3 write into already-owned blocks;
+    only step 4 — the first token of a new 64-token block — triggers <code>num_new_blocks = 1</code> from the single
+    pool, and that one new id extends the one shared block table for all 122 layers at once. Throughout, the indexer
+    still emits ≤2048 logical token ids; <code>r0</code> stays under that budget (193 ≪ 2048), so every token is
+    attended. Subselection would only begin once a sequence exceeds 2048 tokens.
+  </div>
+
+  <h2>9. Why the cache block size must equal the kernel's K-block granularity</h2>
+  <p>FlashMLA sparse advertises exactly one supported block size —
+    <code>get_supported_kernel_block_sizes() → [64]</code> — and the cache is laid out with
+    <code>block_size = 64</code> to match. This is not arbitrary; it is forced by how sparse attention dereferences
+    the cache.</p>
+
+  <p>The chain that turns a selected token into a byte address has <em>three</em> parties, and all three multiply by
+    the same <code>B = block_size</code>:</p>
+  <div class="trace">
+    <span class="step">1</span> <b>write</b> (<code>compute_slot_mapping</code>): <code>slot = block_table[pos//B]·B + pos%B</code><br>
+    <span class="step">2</span> <b>logical→physical</b> (<code>triton_convert_req_index_to_global_index</code>): for each top-k token, <code>global = block_table[tok//B]·B + tok%B</code><br>
+    <span class="step">3</span> <b>read</b> (the FlashMLA kernel): gathers K from the paged cache, indexing the block table in units of <code>B</code>
+  </div>
+
+  <p>The block table is the <strong>only</strong> map from logical position to physical block, and its unit is one
+    block = <code>B</code> tokens. If any party used a different <code>B</code>, its arithmetic would land on the wrong
+    row of the cache tensor. Three concrete failure modes if they disagreed:</p>
+
+  <table>
+    <thead><tr><th>Reason</th><th>What breaks if cache B ≠ kernel B</th></tr></thead>
+    <tbody>
+      <tr><td>Shared address math</td><td>The conversion in step 2 computes <code>tok//B</code> and <code>tok%B</code> with the <em>cache's</em> B. The kernel re-derives a block index from the same global value using <em>its</em> B. Different B → the kernel indexes a different block-table entry → reads another request's tokens (or out of bounds).</td></tr>
+      <tr><td>Paged non-contiguity</td><td>Tokens are physically contiguous <em>within</em> a 64-token block but blocks are scattered across the pool (e.g. ids 42 then 43 may be far apart). A kernel tile that pulled K in a granularity larger than 64 would straddle two blocks that are not adjacent in memory → it reads garbage across the gap.</td></tr>
+      <tr><td>Gather unit = page unit</td><td>Sparse MLA still fetches every selected token <em>through</em> the block table. One block-table lookup yields one block's worth of contiguous K — exactly <code>B</code> tokens. The kernel's inner loop must consume K in that same <code>B</code>-sized stride, or successive lookups desynchronize from the data they describe.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>In one sentence.</strong> The block table is a shared translation table whose unit is <code>block_size</code>;
+    the write path, the top-k logical→physical conversion, and the kernel's K gather all dereference it, so they must
+    agree on that unit. The kernel's K-block granularity <em>is</em> its hard-coded <code>block_size</code> — FlashMLA
+    sparse compiles tiles assuming 64-token pages — so the cache must be allocated with the identical 64, which is why
+    <code>EngineCore._initialize_kv_caches</code> sets <code>cache_config.block_size</code> from
+    <code>min(group block sizes)</code> and <code>vllm_config.validate_block_size()</code> rejects a mismatch.
+  </div>
+  <p style="color:var(--muted);font-size:13px">(The C128A "compressed" decode path scales this by a fixed
+    <code>compress_ratio</code> — <code>kernel_B = block_size // compress_ratio</code> — which is the same coupling
+    expressed as an exact integer ratio rather than equality. Equality is the <code>compress_ratio = 1</code> case.)</p>
+
+  <h2>10. Why this design — the five facts to carry away</h2>
+  <table>
+    <thead><tr><th>Fact</th><th>Where</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Layers register, they don't allocate</td><td><code>static_forward_context[prefix] = self</code></td><td>Decouples model code from memory planning; the runner discovers all cache owners generically.</td></tr>
+      <tr><td>Spec is a late-bound method</td><td><code>get_kv_cache_spec(vllm_config)</code></td><td>Reads the final <code>cache_config</code>, so block-size/dtype defaulting is always reflected.</td></tr>
+      <tr><td>MLA stores 1 vector/token</td><td><code>num_kv_heads = 1</code>, <code>head_size = 576</code></td><td>The whole reason MLA's cache is small — no per-head K and V.</td></tr>
+      <tr><td>bind_kv_cache is the join point</td><td><code>forward_context[name].kv_cache = tensor</code></td><td>Connects the planned tensor to the exact object the forward pass uses.</td></tr>
+      <tr><td>slot = block_id·block_size + offset</td><td><code>compute_slot_mapping</code></td><td>The single formula linking logical positions to physical addresses, on both write and read.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="foot">
+    Generated from the local checkout on 2026-05-30, concretized with the
+    <span class="fileref">deepseek-ai/DeepSeek-V3.2</span> config (61 layers, kv_lora_rank 512, qk_rope 64,
+    index_topk 2048, fp8). Chronological companion to the topical
+    <span class="fileref">minimax_m3_kv_cache_steps.html</span> note. This is a learning note, not a source-code change.
+    Numbers verified against <span class="fileref">kv_cache_interface.py</span> (656-byte layout),
+    <span class="fileref">flashmla_sparse.py</span> (block size 64), and <span class="fileref">deepseek_v2.py</span>
+    (132-byte indexer); deeper call paths summarized from the surrounding modules.
+  </div>
+</main>
+</body>
+</html>

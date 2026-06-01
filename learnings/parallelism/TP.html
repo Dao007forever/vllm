@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tensor Parallelism (TP) &mdash; vLLM Parallelism</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .matshard {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+    margin: 12px 0;
+    max-width: 540px;
+  }
+  .matshard .ms {
+    text-align: center;
+    border: 1px solid var(--border);
+    padding: 14px 6px;
+    border-radius: 6px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.82em;
+    background: var(--panel);
+  }
+  .matshard .ms.r0 { background: var(--blue-soft); border-color:#a6c8df; color:var(--blue);}
+  .matshard .ms.r1 { background: var(--green-soft); border-color:#abd1bb; color:var(--green);}
+  .matshard .ms.r2 { background: var(--amber-soft); border-color:#e3c88a; color:var(--amber);}
+  .matshard .ms.r3 { background: var(--red-soft); border-color:#e0b3ae; color:var(--red);}
+  .pipe {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto 1fr;
+    align-items: center;
+    gap: 10px;
+    margin: 14px 0;
+  }
+  .pipe .stage {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    text-align: center;
+    font-size: 0.85em;
+  }
+  .pipe .stage.com { background: var(--red-soft); border-color:#e0b3ae; }
+  .pipe .arr { font-size: 1.5em; color: var(--muted); text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">parallelism/</a> &rsaquo; <strong>TP</strong> &mdash;
+    Tensor Parallelism
+  </div>
+
+  <h1>Tensor Parallelism (TP)</h1>
+  <p class="subtitle">
+    The original Megatron-LM strategy: shard a <em>single layer's weight matrix</em>
+    across GPUs and recombine activations with an AllReduce. The most fine-grained
+    of vLLM's parallelism options &mdash; and the one with the highest per-step
+    communication cost.
+  </p>
+
+  <section class="tldr">
+    <strong>One-line model</strong>
+    <p>
+      TP shards weights along a chosen axis. Activations stay sharded for as long
+      as possible; an AllReduce closes each Q&middot;K&middot;V &rarr; Output and
+      Gate&middot;Up &rarr; Down boundary. Per-step communication is
+      <code>~4&times;</code> AllReduce per transformer layer, every layer, every
+      forward pass.
+    </p>
+  </section>
+
+  <div class="nav">
+    <ol>
+      <li><a href="#why">Why shard a layer at all</a></li>
+      <li><a href="#col-row">Column-parallel and Row-parallel</a></li>
+      <li><a href="#mlp">Worked example: the MLP block</a></li>
+      <li><a href="#attn">Worked example: the attention block</a></li>
+      <li><a href="#qkv">Why heads, not hidden, get sharded</a></li>
+      <li><a href="#kv-mechanism">How the KV cache inherits QKV's head sharding</a></li>
+      <li><a href="#cost">Communication cost</a></li>
+      <li><a href="#sequence">Sequence-parallel optimisation</a></li>
+      <li><a href="#config">Config and code pointers</a></li>
+      <li><a href="#vs">When to choose TP vs PP vs DP</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why">Why shard a layer at all</h2>
+
+  <p>
+    A 70B-parameter model in FP16 needs <code>~140 GB</code> just for weights, and
+    activations / KV cache add tens of GB more. No single GPU has that memory
+    (an H100 has 80 GB). The first question is: <em>can we keep the model
+    on one device by sharding the work, not the data?</em> The answer:
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <strong>Data parallel only</strong>
+      <p>
+        Each GPU has a full copy of the model. Memory grows per replica.
+        Doesn't help if the model itself doesn't fit on one GPU. Communication is
+        once-per-step at most (for sync), but the memory wall blocks you first.
+      </p>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <strong>Tensor parallel</strong>
+      <p>
+        Each GPU holds <code>1/N</code> of every weight matrix. The model
+        <em>fits</em> for any N. Communication is paid every layer, but the
+        bandwidth budget on NVLink/NVSwitch is roughly 600&ndash;900 GB/s, which is
+        usually enough for TP=4 to TP=8 in one node.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="col-row">Column-parallel and Row-parallel</h2>
+
+  <p>
+    Megatron-style TP has exactly two primitive layers:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>ColumnParallelLinear</h3>
+      <p>
+        Compute <code>Y = X &middot; A</code>. Split <code>A</code> along its
+        <em>output</em> dimension. Each rank holds <code>A_i</code> of shape
+        <code>[in, out/N]</code> and produces <code>Y_i = X &middot; A_i</code>
+        of shape <code>[B, out/N]</code>.
+      </p>
+      <p>
+        Input <code>X</code> is replicated across all ranks (no comm needed),
+        output <code>Y_i</code> is sharded.
+      </p>
+      <p class="subtitle">
+        <span class="fileref">vllm/model_executor/layers/linear.py</span>:410
+      </p>
+    </div>
+    <div class="box">
+      <h3>RowParallelLinear</h3>
+      <p>
+        Compute <code>Y = X &middot; A</code>. Split <code>A</code> along its
+        <em>input</em> dimension. Each rank holds <code>A_i</code> of shape
+        <code>[in/N, out]</code>, gets <code>X_i</code> of shape
+        <code>[B, in/N]</code>, and produces a partial output
+        <code>Y_i = X_i &middot; A_i</code>.
+      </p>
+      <p>
+        Each rank's output is a <em>partial sum</em>. An AllReduce sums them to
+        the full <code>Y</code>.
+      </p>
+      <p class="subtitle">
+        <span class="fileref">vllm/model_executor/layers/linear.py</span>:1392
+      </p>
+    </div>
+  </div>
+
+  <h4>The trick: pair them, defer the AllReduce.</h4>
+
+  <p>
+    A ColumnParallel followed by a RowParallel <em>does not need any
+    communication between them</em>. The ColumnParallel emits a sharded
+    activation; the RowParallel consumes that sharded activation directly
+    (its input is already partitioned along the row dimension). The
+    AllReduce only happens at the end:
+  </p>
+
+  <div class="pipe">
+    <div class="stage">
+      <strong>X</strong> &mdash; replicated<br>
+      <code>[B, H]</code>
+    </div>
+    <div class="arr">&rarr;</div>
+    <div class="stage">
+      <strong>Y = X &middot; A</strong><br>
+      ColumnParallel<br>
+      Y sharded <code>[B, H/N]</code>
+    </div>
+    <div class="arr">&rarr;</div>
+    <div class="stage">
+      <strong>Z = Y &middot; B</strong><br>
+      RowParallel<br>
+      Z partial sum
+    </div>
+  </div>
+  <div class="pipe">
+    <div class="stage com" style="grid-column: 3 / 4">
+      <strong>AllReduce(Z)</strong><br>
+      &rarr; full Z, replicated
+    </div>
+  </div>
+
+  <p>
+    This is the entire pattern. Every block in a transformer (MLP, attention) is
+    one Column &rarr; Row pair plus an AllReduce.
+  </p>
+
+  <h4>Which weights are column- vs row-parallel</h4>
+
+  <p>
+    Not every weight matrix is sharded the same way. The transformer
+    has exactly two Column&rarr;Row pairs per layer: <strong>QKV &rarr;
+    O</strong> for attention, and <strong>gate/up &rarr; down</strong>
+    for the MLP. In each pair, the column-parallel layer shards its
+    <em>output</em> dim along a logical axis (heads, or intermediate
+    features); the row-parallel layer shards its <em>input</em> dim
+    along the same axis. That's how the sharded activation flows from
+    one to the next without communication.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Weight</th>
+        <th>Logical shape</th>
+        <th>Sharded along</th>
+        <th>Type</th>
+        <th>vLLM class</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>W_qkv</code> (fused Q/K/V)</td>
+        <td><code>[H, (n_q + 2&middot;n_kv)&middot;head_dim]</code></td>
+        <td><strong>output</strong> (heads)</td>
+        <td>Column-parallel</td>
+        <td><code>QKVParallelLinear</code></td>
+      </tr>
+      <tr>
+        <td><code>W_O</code> (o_proj)</td>
+        <td><code>[n_q&middot;head_dim, H]</code></td>
+        <td><strong>input</strong> (heads)</td>
+        <td>Row-parallel</td>
+        <td><code>RowParallelLinear</code></td>
+      </tr>
+      <tr>
+        <td><code>W_gate_up</code> (fused gate/up)</td>
+        <td><code>[H, 2&middot;I]</code></td>
+        <td><strong>output</strong> (intermediate)</td>
+        <td>Column-parallel</td>
+        <td><code>MergedColumnParallelLinear</code></td>
+      </tr>
+      <tr>
+        <td><code>W_down</code> (down_proj)</td>
+        <td><code>[I, H]</code></td>
+        <td><strong>input</strong> (intermediate)</td>
+        <td>Row-parallel</td>
+        <td><code>RowParallelLinear</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    So <code>W_qkv</code> <em>is</em> sharded differently from
+    <code>W_O</code>: same physical dimension (heads), opposite sides of
+    the matmul. Same story for <code>W_gate_up</code> vs
+    <code>W_down</code> along the intermediate dim. The choice of which
+    side to shard is what determines whether the layer needs an
+    AllReduce on the way out:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Column-parallel</strong>: input is replicated, output is
+      sharded &rarr; no AllReduce needed (the next layer expects the
+      sharded shape anyway).
+    </li>
+    <li>
+      <strong>Row-parallel</strong>: input is sharded, output is a
+      partial sum &rarr; AllReduce required to recombine before the
+      next replicated-input layer (LayerNorm, residual, the next
+      block).
+    </li>
+  </ul>
+
+  <h2 id="mlp">Worked example: the MLP block (Gate-Up / Down)</h2>
+
+  <p>
+    Llama-style MLP is <code>down(silu(gate(x)) &odot; up(x))</code>.
+    Sizes for Llama&nbsp;3 70B: <code>H=8192</code>, intermediate
+    <code>I=28672</code>. Suppose TP=4.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Step</th><th>Op</th><th>Shape (per rank)</th><th>Comm</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td><td><code>gate_up_proj</code> &mdash; ColumnParallel</td>
+        <td><code>[B, H]</code> &rarr; <code>[B, 2I/N]</code> = <code>[B, 14336]</code></td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>2</td><td>silu / mul (pointwise)</td>
+        <td><code>[B, I/N]</code> = <code>[B, 7168]</code></td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>3</td><td><code>down_proj</code> &mdash; RowParallel</td>
+        <td><code>[B, I/N]</code> &rarr; <code>[B, H]</code> partial</td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>4</td><td>AllReduce(out)</td>
+        <td><code>[B, H]</code> replicated</td>
+        <td><strong>AllReduce of <code>B&times;H</code></strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Each rank does <code>1/N</code> of the FLOPs, holds <code>1/N</code> of the
+    weights, and one AllReduce per MLP at the end.
+  </p>
+
+  <h4>Weight shards (TP=4)</h4>
+  <p>
+    <code>gate_proj</code> shape <code>[H, I] = [8192, 28672]</code>. After
+    column-sharding the output dim by 4:
+  </p>
+  <div class="matshard">
+    <div class="ms r0">A_0<br><span class="subtitle" style="display:block">[8192, 7168]</span></div>
+    <div class="ms r1">A_1<br><span class="subtitle" style="display:block">[8192, 7168]</span></div>
+    <div class="ms r2">A_2<br><span class="subtitle" style="display:block">[8192, 7168]</span></div>
+    <div class="ms r3">A_3<br><span class="subtitle" style="display:block">[8192, 7168]</span></div>
+  </div>
+
+  <p>
+    Then <code>down_proj</code> shape <code>[I, H] = [28672, 8192]</code>.
+    Row-sharded along the input dim by 4:
+  </p>
+  <div class="matshard">
+    <div class="ms r0">B_0<br><span class="subtitle" style="display:block">[7168, 8192]</span></div>
+    <div class="ms r1">B_1<br><span class="subtitle" style="display:block">[7168, 8192]</span></div>
+    <div class="ms r2">B_2<br><span class="subtitle" style="display:block">[7168, 8192]</span></div>
+    <div class="ms r3">B_3<br><span class="subtitle" style="display:block">[7168, 8192]</span></div>
+  </div>
+
+  <h2 id="attn">Worked example: the attention block</h2>
+
+  <p>
+    Same Column &rarr; Row pattern, but the sharded dimension is
+    <strong>num heads</strong>:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Step</th><th>Op</th><th>What's sharded</th><th>Comm</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><code>QKVParallelLinear</code> &mdash; ColumnParallel</td>
+        <td>num_heads &rarr; <code>num_heads/N</code> per rank</td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>rotary position embedding</td>
+        <td>applied to local heads only</td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>flash-attention</td>
+        <td>each rank computes its heads' attention output</td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><code>o_proj</code> &mdash; RowParallel</td>
+        <td>concatenates heads &rarr; partial hidden</td>
+        <td>none</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>AllReduce(o_proj_out)</td>
+        <td>full hidden replicated</td>
+        <td><strong>AllReduce</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>KV cache implication.</strong> Each rank only holds the KV cache for
+    its assigned heads. Memory for KV scales as
+    <code>num_heads/N &times; head_dim</code>, not <code>num_heads &times; head_dim</code>.
+    For GQA models (where <code>num_kv_heads &lt; num_heads</code>), TP must divide
+    <code>num_kv_heads</code>; otherwise some ranks would have no KV cache and need
+    replication. This is where <a href="CP.html">DCP</a> enters the picture.
+  </div>
+
+  <h2 id="qkv">Why heads, not hidden, get sharded</h2>
+
+  <p>
+    Why not just shard <code>hidden_dim</code> directly, as in the MLP?
+  </p>
+
+  <p>
+    Because softmax is non-linear. The attention output for head <code>h</code>
+    needs the <em>full</em> Q, K, V <em>for that head</em> &mdash; you can't compute
+    softmax over a sliced K then sum partial outputs and get the right answer.
+    Sharding by head keeps each head's computation whole and local. Sharding
+    within a head would require splitting the softmax, which is exactly what
+    <a href="CP.html">context-parallel</a> does, with extra communication.
+  </p>
+
+  <h2 id="kv-mechanism">How the KV cache inherits QKV's head sharding</h2>
+
+  <p>
+    A natural question after the above: TP shards <em>every</em> weight
+    matrix in the model &mdash; QKV, O, gate, up, down. So why is the
+    <em>KV cache</em> sharded specifically along <code>num_kv_heads</code>,
+    and where does the cross-rank synchronization (AllReduce?
+    ReduceScatter?) for populating it happen?
+  </p>
+
+  <p>
+    Answer: there is no separate KV-cache sharding mechanism. The cache
+    layout falls out of where the <strong>column-parallel QKV
+    projection</strong> drops its outputs. Trace one token through one
+    layer:
+  </p>
+
+  <ol>
+    <li>
+      Input <code>x</code> is replicated across ranks (shape
+      <code>[B, S, H]</code>).
+    </li>
+    <li>
+      <code>QKVParallelLinear</code> is column-parallel. Each rank holds
+      <code>W_qkv_local</code> of shape
+      <code>[H, (n_q + 2&middot;n_kv) &middot; head_dim / N]</code>.
+    </li>
+    <li>
+      Each rank locally computes
+      <code>q_local, k_local, v_local = x &middot; W_qkv_local</code>.
+      <code>k_local</code> shape is
+      <code>[B, S, n_kv/N, head_dim]</code> &mdash;
+      <strong>already sharded by KV head</strong>. No communication.
+    </li>
+    <li>
+      <code>k_local</code> (and <code>v_local</code>) is written
+      directly into this rank's slot in the paged KV cache. Again, no
+      communication, no reshuffling. The cache layout is fixed by the
+      output shape of the column-parallel projection that produced it.
+    </li>
+  </ol>
+
+  <h4>Worked example: Llama-3-70B with TP=4 (GQA, 8 KV heads)</h4>
+
+  <p>
+    Concrete numbers help with one easy-to-miss point: <strong>q, k, v
+    <em>are</em> sharded</strong>, just as much as <code>W_qkv_local</code>
+    is. The single fused QKV matmul doesn't keep them whole; it just
+    slices its output into three tensors after the GEMM, and each slice
+    is already this rank's head shard.
+  </p>
+
+  <p>
+    Llama-3-70B: <code>n_q=64</code> query heads,
+    <code>n_kv=8</code> KV heads (each KV head is shared by 8 query
+    heads under GQA), <code>head_dim=128</code>, hidden
+    <code>H=8192</code>. The logical full <code>W_qkv</code>
+    concatenates the Q, K, and V projections along the output axis:
+  </p>
+
+  <pre><code>full W_qkv shape:  [H,  (n_q + 2&middot;n_kv) &middot; head_dim]
+                =  [8192, (64 + 8 + 8) &middot; 128]
+                =  [8192, 10240]
+                            &uarr;
+            structured as: [Q: 64&middot;128 | K: 8&middot;128 | V: 8&middot;128]</code></pre>
+
+  <p>
+    Column-parallel sharding by <code>N=4</code> doesn't naively chop
+    the 10240 output axis into four equal chunks &mdash; that would put
+    all KV heads on rank&nbsp;3 and leave ranks 0&ndash;2 with no K or
+    V. Instead, <code>QKVParallelLinear</code> shards Q, K, and V
+    <em>independently</em> by head, then concatenates each rank's slice:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Rank</th>
+        <th>Q heads owned</th>
+        <th>K heads owned</th>
+        <th>V heads owned</th>
+        <th><code>W_qkv_local</code> shape</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>0</td><td>[0..15]</td><td>[0, 1]</td><td>[0, 1]</td><td><code>[8192, 2560]</code></td></tr>
+      <tr><td>1</td><td>[16..31]</td><td>[2, 3]</td><td>[2, 3]</td><td><code>[8192, 2560]</code></td></tr>
+      <tr><td>2</td><td>[32..47]</td><td>[4, 5]</td><td>[4, 5]</td><td><code>[8192, 2560]</code></td></tr>
+      <tr><td>3</td><td>[48..63]</td><td>[6, 7]</td><td>[6, 7]</td><td><code>[8192, 2560]</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Each rank's local output dim:
+    <code>16&middot;128 + 2&middot;128 + 2&middot;128 = 2048 + 256 + 256 = 2560</code>.
+    The matmul produces a single per-rank tensor:
+  </p>
+
+  <pre><code>out  =  x &middot; W_qkv_local  =  [B, S, 2560]   on each rank</code></pre>
+
+  <p>
+    That single output is then <em>sliced</em> along the last dim to
+    recover Q, K, V separately. No collective, no reshape across ranks
+    &mdash; just a local tensor view:
+  </p>
+
+  <pre><code>q_local = out[..., :2048]      &rarr; reshape [B, S, 16, 128]   # 16 Q heads
+k_local = out[..., 2048:2304]  &rarr; reshape [B, S,  2, 128]   # 2 KV heads
+v_local = out[..., 2304:2560]  &rarr; reshape [B, S,  2, 128]   # 2 KV heads</code></pre>
+
+  <p>
+    So <code>q_local</code>, <code>k_local</code>,
+    <code>v_local</code> each carry exactly this rank's <code>1/4</code>
+    share of heads, with the full <code>head_dim=128</code> per head.
+    On rank 0, <code>k_local</code> holds the entirety of KV heads 0
+    and 1 and nothing else; rank 1 holds KV heads 2 and 3; and so on.
+    Across all four ranks, every KV head is owned by exactly one rank
+    &mdash; no replication, no missing heads.
+  </p>
+
+  <p>
+    That <code>k_local</code> of shape <code>[B, S, 2, 128]</code> is
+    what gets appended to rank 0's KV cache slot. Rank 0's cache tensor
+    per layer has shape
+    <code>[num_blocks, block_size, 2, 128]</code> &mdash; exactly the
+    <code>n_kv/N &times; head_dim</code> tail of the head-sharded
+    layout, with no additional sharding logic required.
+  </p>
+
+  <p>
+    The same head shard is what FlashAttention then reads back from the
+    cache on subsequent steps &mdash; the producer and consumer of the
+    cache are both local to the rank, so the head-sharded layout never
+    leaves the rank during normal forward execution.
+  </p>
+
+  <h4>Where do AllReduce / ReduceScatter actually fire?</h4>
+
+  <p>
+    Per transformer layer, only at the <em>row-parallel</em> boundaries.
+    Not at the KV cache.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Boundary</th>
+        <th>Standard TP</th>
+        <th>+ Sequence parallel</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>QKV projection (column-parallel write)</td>
+        <td>none</td>
+        <td>AllGather of <code>x</code> first (input is seq-sharded)</td>
+      </tr>
+      <tr>
+        <td><strong>KV cache populate</strong> (store k_local, v_local)</td>
+        <td><strong>none</strong></td>
+        <td><strong>none</strong></td>
+      </tr>
+      <tr>
+        <td><strong>KV cache read</strong> (FlashAttention)</td>
+        <td><strong>none</strong></td>
+        <td><strong>none</strong></td>
+      </tr>
+      <tr>
+        <td>Attention <code>o_proj</code> (row-parallel)</td>
+        <td>AllReduce</td>
+        <td>ReduceScatter</td>
+      </tr>
+      <tr>
+        <td>MLP <code>down_proj</code> (row-parallel)</td>
+        <td>AllReduce</td>
+        <td>ReduceScatter</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Two collectives per layer in standard TP; both are AllReduce on
+    partial sums emerging from row-parallel weights. Sequence
+    parallelism (see <a href="#sequence">below</a>) swaps each
+    AllReduce for a ReduceScatter + matching AllGather later &mdash;
+    same total bandwidth, different intermediate shape. <strong>Neither
+    AllReduce nor ReduceScatter touches the KV cache.</strong>
+  </p>
+
+  <div class="callout info">
+    <strong>Why this matters for the KV transfer plane</strong>
+    <p>
+      Connectors that move KV between prefill and decode workers (see
+      <a href="../kv_cache/transfer/PARALLELISM.html">kv_cache/transfer/PARALLELISM</a>)
+      describe the transfer entirely in terms of "which heads live on
+      which rank." That phrasing is precise &mdash; the cache layout is
+      already final on each rank before any collective fires, so the
+      connector never has to coordinate with a collective in flight or
+      worry about partial-sum state crossing the wire. It just copies
+      head shards.
+    </p>
+  </div>
+
+  <h2 id="cost">Communication cost</h2>
+
+  <p>
+    Per transformer layer, the per-step bandwidth on each rank is:
+  </p>
+
+  <ul>
+    <li><strong>1 AllReduce</strong> after attention <code>o_proj</code>: payload <code>B&times;S&times;H</code></li>
+    <li><strong>1 AllReduce</strong> after MLP <code>down_proj</code>: payload <code>B&times;S&times;H</code></li>
+  </ul>
+
+  <p>
+    With <code>L</code> layers that's <code>2L</code> AllReduces per forward
+    pass. For Llama&nbsp;3 70B (<code>L=80</code>, <code>H=8192</code>), one decode
+    step (<code>S=1</code>) at <code>B=64</code> sends:
+  </p>
+
+  <pre><code>2 &times; 80 &times; 64 &times; 1 &times; 8192 &times; 2B(fp16)
+  &asymp; 167 MB on the wire per rank, per forward pass</code></pre>
+
+  <p>
+    On 600 GB/s NVLink that's about <code>0.28 ms</code>. Multiply by the
+    decode step rate to see why TP&gt;8 across nodes (over slower interconnects)
+    falls off a cliff.
+  </p>
+
+  <h2 id="sequence">Sequence-parallel optimisation</h2>
+
+  <p>
+    LayerNorm, residual adds, and dropout are <em>elementwise</em> &mdash; they
+    don't mix the hidden dim. So instead of having all ranks redundantly compute
+    them on the full <code>[B, S, H]</code>, you can:
+  </p>
+
+  <ol>
+    <li>Replace each AllReduce with a ReduceScatter (along the <em>sequence</em> dim).</li>
+    <li>Run LayerNorm / residual on the per-rank sequence shard.</li>
+    <li>AllGather before the next attention layer that needs the full sequence.</li>
+  </ol>
+
+  <p>
+    Total comm volume stays the same (ReduceScatter + AllGather = AllReduce),
+    but the activation memory drops by <code>1/N</code>, and you save the
+    duplicated norm/residual work. See <a href="COMMUNICATION.html#identities">the
+    AllReduce identity</a> for the algebra.
+  </p>
+
+  <h2 id="config">Config and code pointers</h2>
+
+  <pre><code># CLI
+vllm serve meta-llama/Llama-3.1-70B-Instruct --tensor-parallel-size 8
+
+# Python
+LLM(model="...", tensor_parallel_size=8)</code></pre>
+
+  <ul>
+    <li>
+      <span class="fileref">vllm/config/parallel.py</span>:113
+      &mdash; <code>tensor_parallel_size: int = 1</code>
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/parallel_state.py</span>:1583
+      &mdash; TP group ranks are <code>all_ranks.view(-1, TP).unbind(0)</code>;
+      contiguous ranks share a TP group so NVLink stays on-board.
+    </li>
+    <li>
+      <span class="fileref">vllm/model_executor/layers/linear.py</span>:410, 1392
+      &mdash; <code>ColumnParallelLinear</code> and <code>RowParallelLinear</code>.
+      Their <code>QKVParallelLinear</code> and <code>MergedColumnParallelLinear</code>
+      subclasses are the workhorses you see in every model file.
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/device_communicators/</span>
+      &mdash; per-backend AllReduce implementations (custom CUDA kernel, NCCL,
+      MORI, etc.).
+    </li>
+  </ul>
+
+  <h2 id="vs">When to choose TP vs PP vs DP</h2>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>Choose TP when&hellip;</h3>
+      <ul>
+        <li>All ranks are on the same node (NVLink available).</li>
+        <li>You need the lowest end-to-end latency.</li>
+        <li>The model doesn't fit on one GPU but fits on one node.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Choose PP when&hellip;</h3>
+      <ul>
+        <li>Crossing nodes; interconnect can't sustain the AllReduce volume.</li>
+        <li>You can hide the bubble with enough in-flight microbatches.</li>
+        <li>Memory is your constraint, not latency.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Choose DP when&hellip;</h3>
+      <ul>
+        <li>The model already fits. You want more throughput.</li>
+        <li>For MoE: <a href="EP.html">EP</a> + DP together for wide deployments.</li>
+        <li>Per-replica latency is fine; you just want to serve more requests.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The composition rule</strong>:
+    <code>world_size = DP &times; PP &times; PCP &times; TP</code>. They are
+    orthogonal &mdash; vLLM builds one rank-grid at startup
+    (<span class="fileref">parallel_state.py</span>:1575) and projects the same
+    physical GPUs into each parallelism's "group" by reshaping.
+  </div>
+
+  <h2>Next</h2>
+
+  <p>
+    Continue with <a href="DP.html">DP.html</a> (the other extreme &mdash; minimum
+    per-step comm), or skip ahead to <a href="EP.html">EP.html</a> if you're
+    working on MoE models.
+  </p>
+
+</main>
+</body>
+</html>

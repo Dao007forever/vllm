@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RFC #42082 — Standardize KV-Cache Layouts</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../kv_cache/index.html">&larr; learnings</a> &nbsp;|&nbsp;
+    source: <a href="https://github.com/vllm-project/vllm/issues/42082">vllm-project/vllm#42082</a>
+    &nbsp;|&nbsp; author: Lucas Wilkinson &nbsp;|&nbsp; opened 2026-05-08
+  </div>
+
+  <h1>RFC #42082 — Standardize KV-Cache Layouts</h1>
+  <p class="subtitle">
+    A beginner-friendly walkthrough of the proposal to give <em>every</em>
+    attention backend one canonical KV-cache shape, so the KV-transfer
+    (&ldquo;connector&rdquo;) code stops needing per-backend special cases.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      Today each attention backend (GQA, MLA, Mamba, &hellip;) stores its
+      KV cache in its own shape, and the code that <em>copies</em> KV cache
+      between machines has to special-case every one of them
+      (<code>if is_mla</code>, <code>if is_mamba</code>, &hellip;). This RFC
+      proposes a single <strong>logical 5-D shape</strong>
+      <code>[layers, blocks, heads, states, content]</code> that all
+      backends map onto, a <strong>stride_order</strong> knob that decides
+      the <em>physical</em> memory order separately from that logical shape,
+      and a rule that <strong>each backend slices its own tensor</strong> for
+      transfer. The payoff: the connector becomes fully backend-agnostic.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#background">Background: the words you need first</a></li>
+      <li><a href="#problem">The problem this RFC fixes</a></li>
+      <li><a href="#shape">Idea 1: one canonical logical shape</a></li>
+      <li><a href="#mapping">How each backend maps onto it</a></li>
+      <li><a href="#stride">Idea 2: logical shape vs physical layout (stride_order)</a></li>
+      <li><a href="#layouts">The four layouts &amp; when each wins</a></li>
+      <li><a href="#shared">Constraint for shared tensors (HMA)</a></li>
+      <li><a href="#spec">Idea 3: the spec describes itself</a></li>
+      <li><a href="#slicing">Idea 4: specs slice themselves for TP</a></li>
+      <li><a href="#connector">The payoff: a generic connector</a></li>
+      <li><a href="#part1">PR #42374 — Part 1 in depth</a></li>
+      <li><a href="#status">Status &amp; work tracking</a></li>
+      <li><a href="#takeaways">Takeaways</a></li>
+    </ol>
+  </nav>
+
+  <!-- ===================================================================== -->
+  <h2 id="background">Background: the words you need first</h2>
+
+  <p>
+    This RFC sits at the intersection of three subsystems. If you are new to
+    vLLM, anchor on these definitions before reading the proposal &mdash;
+    every later section reuses them.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>KV cache</h3>
+      <p>
+        When a model generates token <em>t</em>, attention needs the
+        <strong>K</strong>ey and <strong>V</strong>alue vectors of every
+        earlier token. Recomputing them each step is wasteful, so vLLM stores
+        them. That store is the <em>KV cache</em>. It is split into fixed-size
+        <strong>blocks</strong> (a.k.a. pages), each holding
+        <code>block_size</code> token positions.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Attention backend</h3>
+      <p>
+        The kernel + memory format that implements attention.
+        FlashAttention/<strong>GQA</strong>, <strong>MLA</strong>
+        (DeepSeek-style latent attention), <strong>Mamba</strong> (state-space
+        / recurrent), etc. Crucially, <em>each one lays out its KV bytes
+        differently</em>.
+      </p>
+    </div>
+    <div class="box">
+      <h3>KV connector</h3>
+      <p>
+        In <strong>P/D disaggregation</strong>, one set of GPUs does
+        <em>prefill</em> (reads the prompt, fills the KV cache) and another set
+        does <em>decode</em> (generates tokens). The KV cache must be
+        <em>transferred</em> from prefill to decode &mdash; often over the
+        network with RDMA (e.g. the NIXL connector). That transfer code is the
+        <em>connector</em>.
+      </p>
+    </div>
+    <div class="box">
+      <h3>TP (tensor parallelism)</h3>
+      <p>
+        A model too big for one GPU is split across several. With
+        <strong>TP=2</strong>, the attention <em>heads</em> are divided in
+        half &mdash; GPU&nbsp;0 holds heads 0&ndash;<em>n</em>/2, GPU&nbsp;1
+        holds the rest. The prefill and decode sides can even run at
+        <em>different</em> TP degrees (&ldquo;hetero-TP&rdquo;).
+      </p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The one-sentence why</strong>
+    The connector copies KV bytes between machines. To copy bytes correctly it
+    must know <em>where the bytes are</em> &mdash; and right now that knowledge
+    is scattered across every attention backend.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="problem">The problem this RFC fixes</h2>
+
+  <p>
+    The connector currently asks each attention backend two questions:
+    <code>get_kv_cache_shape()</code> (&ldquo;what shape is your tensor?&rdquo;)
+    and <code>get_kv_cache_stride_order()</code> (&ldquo;in what memory order?&rdquo;).
+    Because the answers differ per backend, the connector fills up with
+    branches and the two subsystems become tightly coupled.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Today: connector is coupled to every backend</div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">CONNECTOR</span>NIXL / RDMA transfer code</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a"><span class="num">asks shape</span><code>if is_mla&hellip;</code></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">backend A</span>GQA shape</div>
+    </div>
+    <div class="flow">
+      <div class="flow-step a"><span class="num">asks shape</span><code>if is_mamba&hellip;</code></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">backend B</span>MLA shape</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">backend C</span>Mamba shape</div>
+    </div>
+    <div class="diagram-caption">
+      Every new backend means new <code>if</code>-branches in the connector.
+      The coupling caused real bugs (see #41657).
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Symptom 1 — flag soup</h3>
+      <p>
+        Connector code is littered with <code>is_mla</code> /
+        <code>is_mamba</code> checks to decide how to interpret the bytes.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Symptom 2 — tight coupling</h3>
+      <p>
+        The connector reaches into attention-backend internals like
+        <span class="fileref">flash_attn.py</span> to learn the layout. Change
+        a backend &rarr; risk breaking transfers.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>Root cause</strong>
+    There is no <em>shared vocabulary</em> for &ldquo;where is head 3 of block 12
+    of layer 5?&rdquo; Each backend answers in its own dialect, so the connector
+    must speak all of them.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="shape">Idea 1: one canonical logical shape</h2>
+
+  <p>
+    The core proposal: define a single <strong>logical</strong> (semantic) shape
+    that <em>every</em> backend must describe its KV cache in. It has five
+    dimensions:
+  </p>
+
+  <div class="eq">
+    <b>[ num_layer_slots , num_blocks , num_heads , num_states , &lt;state_content&gt; ]</b><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;L &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; B &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; H &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; N &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; C
+  </div>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>L &mdash; layers</h3>
+      <p>How many transformer layers share this tensor.</p>
+    </div>
+    <div class="box">
+      <h3>B &mdash; blocks</h3>
+      <p>The paged-attention blocks (the pool of pages).</p>
+    </div>
+    <div class="box">
+      <h3>H &mdash; heads</h3>
+      <p>Attention heads &mdash; or <strong>1</strong> for &ldquo;headless&rdquo;
+      backends like MLA.</p>
+    </div>
+    <div class="box">
+      <h3>N &mdash; states</h3>
+      <p>Token positions per block &mdash; or <strong>1</strong> for recurrent
+      state (Mamba).</p>
+    </div>
+    <div class="box">
+      <h3>C &mdash; state_content</h3>
+      <p>The backend-specific payload (e.g. <code>[2, head_dim]</code> for
+      K&amp;V). <strong>Always contiguous.</strong></p>
+    </div>
+    <div class="box">
+      <h3>Why 5 dims?</h3>
+      <p>It is the smallest shape expressive enough to hold attention
+      <em>and</em> recurrent state, while exposing heads &amp; blocks for
+      slicing.</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>&ldquo;Logical&rdquo; is the key word</strong>
+    This shape says <em>what the dimensions mean</em>, not how they sit in
+    memory. The memory order is decided separately (<a href="#stride">Idea&nbsp;2</a>).
+    That separation is what makes the whole thing flexible.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="mapping">How each backend maps onto it</h2>
+
+  <p>
+    The trick is that the unusual backends fold their quirks into the
+    <code>num_heads=1</code> or <code>num_states=1</code> slots. Here is the
+    mapping table from the RFC:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Backend</th><th>num_states (N)</th><th>num_heads (H)</th><th>state_content (C)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GQA (standard attention)</td><td><code>block_size</code></td><td><code>num_kv_heads</code></td><td><code>[2, head_dim]</code> &larr; the 2 is K&amp;V</td></tr>
+      <tr><td>DeepSeek&nbsp;V4 (c4a, 1 layer type)</td><td><code>block_size/4</code></td><td>1</td><td><code>[latent_size]</code></td></tr>
+      <tr><td>MLA</td><td><code>block_size</code></td><td>1 <span class="tag">headless</span></td><td><code>[latent_size]</code></td></tr>
+      <tr><td>Mamba2 Conv</td><td>1 <span class="tag">recurrent</span></td><td>1</td><td><code>[conv_dim/tp, kernel-1]</code></td></tr>
+      <tr><td>Mamba2 SSM</td><td>1 <span class="tag">recurrent</span></td><td><code>num_heads</code></td><td><code>[head_dim, state_size]</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>Worked example — GQA, one block</h3>
+  <p>
+    Picture a single block of a standard attention layer with
+    <code>block_size=4</code>, <code>num_kv_heads=2</code>. The block holds 4
+    token positions (N), each with 2 heads (H), each head storing a K and a V
+    vector (C = <code>[2, head_dim]</code>).
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">GQA: one block = N states &times; H heads &times; (K,V)</div>
+    <div class="cell-row">
+      <span class="cell label">state N0</span>
+      <span class="cell used">h0: K | V</span>
+      <span class="cell used">h1: K | V</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">state N1</span>
+      <span class="cell used">h0: K | V</span>
+      <span class="cell used">h1: K | V</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">state N2</span>
+      <span class="cell used">h0: K | V</span>
+      <span class="cell used">h1: K | V</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">state N3</span>
+      <span class="cell used">h0: K | V</span>
+      <span class="cell used">h1: K | V</span>
+    </div>
+    <div class="diagram-caption">
+      <code>num_states=4</code>, <code>num_heads=2</code>,
+      <code>state_content=[2, head_dim]</code>. Each cell is one
+      &ldquo;[H,N,C]&rdquo; element the connector might copy.
+    </div>
+  </div>
+
+  <h3>Worked example — MLA &amp; Mamba (the &ldquo;1&rdquo; tricks)</h3>
+  <div class="compare">
+    <div class="side left">
+      <strong>MLA — headless</strong>
+      <p>
+        MLA compresses all heads into one shared <em>latent</em>. So
+        <code>num_heads = 1</code>. It still has <code>block_size</code> token
+        positions, so <code>N = block_size</code>, and the content is the
+        latent vector.
+      </p>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <strong>Mamba — recurrent</strong>
+      <p>
+        Mamba keeps a single rolling state per sequence, not one-per-token. So
+        there is no &ldquo;token position&rdquo; axis &rarr;
+        <code>num_states = 1</code>. The recurrent state itself lives in the
+        content dim.
+      </p>
+    </div>
+  </div>
+
+  <h3>Worked example — DeepSeek&nbsp;V4 (why <code>num_states = block_size/4</code>)</h3>
+  <p>
+    DeepSeek&nbsp;V4&rsquo;s &ldquo;c4a&rdquo; variant is MLA-like &mdash; it is
+    <strong>headless</strong> (<code>num_heads = 1</code>: one shared latent
+    instead of per-head K&amp;V) &mdash; but with one extra twist: it
+    <em>compresses every 4 token positions into a single stored state</em>.
+    That compression ratio is exactly the <code>tokens_per_state = 4</code>
+    field from <a href="#spec">Idea&nbsp;3</a> (the &ldquo;<strong>4</strong>&rdquo;
+    in &ldquo;c<strong>4</strong>a&rdquo;).
+  </p>
+  <p>
+    Crucially, <code>num_states</code> is <em>never stored</em> &mdash; it is
+    <strong>derived</strong> at allocation time as
+    <code>block_size / tokens_per_state</code> (see <a href="#spec">Idea&nbsp;3</a>),
+    because <code>block_size</code> is a deployment choice. With
+    <code>tokens_per_state = 4</code> that becomes <code>block_size / 4</code>.
+    So a block that <em>addresses</em> <code>block_size</code> token positions
+    only needs <code>block_size/4</code> physical state slots &mdash; each slot is
+    one compressed latent standing in for 4 consecutive tokens.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">DeepSeek V4 (c4a): block_size=8, tokens_per_state=4 &rarr; num_states = 8/4 = 2</div>
+    <div class="cell-row">
+      <span class="cell label">state S0</span>
+      <span class="cell used">tokens 0&ndash;3 &rarr; 1 latent</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">state S1</span>
+      <span class="cell used">tokens 4&ndash;7 &rarr; 1 latent</span>
+    </div>
+    <div class="diagram-caption">
+      <code>num_heads=1</code> (headless), <code>num_states = 2</code>,
+      <code>state_content = [latent_size]</code>. The block still
+      <em>addresses</em> 8 token positions, but stores only 2 latents because
+      every 4 tokens collapse into one. Halve the compression to
+      <code>tokens_per_state=2</code> and the same block would hold 4 states;
+      set it to 1 and you are back to plain MLA with 8.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Contrast with plain MLA</strong>
+    MLA is also headless, but it keeps <code>tokens_per_state = 1</code> &rarr;
+    <code>num_states = block_size</code> (one latent per token). DeepSeek&nbsp;V4&rsquo;s
+    c4a is essentially &ldquo;MLA + 4&times; temporal compression,&rdquo; which is
+    the only reason its <code>num_states</code> shrinks to
+    <code>block_size/4</code>. Same headless content dim, fewer state slots.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="stride">Idea 2: logical shape vs physical layout (stride_order)</h2>
+
+  <p>
+    The logical shape is always <code>[L, B, H, N, C]</code>. But you may want
+    the bytes stored in a <em>different</em> order for performance. A
+    <code>stride_order</code> is just a permutation that says &ldquo;walk the
+    logical dimensions in <em>this</em> physical order.&rdquo;
+  </p>
+
+  <div class="callout">
+    <strong>Analogy</strong>
+    A spreadsheet has the same <em>logical</em> cells whether you store it
+    row-major or column-major on disk. <code>stride_order</code> is choosing
+    row-major vs column-major &mdash; the meaning is identical, the access cost
+    is not.
+  </div>
+
+  <p>
+    Why does the connector care about physical order? Because a network transfer
+    is fastest when the bytes it wants are <strong>contiguous</strong> &mdash;
+    one big RDMA read beats thousands of tiny scattered ones. Different transfer
+    patterns want different things contiguous, so the RFC defines four named
+    layouts.
+  </p>
+
+  <!-- ===================================================================== -->
+  <h2 id="layouts">The four layouts &amp; when each wins</h2>
+
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Physical order</th><th>stride_order</th><th>What ends up contiguous</th><th>Best for</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>LBHNC</strong> <span class="tag full">default</span></td>
+        <td><code>[L,B,H,N,C]</code></td>
+        <td><code>(0,1,2,3,4)</code> identity</td>
+        <td>a head&rsquo;s data</td>
+        <td>head-level TP transfers, hetero-TP disagg</td>
+      </tr>
+      <tr>
+        <td><strong>LBNHC</strong></td>
+        <td><code>[L,B,N,H,C]</code></td>
+        <td><code>(0,1,3,2,4)</code></td>
+        <td>a state (token) slice</td>
+        <td>block-level transfers, hetero-block-size disagg</td>
+      </tr>
+      <tr>
+        <td><strong>BLHNC</strong></td>
+        <td><code>[B,L,H,N,C]</code></td>
+        <td><code>(1,0,2,3,4)</code></td>
+        <td>one block across <em>all</em> layers</td>
+        <td>big P/D transfers when TP &amp; block size match</td>
+      </tr>
+      <tr>
+        <td><strong>BHLNC</strong></td>
+        <td><code>[B,H,L,N,C]</code></td>
+        <td><code>(1,2,0,3,4)</code></td>
+        <td>one (block, head) across all layers</td>
+        <td>big P/D transfers for hetero-TP</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Visual: where does L (the layer axis) move?</h3>
+  <p>
+    The whole game is <em>where the layer dimension sits</em>. In the two
+    &ldquo;L-first&rdquo; layouts each layer is a separate region; in the
+    &ldquo;B-first&rdquo; layouts all layers for a block are glued together so
+    you can transfer a block in one shot.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">LBHNC (default) — layer-major: each layer is its own region</div>
+    <div class="cell-row">
+      <span class="cell label">layer 0</span>
+      <span class="cell used">blk0 h0</span>
+      <span class="cell used">blk0 h1</span>
+      <span class="cell used">blk1 h0</span>
+      <span class="cell used">blk1 h1</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">layer 1</span>
+      <span class="cell used">blk0 h0</span>
+      <span class="cell used">blk0 h1</span>
+      <span class="cell used">blk1 h0</span>
+      <span class="cell used">blk1 h1</span>
+    </div>
+    <div class="diagram-caption">
+      A single head&rsquo;s bytes are contiguous &rarr; easy to grab &ldquo;just
+      head 1&rdquo; for tensor-parallel transfers.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">BLHNC — block-major: one block carries all its layers together</div>
+    <div class="cell-row">
+      <span class="cell label">block 0</span>
+      <span class="cell cached">L0 h0</span>
+      <span class="cell cached">L0 h1</span>
+      <span class="cell cached">L1 h0</span>
+      <span class="cell cached">L1 h1</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 1</span>
+      <span class="cell cached">L0 h0</span>
+      <span class="cell cached">L0 h1</span>
+      <span class="cell cached">L1 h0</span>
+      <span class="cell cached">L1 h1</span>
+    </div>
+    <div class="diagram-caption">
+      All layers of block 0 are adjacent &rarr; the connector transfers an
+      entire block across every layer in <strong>one RDMA read</strong>. Wins
+      when both sides agree on TP and block size.
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>Same data, two layouts</strong>
+    Both diagrams describe the identical logical tensor
+    <code>[L,B,H,N,C]</code>. Only the byte order differs. The connector reads
+    <code>stride_order</code> to know which one it is looking at &mdash; it does
+    <em>not</em> need to know which backend produced it.
+  </div>
+
+  <h3>Why layer-major is the default but block-major is an opt-in</h3>
+  <p>
+    The two &ldquo;winning&rdquo; layouts are pulled by <em>two different
+    consumers</em>. The <strong>attention kernel</strong> runs the model one
+    layer at a time (finish layer&nbsp;0, then layer&nbsp;1&hellip;), so its
+    natural nesting is <em>layers&nbsp;&rarr;&nbsp;blocks</em> &mdash;
+    layer-major. The <strong>connector</strong> moves a whole sequence&rsquo;s KV
+    addressed by the block table, so its natural nesting is
+    <em>blocks&nbsp;&rarr;&nbsp;layers</em> &mdash; block-major. Same tensor,
+    opposite preferred axis order.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Consumer</th><th>Natural order</th><th>Layout</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Compute</strong> (attention kernel)</td>
+        <td>layer-major</td>
+        <td><strong>LBHNC</strong> <span class="tag full">default</span></td>
+        <td>forward pass runs layer-by-layer; each layer wants its own
+        contiguous region. Also gives the finest-grain (per-<em>head</em>)
+        contiguity, which head-level TP slicing needs.</td>
+      </tr>
+      <tr>
+        <td><strong>Bulk transfer</strong> (connector)</td>
+        <td>block-major</td>
+        <td><strong>BLHNC</strong></td>
+        <td>P/D copies sequences addressed by block; gluing a block&rsquo;s
+        layers together turns <em>L</em> small reads into <strong>one RDMA
+        read per block</strong>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>So which do you store?</strong>
+    <strong>LBHNC</strong> is the <em>logical default</em>: it matches compute,
+    gives the finest contiguity for slicing, and satisfies the
+    <a href="#shared">HMA contiguity rule</a>, so it always works.
+    <strong>BLHNC</strong> is a <em>physical opt-in</em> you flip to via
+    <code>stride_order</code> only when the workload is dominated by big P/D
+    transfers <em>and</em> both sides agree on TP and block size &mdash; that
+    agreement is what lets the block-of-all-layers blob line up on each end.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="shared">Constraint for shared tensors (HMA)</h2>
+
+  <p>
+    Some models mix attention types (<strong>HMA</strong> = hybrid memory
+    allocation). vLLM may pack several layer groups into one underlying
+    <code>KVCacheTensor</code> when they share the same
+    <code>page_size_bytes</code>. Those layers can have <em>different</em> H, N,
+    or C sizes. That puts a rule on which layouts are legal:
+  </p>
+
+  <ol class="steps">
+    <li>
+      The per-layer-per-block content <code>[H, N, C]</code> must be
+      <strong>contiguous</strong> in memory
+      (<code>layout[0,0,...].is_contiguous()</code>). This rules out
+      <strong>LBNHC</strong> and <strong>BHLNC</strong>; only
+      <strong>LBHNC</strong> and <strong>BLHNC</strong> qualify.
+    </li>
+    <li>
+      <em>If</em> H, N, and C happen to match across all layers in the tensor,
+      then <em>any</em> layout is valid again.
+    </li>
+  </ol>
+
+  <div class="callout">
+    <strong>Why step 2 is the escape hatch</strong>
+    The contiguity rule in step 1 exists <em>only</em> to make differently-shaped
+    layers coexist in one buffer. When shapes differ, the tensor is
+    <strong>ragged</strong> &mdash; the only universal handle is &ldquo;layer&nbsp;i,
+    block&nbsp;j&rsquo;s page,&rdquo; one contiguous <code>page_size_bytes</code>
+    blob you reinterpret with that layer&rsquo;s own shape; that forces
+    <code>[H,N,C]</code> to stay together (LBNHC splits it as <code>N,H,C</code>;
+    BHLNC wedges <code>L</code> in between). But if every layer has the
+    <em>same</em> H, N, C, the buffer is a genuine uniform rectangular
+    <code>[L,B,H,N,C]</code> array &mdash; nothing ragged to protect &mdash; so the
+    rule has nothing to guard and all four permutations become legal again.
+  </div>
+
+  <div class="callout info">
+    <strong>Concrete case — DeepSeek&nbsp;V4</strong>
+    Its layers use mixed compression ratios, so they have different N and C
+    sizes yet share one tensor. The default <strong>LBHNC</strong> layout
+    satisfies the contiguity rule, so it &ldquo;just works.&rdquo;
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="spec">Idea 3: the spec describes itself</h2>
+
+  <p>
+    Each backend already has a <code>KVCacheSpec</code> object. The RFC adds
+    three fields so the shape can be reconstructed from the spec alone &mdash;
+    no need to call into the attention backend.
+  </p>
+
+  <pre><code><span class="k">@dataclass</span>
+<span class="k">class</span> <span class="fn">KVCacheSpec</span>:
+    num_heads: <span class="k">int</span>          <span class="c"># heads (1 if headless)</span>
+    tokens_per_state: <span class="k">int</span>   <span class="c"># -1 infinite, 1 standard, N compressed</span>
+    state_content_size: <span class="k">int</span> <span class="c"># bytes per state per head</span></code></pre>
+
+  <p>
+    Notice <code>num_states</code> is <em>not</em> stored &mdash; it is
+    <strong>derived</strong> as <code>block_size / tokens_per_state</code> at
+    allocation time, because <code>block_size</code> is a deployment choice not
+    known when the spec is built.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Backend</th><th>num_heads</th><th>tokens/state</th><th>num_states (derived)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GQA</td><td><code>num_kv_heads</code></td><td>1</td><td><code>block_size</code></td></tr>
+      <tr><td>DeepSeek V4</td><td><code>num_kv_heads</code></td><td>4</td><td><code>block_size/4</code></td></tr>
+      <tr><td>MLA</td><td>1</td><td>1</td><td><code>block_size</code></td></tr>
+      <tr><td>Mamba2 Conv</td><td>1</td><td>-1</td><td>1</td></tr>
+      <tr><td>Mamba2 SSM</td><td><code>num_heads</code></td><td>-1</td><td>1</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>Reading <code>tokens_per_state</code></strong>
+    <code>1</code> = one token per stored state (normal). <code>4</code> = four
+    tokens compressed into one state (DeepSeek V4). <code>-1</code> = recurrent
+    / &ldquo;infinite&rdquo; &mdash; the whole sequence collapses to one rolling
+    state (Mamba).
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="slicing">Idea 4: specs slice themselves for TP</h2>
+
+  <p>
+    Here is the cleverest part. When transferring between two machines with
+    different TP, you must figure out <em>which heads overlap</em>. Today the
+    connector does raw byte math. The RFC moves that knowledge <em>into the
+    spec</em>: each spec implements <code>slice_for_tp_transfer()</code>.
+  </p>
+
+  <pre><code><span class="k">class</span> <span class="fn">KVCacheSpec</span>:
+    <span class="k">def</span> <span class="fn">slice_for_tp_transfer</span>(self, my_tensor, my_tp, my_rank,
+                              other_spec, other_tp, other_rank) -&gt; <span class="k">list</span>[Tensor]:
+        <span class="s">"""Return the slices of my_tensor that need to be transferred.</span>
+<span class="s">        Takes BOTH sides' TP configs, since tp_size is a deployment</span>
+<span class="s">        property, not part of the spec."""</span>
+        ...</code></pre>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>GQA</h3>
+      <p>Slices by <strong>heads</strong> &mdash; computes which head range on
+      the source overlaps the destination rank, returns that slice.</p>
+    </div>
+    <div class="box">
+      <h3>Mamba Conv</h3>
+      <p>Returns <strong>3 slices</strong> (the x / B / C components of the conv
+      state) &mdash; same interface, different internal structure.</p>
+    </div>
+    <div class="box">
+      <h3>MLA</h3>
+      <p>May be a <strong>single unsliced latent</strong> &mdash; nothing to
+      split because it is headless.</p>
+    </div>
+  </div>
+
+  <h3>Why pass <em>both</em> sides&rsquo; TP?</h3>
+  <p>
+    The source has <code>src_tp &times; num_heads</code> total heads; the
+    destination has <code>dst_tp &times; num_heads</code>. The spec computes the
+    <strong>overlap</strong> of head ranges and converts it to local indices.
+    The GQA implementation even handles replication when one side has fewer
+    ranks (<code>dst_rank %= src_tp</code>).
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">TP slicing: src TP=1 (4 heads) &rarr; dst TP=2 (2 heads each)</div>
+    <div class="diagram-row">
+      <span class="cell label">source rank 0</span>
+      <span class="cell used">h0</span>
+      <span class="cell match">h1</span>
+      <span class="cell match">h2</span>
+      <span class="cell used">h3</span>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">dst rank 0</span>
+      <span class="cell used">h0</span>
+      <span class="cell used">h1</span>
+      <span class="cell label">&nbsp;</span>
+      <span class="cell label">dst rank 1 &rarr;</span>
+      <span class="cell match">h2</span>
+      <span class="cell match">h3</span>
+    </div>
+    <div class="diagram-caption">
+      To fill <em>dst rank 1</em> (heads h2,h3), the source spec returns
+      <code>src_tensor[:, :, slice(2,4)]</code>. The spec &mdash; not the
+      connector &mdash; computed that overlap.
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="connector">The payoff: a generic connector</h2>
+
+  <p>
+    With the three ideas in place, the connector no longer contains a single
+    backend-specific branch. It asks both specs to slice themselves, then copies
+    contiguous chunks.
+  </p>
+
+  <pre><code><span class="c"># 1. TP slicing — computed ONCE at setup (which heads to transfer)</span>
+src_slices = src_spec.<span class="fn">slice_for_tp_transfer</span>(
+    src_cache, src_tp, src_rank, dst_spec, dst_tp, dst_rank)
+dst_meta   = <span class="fn">make_meta_kv_cache</span>(dst_spec, num_blocks, dst_block_size)
+dst_slices = dst_spec.<span class="fn">slice_for_tp_transfer</span>(
+    dst_meta, dst_tp, dst_rank, src_spec, src_tp, src_rank)
+
+<span class="c"># 2. Per-block transfer — handles hetero block sizes naturally</span>
+<span class="k">for</span> src_blk, src_states, dst_blk, dst_states <span class="k">in</span> block_mapping:
+    <span class="k">for</span> src_s, dst_s <span class="k">in</span> <span class="fn">zip</span>(src_slices, dst_slices):
+        src_block = src_s[:, src_blk, :, src_states, ...]
+        dst_block = dst_s[:, dst_blk, :, dst_states, ...]
+        <span class="k">for</span> src_chunk, dst_chunk <span class="k">in</span> <span class="fn">jointly_contiguous_chunks</span>(src_block, dst_block):
+            self.<span class="fn">_rdma_transfer</span>(src_chunk, dst_chunk)</code></pre>
+
+  <ol class="steps">
+    <li>
+      <strong>TP slicing once.</strong> Both specs return slices in the
+      <em>same semantic order</em>, so <code>src_slices</code> and
+      <code>dst_slices</code> pair up by <code>zip</code> &mdash; even if the two
+      sides use different <code>stride_order</code>s.
+    </li>
+    <li>
+      <strong>Meta tensor for the destination.</strong>
+      <code>make_meta_kv_cache</code> builds a <code>device='meta'</code> tensor
+      &mdash; it carries shape/stride info but allocates <em>no GPU memory</em>.
+      It exists purely to compute destination offsets.
+    </li>
+    <li>
+      <strong><code>jointly_contiguous_chunks</code></strong> decomposes each
+      slice pair into regions contiguous on <em>both</em> sides, automatically
+      coalescing interleaved layers into bigger transfers when the layout allows.
+    </li>
+    <li>
+      <strong>Hetero block sizes</strong> fall out for free: the
+      <code>block_mapping</code> carries per-side block index + state slice, so
+      prefill block size &ne; decode block size still works.
+    </li>
+  </ol>
+
+  <div class="compare">
+    <div class="side left">
+      <strong>Before</strong>
+      <p>Connector knows GQA, MLA, Mamba layouts. Adding a backend = editing the
+      connector. <code>is_mla</code>/<code>is_mamba</code> everywhere.</p>
+    </div>
+    <div class="vs">&rarr;</div>
+    <div class="side right">
+      <strong>After</strong>
+      <p>Connector knows only the canonical shape + <code>stride_order</code>.
+      Adding a backend = implement its <code>KVCacheSpec.slice_for_tp_transfer</code>.
+      Connector untouched.</p>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="part1">PR #42374 — Part 1 in depth</h2>
+
+  <p>
+    The RFC is the blueprint. <a href="https://github.com/vllm-project/vllm/pull/42374">PR&nbsp;#42374</a>
+    (&ldquo;<em>[Core][WIP][1/N] Standardize kv layout</em>&rdquo;, body literally
+    just says <em>&ldquo;part 1 of #42082&rdquo;</em>) lays the
+    <strong>foundation</strong>: it builds the shared vocabulary in one place and
+    then <em>deletes</em> the per-backend dialects that the connector used to
+    depend on.
+  </p>
+
+  <div class="callout info">
+    <strong>The diff shape tells the story</strong>
+    <span class="mono">+1,677 / &minus;3,382 across 98 files</span> &mdash; a
+    <strong>net removal of ~1,700 lines</strong>. When a refactor deletes twice
+    as much as it adds, it is collapsing duplicated code into a single
+    definition. That is exactly what &ldquo;standardize&rdquo; means here.
+  </div>
+
+  <h3>Which of the four ideas does Part 1 deliver?</h3>
+  <p>
+    Part 1 is deliberately scoped. It ships the <em>shape vocabulary</em> (Ideas
+    1&ndash;3) and rips out the old per-backend shape methods. The
+    self-slicing connector (Idea 4) is left for later stages.
+  </p>
+
+  <table>
+    <thead><tr><th>RFC idea</th><th>In PR #42374?</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#shape">1 — canonical 5-D shape</a></td><td>✅ yes</td><td><code>reshape_kv_cache()</code> in <span class="fileref">kv_cache_interface.py</span></td></tr>
+      <tr><td><a href="#stride">2 — stride_order layouts</a></td><td>✅ yes</td><td>new <code>KVCacheLayout</code> enum</td></tr>
+      <tr><td><a href="#spec">3 — self-describing spec</a></td><td>✅ yes</td><td>3 new <code>KVCacheSpec</code> properties</td></tr>
+      <tr><td><a href="#slicing">4 — <code>slice_for_tp_transfer</code></a></td><td>⏳ deferred</td><td>connector refactor, stage [3/N]</td></tr>
+    </tbody>
+  </table>
+
+  <h3>What moved: from many dialects to one vocabulary</h3>
+  <p>
+    Before this PR, every attention backend implemented two methods the
+    connector and allocator called: <code>get_kv_cache_shape()</code> and
+    <code>get_kv_cache_stride_order()</code>. Each backend answered in its own
+    way &mdash; that is the &ldquo;dialect&rdquo; problem from
+    <a href="#problem">the motivation</a>.
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <strong>Before — knowledge in each backend</strong>
+      <p>
+        <span class="fileref">backend.py</span> declared
+        <code>@abstractmethod get_kv_cache_shape(...)</code> and
+        <code>get_kv_cache_stride_order(...)</code>. FlashAttn, FlashInfer,
+        Triton, ROCm, every MLA variant&hellip; each re-implemented them. Dozens
+        of copies, slightly different.
+      </p>
+    </div>
+    <div class="vs">&rarr;</div>
+    <div class="side right">
+      <strong>After — knowledge in the spec</strong>
+      <p>
+        Those abstract methods are <strong>deleted</strong>. Shape now comes
+        from <code>KVCacheSpec</code> properties; physical order comes from one
+        <code>KVCacheLayout</code> enum; one <code>reshape_kv_cache()</code>
+        function turns a flat buffer into per-layer views for <em>all</em>
+        backends.
+      </p>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Part 1: delete N copies, add 1 definition</div>
+    <div class="flow">
+      <div class="flow-step r"><span class="num">DELETED</span>get_kv_cache_shape() &times; ~20 backends</div>
+      <div class="flow-step r"><span class="num">DELETED</span>get_kv_cache_stride_order() &times; ~20 backends</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g"><span class="num">ADDED once</span>KVCacheLayout enum + spec properties + reshape_kv_cache()</div>
+    </div>
+    <div class="diagram-caption">
+      Most of the &minus;3,382 deleted lines are these duplicated per-backend
+      methods (flash_attn &minus;45, flashinfer &minus;126, rocm_attn &minus;55,
+      triton_attn &minus;53, gpu/attn_utils &minus;198, mixin file deleted
+      &minus;170, &hellip;).
+    </div>
+  </div>
+
+  <h3>The new vocabulary, as actually committed</h3>
+
+  <h4>1. The <code>KVCacheLayout</code> enum &mdash; Idea 2 made concrete</h4>
+  <p>
+    The four named layouts from <a href="#layouts">the layouts section</a> are
+    now an enum whose value <em>is</em> the stride permutation &mdash; with
+    helper properties the connector reads instead of hard-coding layout strings.
+  </p>
+  <pre><code><span class="k">class</span> <span class="fn">KVCacheLayout</span>(Enum):
+    LBHNC = (<span class="n">0</span>, <span class="n">1</span>, <span class="n">2</span>, <span class="n">3</span>, <span class="n">4</span>)  <span class="c"># identity (default)</span>
+    LBNHC = (<span class="n">0</span>, <span class="n">1</span>, <span class="n">3</span>, <span class="n">2</span>, <span class="n">4</span>)
+    BLHNC = (<span class="n">1</span>, <span class="n">0</span>, <span class="n">2</span>, <span class="n">3</span>, <span class="n">4</span>)
+    BHLNC = (<span class="n">1</span>, <span class="n">2</span>, <span class="n">0</span>, <span class="n">3</span>, <span class="n">4</span>)
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="fn">is_layer_compact</span>(self):   <span class="c"># L is outermost?  (LBHNC, LBNHC)</span>
+        <span class="k">return</span> self.value[<span class="n">0</span>] == <span class="n">0</span>
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="fn">is_block_contiguous</span>(self): <span class="c"># [H,N,C] contiguous in a block?</span>
+        <span class="k">return</span> self.value[-<span class="n">3</span>:] == (<span class="n">2</span>, <span class="n">3</span>, <span class="n">4</span>)</code></pre>
+  <p>
+    <code>is_block_contiguous</code> is precisely the
+    <a href="#shared">shared-tensor constraint</a> turned into a one-line check:
+    only <code>LBHNC</code> and <code>BLHNC</code> pass it.
+  </p>
+
+  <h4>2. Three spec properties &mdash; Idea 3 made concrete</h4>
+  <p>
+    <code>KVCacheSpec</code> gains the RFC&rsquo;s three fields as properties (the
+    RFC&rsquo;s <code>state_content_size</code> landed as
+    <code>state_content_size_bytes</code>). Each subclass fills them in:
+  </p>
+  <pre><code><span class="k">class</span> <span class="fn">KVCacheSpec</span>:
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="fn">num_heads</span>(self) -&gt; <span class="k">int</span>: ...               <span class="c"># 1 if headless</span>
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="fn">tokens_per_state</span>(self) -&gt; <span class="k">int</span>: ...        <span class="c"># -1 recurrent, 1 std, N compressed</span>
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="fn">state_content_size_bytes</span>(self) -&gt; <span class="k">int</span>: ...
+
+<span class="c"># AttentionSpec (GQA):  C = K and V packed together</span>
+    state_content_size_bytes = <span class="n">2</span> * head_size * dtype_size
+<span class="c"># MLAAttentionSpec:     headless latent, no factor of 2</span>
+    num_heads = <span class="n">1</span></code></pre>
+  <div class="callout good">
+    <strong>Naming cleanup that proves the point</strong>
+    MLA&rsquo;s DeepSeek-V4 field <code>compress_ratio</code> was
+    <em>renamed</em> to <code>tokens_per_state</code> throughout
+    <span class="fileref">kv_cache_interface.py</span>. The RFC&rsquo;s
+    vocabulary literally replaced the old per-model term &mdash;
+    <code>storage_block_size</code> is now <code>block_size // tokens_per_state</code>.
+  </div>
+
+  <h4>3. <code>reshape_kv_cache()</code> &mdash; Idea 1 made concrete</h4>
+  <p>
+    This single function replaces every backend&rsquo;s shape logic. Give it a
+    flat <code>int8</code> buffer + a spec + a layout, and it returns one
+    <code>[B, H, N, C]</code> view per layer slot &mdash; works for GQA, MLA,
+    Mamba alike:
+  </p>
+  <pre><code><span class="k">def</span> <span class="fn">reshape_kv_cache</span>(raw, spec, num_blocks, num_layer_slots, layout, block_size=<span class="k">None</span>):
+    <span class="c"># 1. logical byte-shape from the SPEC (not the backend)</span>
+    logical = (num_layer_slots, *<span class="fn">compute_layer_kv_cache_shape_bytes</span>(spec, num_blocks, block_size))
+    <span class="c"># 2. reorder to physical layout via the enum's stride_order</span>
+    physical = <span class="fn">tuple</span>(logical[i] <span class="k">for</span> i <span class="k">in</span> layout.stride_order)
+    cache = raw.<span class="fn">view</span>(physical).<span class="fn">permute</span>(*inv_order)   <span class="c"># back to logical [L,B,H,N,C]</span>
+    <span class="k">return</span> [cache[i] <span class="k">for</span> i <span class="k">in</span> <span class="fn">range</span>(num_layer_slots)]   <span class="c"># one view per layer</span>
+
+<span class="k">def</span> <span class="fn">num_states_for</span>(block_size, tokens_per_state):
+    <span class="k">return</span> <span class="n">1</span> <span class="k">if</span> tokens_per_state == -<span class="n">1</span> <span class="k">else</span> block_size // tokens_per_state</code></pre>
+  <p>
+    Note <code>num_states</code> is computed here at allocation time
+    (<code>-1</code> recurrent &rarr; 1), exactly as the RFC said it would be
+    &mdash; derived, never stored.
+  </p>
+
+  <div class="callout info">
+    <strong>What is <code>inv_order</code>?</strong>
+    It is the <strong>inverse permutation</strong> of
+    <code>layout.stride_order</code>. <code>stride_order</code> scrambles the
+    logical <code>[L,B,H,N,C]</code> axes into the physical order the bytes are
+    actually stored in; <code>inv_order</code> un-scrambles physical
+    <em>back</em> to logical, so every caller gets a consistent
+    <code>[L,B,H,N,C]</code> view no matter which layout produced the bytes.
+    Compute it as <code>argsort(stride_order)</code> &mdash; the permutation
+    <code>q</code> with <code>q[stride_order[i]] = i</code>. For the default
+    <strong>LBHNC</strong> layout <code>stride_order</code> is the identity, so
+    <code>inv_order</code> is identity too and the <code>permute</code> is a
+    no-op; it only does real work for the non-default layouts.
+  </div>
+
+  <h4>Example run &mdash; GQA buffer in <code>BLHNC</code> layout</h4>
+  <p>
+    Take a tiny GQA tensor: <code>num_layer_slots=2</code>,
+    <code>num_blocks=3</code>, <code>num_heads=2</code>, <code>block_size=4</code>
+    with <code>tokens_per_state=1</code> (so <code>num_states=4</code>), and a
+    <code>state_content</code> of 16 bytes per state. Store it
+    <strong>block-major</strong> (<code>BLHNC</code>) so whole blocks transfer in
+    one shot.
+  </p>
+
+  <pre><code>reshape_kv_cache(
+    raw,                          <span class="c"># flat int8 buffer of 2*3*2*4*16 = 3072 bytes</span>
+    spec,                         <span class="c"># GQA: num_heads=2, tokens_per_state=1, content=16B</span>
+    num_blocks=<span class="n">3</span>,
+    num_layer_slots=<span class="n">2</span>,
+    layout=KVCacheLayout.BLHNC,   <span class="c"># stride_order = (1, 0, 2, 3, 4)</span>
+    block_size=<span class="n">4</span>,
+)
+
+<span class="c"># num_states = num_states_for(block_size=4, tokens_per_state=1) = 4 // 1 = 4</span>
+<span class="c"># logical    = (L, B, H, N, C) = (2, 3, 2, 4, 16)     # axis indices (0,1,2,3,4)</span>
+<span class="c"># stride_order (BLHNC)            = (1, 0, 2, 3, 4)</span>
+<span class="c"># physical = (logical[1],logical[0],logical[2],logical[3],logical[4])</span>
+<span class="c">#          = (3, 2, 2, 4, 16)  ->  [B, L, H, N, C]   # how the bytes actually sit</span>
+
+<span class="c"># inv_order = argsort(stride_order) = inverse of (1,0,2,3,4) = (1, 0, 2, 3, 4)</span>
+cache = raw.<span class="fn">view</span>(<span class="n">3</span>,<span class="n">2</span>,<span class="n">2</span>,<span class="n">4</span>,<span class="n">16</span>)        <span class="c"># interpret flat bytes as [B,L,H,N,C]</span>
+            .<span class="fn">permute</span>(<span class="n">1</span>,<span class="n">0</span>,<span class="n">2</span>,<span class="n">3</span>,<span class="n">4</span>)    <span class="c"># un-scramble -> [L,B,H,N,C] = (2,3,2,4,16)</span>
+
+<span class="k">return</span> [cache[<span class="n">0</span>], cache[<span class="n">1</span>]]           <span class="c"># 2 per-layer views, each [B,H,N,C] = (3,2,4,16)</span></code></pre>
+
+  <p>
+    The key step is the <code>permute(*inv_order)</code>: the raw bytes are
+    block-major (<code>B</code> outermost), but after permuting by
+    <code>inv_order</code> the returned views are indexed
+    <code>[L,B,H,N,C]</code> like every other backend &mdash; the caller never
+    has to know it was stored <code>BLHNC</code>.
+  </p>
+
+  <div class="callout">
+    <strong>When <code>inv_order &ne; stride_order</code></strong>
+    <code>BLHNC</code> just swaps the first two axes, so it happens to be its own
+    inverse. That is a coincidence of that layout, not a rule. For
+    <strong>BHLNC</strong> (<code>stride_order = (1,2,0,3,4)</code>) the inverse
+    is <code>argsort((1,2,0,3,4)) = (2,0,1,3,4)</code> &mdash; genuinely
+    different. <code>inv_order</code> is always the <em>true inverse</em>, never
+    just a copy of <code>stride_order</code>.
+  </div>
+
+  <h3>The recurrent &amp; connector edges line up too</h3>
+  <div class="grid">
+    <div class="box">
+      <h3>Mamba binds N=1, H=1</h3>
+      <p>
+        Mamba&rsquo;s new <code>bind_kv_cache()</code> unpacks a raw
+        <code>[B, 1, 1, C]</code> int8 view into its conv/SSM state tensors
+        &mdash; literally the <code>num_heads=1, num_states=1</code> row from the
+        <a href="#mapping">mapping table</a>.
+      </p>
+    </div>
+    <div class="box">
+      <h3>NIXL speaks the new names</h3>
+      <p>
+        The NIXL connector dropped its old <code>"HND"</code>/<code>"NHD"</code>
+        strings for <code>"LBHNC"</code>/<code>"LBNHC"</code>, and replaced a
+        hard-coded <code>layout == "HND"</code> check with
+        <code>KVCacheLayout[name].is_block_contiguous</code>. First taste of the
+        connector becoming layout-driven.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Still WIP</strong>
+    PR #42374 is marked <code>[WIP]</code> and is <strong>open</strong>, touching
+    98 files including many test updates. It establishes the vocabulary and
+    removes the old methods, but the fully generic, self-slicing connector
+    (<a href="#slicing">Idea 4</a>) arrives in later stages. Read it as
+    &ldquo;phase 1 of N,&rdquo; not the finished product.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="status">Status &amp; work tracking</h2>
+
+  <p>
+    This is an RFC (request for comments) &mdash; a design proposal, landing in
+    stages rather than one PR.
+  </p>
+
+  <table>
+    <thead><tr><th>Stage</th><th>PR</th><th>What</th></tr></thead>
+    <tbody>
+      <tr><td>prep</td><td>#42122, #42095</td><td>preparatory refactors</td></tr>
+      <tr><td>[1/N]</td><td>#42374</td><td>standardize backends &amp; allocation; remove <code>get_kv_cache_stride_order</code> / <code>get_kv_cache_shape</code></td></tr>
+      <tr><td>[2/N]</td><td>#43151</td><td>next standardization step</td></tr>
+      <tr><td>[3/N]</td><td>(planned)</td><td>refactor connector to use meta-tensors + spec slicing</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>Discussion highlight</strong>
+    A reviewer (orozery, PR #37885) proposed the worker-side connector receive a
+    <em>canonical</em> representation &mdash; each tensor as
+    <code>(num_blocks, page_size_in_bytes)</code> int8 &mdash; so the connector
+    truly never touches the attention backend. Same spirit as this RFC: push
+    layout knowledge out of the connector.
+  </div>
+
+  <!-- ===================================================================== -->
+  <h2 id="takeaways">Takeaways</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>1. One logical shape</h3>
+      <p><code>[L, B, H, N, C]</code> &mdash; every backend folds its quirks
+      into the <code>H=1</code> / <code>N=1</code> slots.</p>
+    </div>
+    <div class="box">
+      <h3>2. Layout &ne; meaning</h3>
+      <p><code>stride_order</code> picks physical byte order independently, to
+      make the right things contiguous for a given transfer.</p>
+    </div>
+    <div class="box">
+      <h3>3. Specs are self-describing</h3>
+      <p>Three fields reconstruct the shape; <code>num_states</code> is derived
+      from <code>block_size</code>.</p>
+    </div>
+    <div class="box">
+      <h3>4. Specs slice themselves</h3>
+      <p><code>slice_for_tp_transfer()</code> moves TP/head math out of the
+      connector and into each backend&rsquo;s spec.</p>
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>The one thing to remember</strong>
+    The connector should answer &ldquo;where is head 3 of block 12 of layer
+    5?&rdquo; in <em>one</em> language. This RFC defines that language
+    (logical shape + stride_order) and makes each backend translate itself
+    into it &mdash; so the transfer code becomes backend-agnostic.
+  </div>
+
+  <div class="foot">
+    Summary of <a href="https://github.com/vllm-project/vllm/issues/42082">vllm-project/vllm#42082</a>
+    &mdash; &ldquo;[RFC]: Standardize KV-cache Layouts&rdquo; by Lucas Wilkinson.
+    Design doc &amp; full discussion linked from the issue. This page is a
+    beginner-oriented explainer, not a verbatim copy; confirm details against
+    the issue and linked PRs before relying on them.
+  </div>
+</main>
+</body>
+</html>

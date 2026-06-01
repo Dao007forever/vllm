@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenTelemetry tracing in vLLM v1 — and how to emit a span from EngineCore</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  /* page-local helpers */
+  .proc {
+    border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+    padding: 10px 13px; min-width: 150px; flex: 1 1 0;
+  }
+  .proc .ptitle { font-weight: 650; font-size: 0.9em; margin-bottom: 6px; }
+  .proc.front { border-left: 4px solid var(--green); }
+  .proc.core  { border-left: 4px solid var(--blue); }
+  .proc.work  { border-left: 4px solid var(--violet); }
+  .proc ul { margin: 4px 0 0; padding-left: 17px; font-size: 0.83em; }
+  .proc li { margin: 2px 0; }
+  .zmq { display:flex; align-items:center; justify-content:center; color: var(--muted);
+         font-family:"SF Mono",Monaco,monospace; font-size:0.7em; padding:0 4px; text-align:center; }
+  .yes { color: var(--green); font-weight: 650; }
+  .no  { color: var(--red);   font-weight: 650; }
+  .pill { display:inline-block; font-family:"SF Mono",Monaco,monospace; font-size:0.74em;
+          padding:1px 6px; border-radius:4px; border:1px solid var(--border); background:var(--code); }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../">&larr; learnings</a> &nbsp;|&nbsp; tracing &nbsp;|&nbsp;
+    source: <span class="fileref">vllm/tracing/</span> &nbsp;·&nbsp;
+    <span class="fileref">vllm/v1/engine/core.py</span> &nbsp;·&nbsp;
+    <span class="fileref">vllm/v1/engine/output_processor.py</span>
+  </div>
+
+  <h1>OpenTelemetry Tracing in vLLM v1</h1>
+  <p class="subtitle">Where request spans come from, how timing crosses the scheduler/worker boundary,
+    and a recipe for emitting your own span from inside EngineCore.</p>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    vLLM emits one OTel span per request — <code>"llm_request"</code> — and it is created in the
+    <strong>frontend</strong> process by <code>OutputProcessor.do_tracing</code>, <em>after</em> the request finishes,
+    with its <code>start_time</code> backdated to arrival. The worker processes never emit request spans; the
+    EngineCore process only <em>measures</em> per-request timing (monotonic event timestamps) and forwards it
+    back over ZMQ. The EngineCore process <strong>already has a tracer initialized</strong>
+    (<span class="fileref">core.py:1170</span>), so emitting a span there is mostly a matter of calling
+    <code>@instrument</code> or <code>instrument_manual</code> — with one sharp edge: EngineCore timestamps are
+    <code>time.monotonic()</code>, but OTel wants epoch-nanoseconds.
+  </div>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#bigpicture">The big picture: who emits the span</a></li>
+      <li><a href="#toolbox">The tracing toolbox (<code>vllm/tracing</code>)</a></li>
+      <li><a href="#flow">Timing across the process boundary</a></li>
+      <li><a href="#has-tracer">EngineCore already has a tracer</a></li>
+      <li><a href="#recipeA">Recipe A — <code>@instrument</code> (coarse, easy)</a></li>
+      <li><a href="#recipeB">Recipe B — per-request span (client-parented)</a></li>
+      <li><a href="#clock">The clock gotcha (monotonic vs epoch)</a></li>
+      <li><a href="#parenting">Parenting: where your span lands</a></li>
+      <li><a href="#checklist">Pitfalls &amp; checklist</a></li>
+      <li><a href="#sglang">Appendix — SGLang contrast: every process traces</a></li>
+    </ol>
+  </div>
+
+  <h2 id="bigpicture">1. The big picture: who emits the span</h2>
+
+  <p>vLLM v1 runs as (at least) two cooperating processes connected by ZMQ. The default frontend is
+    <strong>Python</strong> (FastAPI + <code>AsyncLLM</code> + <code>OutputProcessor</code>). There is also an
+    <em>experimental, opt-in</em> Rust frontend (<span class="pill">VLLM_USE_RUST_FRONTEND=1</span>) which has
+    <strong>no OpenTelemetry</strong> — it forwards <code>trace_headers</code> to the engine and exports Prometheus
+    metrics only. Everything below describes the default Python path.</p>
+
+  <div class="diagram">
+    <div class="diagram-title">Process split — request-level OTel span is a frontend job</div>
+    <div class="diagram-row" style="align-items:stretch;">
+      <div class="proc front">
+        <div class="ptitle">FRONTEND (Python)</div>
+        AsyncLLM / API server / OutputProcessor
+        <ul>
+          <li>extracts <code>traceparent</code> from HTTP</li>
+          <li>stamps wall-clock <code>arrival_time</code></li>
+          <li><span class="yes">emits <code>llm_request</code> span</span></li>
+        </ul>
+      </div>
+      <div class="zmq">ZMQ&nbsp;&rarr;<br>&larr;&nbsp;EngineCoreOutput</div>
+      <div class="proc core">
+        <div class="ptitle">ENGINECORE (Python)</div>
+        scheduler + busy loop
+        <ul>
+          <li>carries <code>trace_headers</code> untouched</li>
+          <li>stamps <code>QUEUED</code>/<code>SCHEDULED</code> events (<em>monotonic</em>)</li>
+          <li>has a tracer, emits only <code>@instrument</code> init spans</li>
+        </ul>
+      </div>
+      <div class="zmq">drives</div>
+      <div class="proc work">
+        <div class="ptitle">WORKER(S)</div>
+        model execution
+        <ul>
+          <li><span class="no">no request spans</span></li>
+          <li>only <code>@instrument</code> init/warmup spans</li>
+        </ul>
+      </div>
+    </div>
+    <div class="diagram-caption">The span is reconstructed in the frontend at request-finish, with start_time backdated to arrival.</div>
+  </div>
+
+  <h2 id="toolbox">2. The tracing toolbox</h2>
+
+  <p>Everything lives under <span class="fileref">vllm/tracing/</span>. The public surface is small
+    (<span class="fileref">vllm/tracing/__init__.py</span>):</p>
+
+  <table>
+    <tr><th>Symbol</th><th>What it does</th><th>Where used</th></tr>
+    <tr><td><code>init_tracer(module, endpoint, attrs)</code></td>
+        <td>Builds a <code>TracerProvider</code> + OTLP exporter; <strong>also writes the endpoint into
+        <code>os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]</code></strong> so child processes inherit it.</td>
+        <td>Frontend — <span class="fileref">async_llm.py:116</span>, <span class="fileref">llm_engine.py:68</span></td></tr>
+    <tr><td><code>maybe_init_worker_tracer(module, kind, name)</code></td>
+        <td>Reads that env var; if set, calls <code>init_tracer</code> in this process. Returns <code>None</code> when no endpoint.</td>
+        <td>EngineCore — <span class="fileref">core.py:1170</span>; workers</td></tr>
+    <tr><td><code>@instrument(span_name=…)</code></td>
+        <td>Decorator. Wraps sync/async fn in a current span; parent via <code>_get_smart_context()</code>;
+        wraps body in <code>propagate_trace_to_env()</code>. Wall-clock start/end automatically.</td>
+        <td><span class="fileref">core.py:239</span> ("Prepare model"), <span class="fileref">core.py:900</span> ("EngineCoreProc init")</td></tr>
+    <tr><td><code>instrument_manual(name, start_time, end_time, attributes, context, kind)</code></td>
+        <td>Creates a span with <strong>explicit epoch-ns timestamps</strong> and ends it immediately. Used to backdate spans.</td>
+        <td><span class="fileref">output_processor.py:766</span> (the <code>llm_request</code> span)</td></tr>
+    <tr><td><code>extract_trace_context(headers)</code></td>
+        <td>Parses W3C <code>traceparent</code>/<code>tracestate</code> into an OTel <code>Context</code> — the parent link.</td>
+        <td><span class="fileref">output_processor.py:723</span></td></tr>
+    <tr><td><code>SpanAttributes</code></td>
+        <td>String constants for <code>gen_ai.*</code> attribute keys (latency, tokens, request id, …).</td>
+        <td><span class="fileref">vllm/tracing/utils.py:15</span></td></tr>
+    <tr><td><code>is_tracing_available()</code></td>
+        <td>True if the OTel <em>package</em> is importable. Does <strong>not</strong> mean an endpoint is configured.</td>
+        <td>guards</td></tr>
+  </table>
+
+  <div class="callout info">
+    <strong>Two layers, don't conflate them.</strong> When OTel is unavailable, <code>@instrument</code> returns the
+    function unchanged and <code>instrument_manual</code> returns <code>None</code> — both no-op cleanly. When OTel is
+    <em>installed but no endpoint is set</em>, the worker tracer is <code>None</code>, so <code>trace.get_tracer()</code>
+    hands back the global no-op tracer: spans are created but never exported. Cheap, but you still pay for any attribute
+    dict you build — so gate expensive work on the endpoint being configured (see §9).
+  </div>
+
+  <h2 id="flow">3. Timing across the process boundary</h2>
+
+  <p>This is the crux of "scheduler and worker processes". The per-request timeline is <em>measured in EngineCore</em>
+    and <em>assembled in the frontend</em>:</p>
+
+  <ol class="steps">
+    <li><strong>Frontend</strong> stamps wall-clock <code>arrival_time</code> (<code>time.time()</code>) when the request is created.</li>
+    <li><strong>EngineCore</strong> (scheduler) records <code>EngineCoreEvent</code>s — <code>QUEUED</code>, <code>SCHEDULED</code> —
+      using <code>time.monotonic()</code> (<span class="fileref">scheduler.py:942, 1217</span>), and stamps an
+      <code>engine_core_timestamp</code> on each output batch.</li>
+    <li>Those events ride back to the frontend inside <code>EngineCoreOutput</code> over ZMQ.</li>
+    <li><strong>Frontend</strong> rebuilds <code>RequestStateStats</code> from the events
+      (<span class="fileref">stats.py:404-422</span>) and computes durations:
+      <code>queued = scheduled_ts − queued_ts</code>, <code>prefill = first_token_ts − scheduled_ts</code>,
+      <code>decode = last_token_ts − first_token_ts</code>.</li>
+    <li>On finish, <code>OutputProcessor.do_tracing</code> (<span class="fileref">output_processor.py:712</span>) builds the
+      attribute dict and calls <code>instrument_manual("llm_request", start_time=arrival_ns, context=extract_trace_context(trace_headers), kind=SERVER)</code>.</li>
+  </ol>
+
+  <div class="callout good">
+    <strong>Why durations survive the process hop.</strong> <code>queued_ts</code>, <code>scheduled_ts</code>,
+    <code>first_token_ts</code>, <code>last_token_ts</code> are <em>all</em> on the EngineCore monotonic clock, so their
+    differences are valid even though they're consumed in another process. Only <code>arrival_time</code> (the absolute
+    span start) is wall-clock. <code>EngineCoreEvent</code>'s own docstring warns: monotonic timestamps "should not be
+    compared with timestamps from other processes" (<span class="fileref">vllm/v1/engine/__init__.py:156-161</span>).
+  </div>
+
+  <div class="divider"></div>
+
+  <h2 id="has-tracer">4. EngineCore already has a tracer</h2>
+
+  <p>You don't need to bootstrap anything. When the frontend has tracing enabled, <code>init_tracer</code> puts the OTLP
+    endpoint into the environment, the EngineCore subprocess inherits it, and at startup it calls:</p>
+
+  <pre><span class="c"># vllm/v1/engine/core.py:1170 (inside run_engine_core)</span>
+maybe_init_worker_tracer(<span class="s">"vllm.engine_core"</span>, <span class="s">"engine_core"</span>, process_title)</pre>
+
+  <p>So a <code>TracerProvider</code> with a <code>BatchSpanProcessor</code> is live in the EngineCore process. The only
+    question is <em>how</em> you open a span and <em>what parent</em> it gets.</p>
+
+  <h2 id="recipeA">5. Recipe A — <code>@instrument</code> (coarse, easy)</h2>
+
+  <p>The lowest-effort option. Decorate any EngineCore method and you get one span per call, with wall-clock start/end
+    filled in automatically (no clock math). This is exactly how init/warmup are traced today.</p>
+
+  <pre><span class="k">from</span> vllm.tracing <span class="k">import</span> instrument
+
+<span class="k">class</span> <span class="fn">EngineCore</span>:
+    <span class="fn">@instrument</span>(span_name=<span class="s">"EngineCore step"</span>)
+    <span class="k">def</span> <span class="fn">step</span>(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        ...</pre>
+
+  <div class="callout warn">
+    <strong>Watch the volume.</strong> <code>step()</code> runs once per forward pass — at decode that is one span
+    <em>per token-batch per iteration</em>. Decorating the busy loop will flood your collector. Prefer decorating
+    rare/coarse operations (init, profiling, a KV-transfer wait), or use Recipe B with explicit start/end so one span
+    covers a whole request rather than one per step.
+  </div>
+
+  <p><strong>Parent.</strong> <code>@instrument</code> derives its parent from <code>_get_smart_context()</code>
+    (<span class="fileref">otel.py:216</span>): if a span is already active in this process it nests under it; otherwise
+    it reads <code>traceparent</code> from <code>os.environ</code>. EngineCore's env only holds the <em>process-level</em>
+    traceparent injected at spawn — <strong>not the per-request client trace</strong>. So an <code>@instrument</code> span
+    is <em>not</em> tied to the originating HTTP request. For that, use Recipe B.</p>
+
+  <h2 id="recipeB">6. Recipe B — per-request span, parented to the client trace</h2>
+
+  <p>To attach an EngineCore span to the <em>same</em> distributed trace as the client request, you must explicitly pull
+    the context out of the request's <code>trace_headers</code> (the scheduler's <code>Request</code> object carries them —
+    <span class="fileref">request.py:165</span>) and hand it to a manual span. Mirror what
+    <code>OutputProcessor.do_tracing</code> does, but inside EngineCore.</p>
+
+  <pre><span class="k">import</span> time
+<span class="k">from</span> vllm.tracing <span class="k">import</span> (
+    SpanAttributes, SpanKind, extract_trace_context, instrument_manual,
+)
+
+<span class="c"># Capture a monotonic→epoch offset ONCE, e.g. in EngineCore.__init__ — see §7.</span>
+<span class="c">#   self._epoch_offset = time.time() - time.monotonic()</span>
+
+<span class="k">def</span> <span class="fn">_emit_engine_span</span>(self, request, sched_ts, done_ts):
+    <span class="c"># sched_ts / done_ts are EngineCore time.monotonic() readings.</span>
+    endpoint = self.vllm_config.observability_config.otlp_traces_endpoint
+    <span class="k">if</span> <span class="k">not</span> endpoint:
+        <span class="k">return</span>                                  <span class="c"># nothing is exported; skip the work</span>
+    ctx = extract_trace_context(request.trace_headers)  <span class="c"># parent = client trace, or None</span>
+    start_ns = int((sched_ts + self._epoch_offset) * <span class="n">1e9</span>)
+    end_ns   = int((done_ts  + self._epoch_offset) * <span class="n">1e9</span>)
+    instrument_manual(
+        span_name=<span class="s">"engine_core.schedule_execute"</span>,
+        start_time=start_ns,
+        end_time=end_ns,
+        attributes={
+            SpanAttributes.GEN_AI_REQUEST_ID: request.request_id,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_SCHEDULER: done_ts - sched_ts,
+        },
+        context=ctx,
+        kind=SpanKind.INTERNAL,
+    )</pre>
+
+  <p>Call it from <code>step()</code> (<span class="fileref">core.py:479</span>) or from
+    <code>scheduler.update_from_output</code> — wherever you can see both the <code>Request</code> (for
+    <code>trace_headers</code>) and the timestamps you want to bracket. Since durations come from monotonic deltas, they
+    are accurate regardless of the clock conversion below.</p>
+
+  <h2 id="clock">7. The clock gotcha — monotonic vs epoch</h2>
+
+  <div class="callout bad">
+    <strong>Do not pass a <code>time.monotonic()</code> value as <code>start_time</code>.</strong>
+    OTel interprets <code>start_time</code>/<code>end_time</code> as <strong>nanoseconds since the Unix epoch</strong>.
+    <code>time.monotonic()</code> is an arbitrary zero (often seconds since boot), so a span built from it would be dated
+    to ~1970 + uptime — garbage on the timeline. This is precisely why the frontend's <code>llm_request</code> span uses
+    wall-clock <code>arrival_time</code> for its start, and uses the monotonic event timestamps only for
+    <em>subtraction</em>.
+  </div>
+
+  <p>Two correct options:</p>
+  <div class="grid">
+    <div class="box">
+      <h3>Use wall-clock directly</h3>
+      <p>If you can capture the bracket with <code>time.time()</code> at the point of interest, just pass those
+        epoch-seconds×1e9. Simplest when you control the call site.</p>
+    </div>
+    <div class="box">
+      <h3>Convert monotonic → epoch</h3>
+      <p>Capture an offset once: <code>offset = time.time() − time.monotonic()</code>, then
+        <code>epoch_ns = int((mono_ts + offset) * 1e9)</code>. Reuse existing monotonic event timestamps without
+        re-instrumenting the scheduler.</p>
+    </div>
+  </div>
+
+  <p class="subtitle">The offset drifts slightly over long uptimes (the two clocks aren't perfectly coupled), but for
+    span placement on a waterfall it is well within tolerance. Capture it once, not per-span.</p>
+
+  <h2 id="parenting">8. Parenting — where your EngineCore span lands</h2>
+
+  <p>OTel parent/child linkage comes from the <strong>trace context (trace-id + span-id)</strong>, never from
+    timestamps. So:</p>
+  <ul>
+    <li>Feed <code>context=extract_trace_context(request.trace_headers)</code> &rarr; your span becomes a child of the
+      <strong>client's</strong> span (the incoming HTTP <code>traceparent</code>).</li>
+    <li>The frontend's <code>llm_request</code> span also parents off those <em>same</em> client headers. So your
+      EngineCore span and <code>llm_request</code> end up as <strong>siblings</strong> under the client root — they are
+      <em>not</em> nested inside <code>llm_request</code>.</li>
+    <li>To nest <em>under</em> <code>llm_request</code> instead, you'd have to propagate that span's context to EngineCore
+      (it isn't today — only the original client headers make the round trip). Sibling-under-client is the path of least
+      resistance and is usually what you want.</li>
+    <li>Pass <code>context=None</code> (or omit) and <code>_get_smart_context()</code> takes over — you get the
+      process-level trace or a fresh root, decoupled from the request.</li>
+  </ul>
+
+  <h2 id="checklist">9. Pitfalls &amp; checklist</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Do</h3>
+      <ul>
+        <li>Gate on <code>observability_config.otlp_traces_endpoint</code> before building attributes.</li>
+        <li>Use <code>SpanAttributes.*</code> constants, not raw strings.</li>
+        <li>Capture the monotonic→epoch offset <strong>once</strong>.</li>
+        <li>Prefer one span per request (explicit start/end) over one per <code>step()</code>.</li>
+        <li>Pass <code>trace_headers</code>-derived context to join the client trace.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Avoid</h3>
+      <ul>
+        <li>Feeding <code>time.monotonic()</code> into <code>start_time</code> (§7).</li>
+        <li>Decorating the hot busy loop with <code>@instrument</code> (span flood).</li>
+        <li>Assuming <code>is_tracing_available()</code> means "exporter configured" — it doesn't.</li>
+        <li>Comparing EngineCore monotonic timestamps against frontend wall-clock for absolute placement.</li>
+        <li>Expecting the Rust frontend to emit OTel spans — it does not.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Minimal change, summarized.</strong> The tracer exists in EngineCore already. To emit a request-scoped span:
+    (1) grab <code>request.trace_headers</code> → <code>extract_trace_context</code>; (2) convert your monotonic
+    timestamps to epoch-ns via a once-captured offset; (3) call <code>instrument_manual(..., context=ctx,
+    kind=SpanKind.INTERNAL)</code>; (4) gate the whole thing on <code>otlp_traces_endpoint</code> being set.
+  </div>
+
+  <div class="divider"></div>
+
+  <h2 id="sglang">10. Appendix — SGLang contrast: every process traces</h2>
+
+  <p>SGLang makes the opposite design choice, and it flows from a different process architecture. vLLM
+    <strong>centralizes</strong> scheduling in one EngineCore process and treats the GPU workers as dumb executors —
+    so it only ever emits a span from the frontend. SGLang runs the scheduler <strong>SPMD</strong>: every GPU process is
+    its own autonomous scheduler+worker, so tracing has to emit and stitch spans from <em>all</em> of them.</p>
+
+  <h3>Process model at TP=4 (single node)</h3>
+
+  <div class="diagram">
+    <div class="diagram-title">vLLM — 1 dedicated scheduler + 4 workers (5 GPU-side processes)</div>
+    <div class="diagram-row" style="align-items:stretch;">
+      <div class="proc front">
+        <div class="ptitle">API server (frontend)</div>
+        <ul><li><span class="yes">emits the one <code>llm_request</code> span</span></li></ul>
+      </div>
+      <div class="zmq">ZMQ</div>
+      <div class="proc core">
+        <div class="ptitle">EngineCore &mdash; <strong>no GPU</strong></div>
+        <ul>
+          <li>runs <em>the</em> scheduler</li>
+          <li>ships <code>scheduler_output</code> to workers</li>
+          <li>only <code>@instrument</code> init spans</li>
+        </ul>
+      </div>
+      <div class="zmq">RPC&nbsp;&rarr;</div>
+      <div class="proc work" style="flex:2 1 0;">
+        <div class="ptitle">Worker 0 / 1 / 2 / 3 &mdash; 1 GPU each</div>
+        <ul>
+          <li>execute the plan; <strong>do not schedule</strong></li>
+          <li><span class="no">no request spans</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">SGLang — 4 self-scheduling GPU processes (4 GPU-side processes)</div>
+    <div class="diagram-row" style="align-items:stretch;">
+      <div class="proc front">
+        <div class="ptitle">HTTP + TokenizerManager</div>
+        <ul><li><span class="yes">traces</span> (root Req span)</li></ul>
+      </div>
+      <div class="zmq">ZMQ&nbsp;&rarr;<br>rank&nbsp;0&nbsp;only</div>
+      <div class="proc work" style="flex:2 1 0;">
+        <div class="ptitle">Scheduler[TP0..TP3] &mdash; scheduler <em>+</em> TpModelWorker, 1 GPU each</div>
+        <ul>
+          <li>each runs the full scheduler loop (SPMD)</li>
+          <li>rank&nbsp;0 ingests + <code>broadcast_pyobj</code> to peers over <code>tp_cpu_group</code></li>
+          <li><span class="yes">each emits its own thread span + slices</span>, tagged <code>tp_rank</code></li>
+        </ul>
+      </div>
+      <div class="zmq">&rarr;</div>
+      <div class="proc core">
+        <div class="ptitle">DetokenizerManager</div>
+        <ul><li><span class="yes">traces</span></li></ul>
+      </div>
+    </div>
+    <div class="diagram-caption">The extra vLLM process is the centralized scheduler (EngineCore, no GPU). SGLang has no
+      such process — the 4 GPU processes self-schedule in lockstep.</div>
+  </div>
+
+  <h3>Who coordinates the 4 GPUs in SGLang?</h3>
+  <p>No single process. Coordination is <strong>collective, through the torch.distributed groups</strong>, not a boss:</p>
+  <ol class="steps">
+    <li><strong>Ingest + broadcast.</strong> In <code>recv_requests()</code>
+      (<span class="fileref">scheduler.py:1504</span>), only <code>attn_tp_rank == 0</code> reads requests off the ZMQ
+      socket, then <code>broadcast_pyobj(..., tp_cpu_group)</code> sends them to ranks 1&ndash;3 over a gloo CPU group.</li>
+    <li><strong>Decide identically.</strong> All 4 ranks now hold the same request set and run the same scheduling logic
+      &rarr; identical batches, no divergence.</li>
+    <li><strong>Execute together.</strong> The forward runs as a tensor-parallel collective over NCCL.</li>
+  </ol>
+  <p>vLLM's EngineCore is instead the single decision-maker: it runs the scheduler and ships <code>scheduler_output</code>
+    to the 4 workers via <code>MultiprocExecutor</code> (workers execute, never schedule). That dedicated decision-maker
+    is the "+1" process — and the reason vLLM can emit its span from one place.</p>
+
+  <h3>How the designs diverge for tracing</h3>
+  <table>
+    <tr><th></th><th>vLLM v1</th><th>SGLang</th></tr>
+    <tr><td>Scheduler</td><td>centralized (1 EngineCore)</td><td>SPMD — one per GPU process</td></tr>
+    <tr><td>GPU workers</td><td>dumb executors</td><td>full scheduler each</td></tr>
+    <tr><td>Spans per request</td><td><strong>one</strong> (<code>llm_request</code>, frontend)</td>
+        <td>hierarchy: root Req &rarr; per-process thread span &rarr; nested slices + events</td></tr>
+    <tr><td>Worker request spans</td><td><span class="no">none</span></td>
+        <td><span class="yes">yes</span> — thread span per rank, tagged <code>tp_rank</code>/<code>host</code>/<code>pid</code></td></tr>
+    <tr><td>Cross-process glue</td><td><code>trace_headers</code> echoed on <code>EngineCoreOutput</code>; span backdated at finish</td>
+        <td>pickled <code>TraceReqContext</code> (<code>__getstate__</code>/<code>__setstate__</code>) + W3C propagation; live spans</td></tr>
+    <tr><td>ID collisions</td><td>n/a (single emitter)</td>
+        <td>custom <code>TraceCustomIdGenerator</code> — avoids dup trace-ids across TP processes</td></tr>
+    <tr><td>Verbosity</td><td>on/off (endpoint configured?)</td>
+        <td><strong><code>trace_level</code> 0&ndash;3</strong>, runtime-settable via <code>/set_trace_level?level=N</code></td></tr>
+    <tr><td>Clock handling</td><td>monotonic deltas; wall-clock for span start (§7 gotcha)</td>
+        <td><code>convert_time_to_realtime_ns</code> calibrates monotonic&rarr;realtime per thread</td></tr>
+  </table>
+
+  <h3>The <code>trace_level</code> dial</h3>
+  <p>SGLang gates each span ("slice") and event on a per-request level snapshot of a process-global
+    (<code>global_trace_level</code>, default 3 but <code>--enable-trace</code> defaults off). <code>level 0</code> disables
+    tracing for that request; <code>__check_fast_return(level)</code> skips any span whose <code>level &gt; trace_level</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Adds</th><th>Example stages</th></tr>
+    <tr><td><strong>0</strong></td><td>nothing</td><td>tracing disabled for the request</td></tr>
+    <tr><td><strong>1</strong></td><td>request skeleton — coarse lifecycle</td>
+        <td><code>tokenize</code>, <code>prefill_waiting</code>, <code>prefill_forward</code>, <code>decode_forward</code>,
+        PD phases (<code>prefill_bootstrap</code>, <code>prefill_transfer_kv_cache</code>, <code>decode_prepare</code>)</td></tr>
+    <tr><td><strong>2</strong></td><td>+ dispatch / handoff + coarse spec-decode</td>
+        <td><code>api_server_dispatch</code>, <code>dpc_dispatch</code>, <code>request_process</code>,
+        <code>spec_draft</code>, <code>spec_verify</code></td></tr>
+    <tr><td><strong>3</strong></td><td>+ per-iteration inner loops (high volume)</td>
+        <td><code>decode_loop</code> (per step), <code>chunked_prefill</code> (per chunk),
+        <code>spec_draft_extend</code>, <code>fake_output</code></td></tr>
+  </table>
+
+  <div class="callout info">
+    <strong>The trade-off.</strong> SGLang gets a true per-process distributed trace with a live verbosity knob — at the
+    cost of real machinery: pickling the trace context onto every cross-process request, a custom ID generator to dodge
+    trace-id collisions across the TP processes, and per-thread monotonic&rarr;realtime calibration. vLLM sidesteps all of
+    it by only ever emitting from the single frontend, accepting one coarse backdated span as the price.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>SGLang sources:</strong>
+    <span class="fileref">python/sglang/srt/observability/trace.py</span> (TraceReqContext, IdGenerator, slice/level API),
+    <span class="fileref">python/sglang/srt/observability/req_time_stats.py</span> (stage&rarr;level map, cross-thread clock),
+    <span class="fileref">python/sglang/srt/managers/scheduler.py</span> (per-rank tracing init:3760, recv_requests/broadcast:1504),
+    <span class="fileref">python/sglang/srt/entrypoints/http_server.py</span> (<code>/set_trace_level</code>:967),
+    <span class="fileref">python/sglang/srt/server_args.py</span> (<code>enable_trace</code>:421).
+  </div>
+
+  <div class="foot">
+    Sources read: <span class="fileref">vllm/tracing/__init__.py</span>, <span class="fileref">vllm/tracing/otel.py</span>,
+    <span class="fileref">vllm/tracing/utils.py</span>; <span class="fileref">vllm/v1/engine/core.py</span>
+    (<code>run_engine_core</code>:1152, <code>step</code>:479, <code>@instrument</code> sites:239/900,
+    <code>maybe_init_worker_tracer</code>:1170); <span class="fileref">vllm/v1/engine/output_processor.py</span>
+    (<code>do_tracing</code>:712); <span class="fileref">vllm/v1/metrics/stats.py</span>
+    (<code>RequestStateStats</code>, <code>update_from_events</code>:404);
+    <span class="fileref">vllm/v1/engine/__init__.py</span> (<code>EngineCoreEvent</code>:156);
+    <span class="fileref">vllm/v1/core/sched/scheduler.py</span> (event stamping:942/1217, header echo:1701/1727);
+    <span class="fileref">vllm/v1/executor/multiproc_executor.py</span> (worker-per-rank spawn:176);
+    <span class="fileref">rust/README.md</span> (frontend opt-in). SGLang sources listed in &sect;10.
+    A learnings walkthrough — verify against current source before changing code.
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Collective Communication Primitives &mdash; vLLM Parallelism</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .prim-card {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin: 14px 0;
+  }
+  .prim-card h3 { margin-top: 0; }
+  .rank-box {
+    display: inline-block;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 4px;
+    text-align: center;
+    font-family: "SF Mono", Monaco, monospace;
+    min-width: 110px;
+    font-size: 0.82em;
+  }
+  .rank-box .rname { display:block; color: var(--muted); font-size: 0.78em; margin-bottom: 3px; font-family: -apple-system, sans-serif; font-weight: 650;}
+  .rank-box.r0 { border-left: 4px solid var(--blue); }
+  .rank-box.r1 { border-left: 4px solid var(--green); }
+  .rank-box.r2 { border-left: 4px solid var(--amber); }
+  .rank-box.r3 { border-left: 4px solid var(--red); }
+  .ranks-row { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin: 8px 0; }
+  .center-arrow { text-align: center; font-size: 1.4em; color: var(--muted); margin: 4px 0; }
+  .sym {
+    display: inline-block;
+    background: var(--code);
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-family: monospace;
+    font-size: 0.85em;
+  }
+  .cost-table th:nth-child(1) { width: 18%; }
+  .cost-table th:nth-child(2) { width: 30%; }
+  .cost-table th:nth-child(3) { width: 28%; }
+  .cost-table th:nth-child(4) { width: 24%; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">parallelism/</a> &rsaquo; <strong>COMMUNICATION</strong>
+  </div>
+
+  <h1>Collective Communication Primitives</h1>
+  <p class="subtitle">
+    The seven NCCL/Gloo collectives that every parallelism strategy in
+    vLLM is built out of. Read this first if the terms <em>AllReduce</em>,
+    <em>AllGather</em>, <em>ReduceScatter</em>, and <em>All2All</em> are
+    not yet second nature &mdash; the rest of the parallelism docs assume
+    they are.
+  </p>
+
+  <section class="tldr">
+    <strong>The mental model in one line</strong>
+    <p>
+      Every collective is a function of <em>two</em> tensor shapes (in &rarr; out)
+      and a <em>reduction</em> (sum, none, concat). Knowing the shape transform
+      lets you read any parallel layer mechanically: "this layer's input is sharded
+      by hidden-dim, output is sharded by hidden-dim, so we need AllReduce."
+    </p>
+  </section>
+
+  <div class="callout info">
+    <strong>Notation used throughout these docs</strong>
+    <ul style="margin: 6px 0 0 0;">
+      <li><code>B</code> &mdash; batch size (number of sequences in the step)</li>
+      <li><code>S</code> &mdash; sequence length (tokens per sequence)</li>
+      <li><code>H</code> &mdash; <em>hidden dimension</em> (model's residual-stream width). For Llama-3 70B, <code>H = 8192</code>.</li>
+      <li><code>I</code> &mdash; MLP intermediate dimension (usually 3&ndash;4&times; <code>H</code>). For Llama-3 70B, <code>I = 28672</code>.</li>
+      <li><code>D</code> &mdash; a generic tensor size in bytes, used in the cheat-sheet below.</li>
+      <li><code>N</code> &mdash; number of ranks in the collective's group (e.g. TP size).</li>
+      <li><code>num_heads</code>, <code>head_dim</code> &mdash; attention heads. Note <code>H = num_heads &times; head_dim</code>; for Llama-3 70B <code>num_heads = 64</code>, <code>head_dim = 128</code>. "Sharding by head" means slicing <code>H</code> into groups of <code>head_dim</code>.</li>
+      <li><code>num_kv_heads</code> &mdash; KV heads under GQA (often much smaller than <code>num_heads</code>; e.g. 8 for Llama-3 70B). Hard ceiling on TP for the KV cache.</li>
+      <li><code>E</code> &mdash; expert count for MoE (e.g. 256 for DeepSeek-V3); top-<code>k</code> = experts activated per token.</li>
+    </ul>
+  </div>
+
+  <div class="nav">
+    <ol>
+      <li><a href="#cheat">Cheat sheet</a></li>
+      <li><a href="#broadcast">Broadcast</a></li>
+      <li><a href="#allreduce">AllReduce</a></li>
+      <li><a href="#allgather">AllGather</a></li>
+      <li><a href="#reducescatter">ReduceScatter</a></li>
+      <li><a href="#alltoall">All2All</a></li>
+      <li><a href="#sendrecv">Send/Recv</a></li>
+      <li><a href="#identities">Useful identities</a></li>
+      <li><a href="#vllm">How vLLM exposes them</a></li>
+    </ol>
+  </div>
+
+  <h2 id="cheat">Cheat sheet</h2>
+
+  <table class="cost-table">
+    <thead>
+      <tr><th>Op</th><th>Per-rank input &rarr; per-rank output</th><th>Reduction</th><th>Volume / rank (ring)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Broadcast</strong></td>
+        <td><code>[D]</code> on root &rarr; <code>[D]</code> on all</td>
+        <td>copy</td>
+        <td><code>D</code> send (root only)</td>
+      </tr>
+      <tr>
+        <td><strong>AllReduce</strong></td>
+        <td><code>[D]</code> on all &rarr; <code>[D]</code> identical on all</td>
+        <td>sum (or max/min/avg)</td>
+        <td><code>~2D</code> (ring: RS + AG)</td>
+      </tr>
+      <tr>
+        <td><strong>AllGather</strong></td>
+        <td><code>[D/N]</code> per rank &rarr; <code>[D]</code> identical on all</td>
+        <td>concat</td>
+        <td><code>D &minus; D/N</code></td>
+      </tr>
+      <tr>
+        <td><strong>ReduceScatter</strong></td>
+        <td><code>[D]</code> per rank &rarr; <code>[D/N]</code> shard per rank</td>
+        <td>sum</td>
+        <td><code>D &minus; D/N</code></td>
+      </tr>
+      <tr>
+        <td><strong>All2All</strong></td>
+        <td><code>[N, D/N]</code> per rank &rarr; <code>[N, D/N]</code> per rank (transposed routing)</td>
+        <td>no reduction; reshuffle by index</td>
+        <td><code>D &minus; D/N</code></td>
+      </tr>
+      <tr>
+        <td><strong>Send/Recv</strong></td>
+        <td><code>[D]</code> on src &rarr; <code>[D]</code> on dst</td>
+        <td>copy</td>
+        <td><code>D</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    "Ring" is the algorithm NCCL uses on most homogeneous topologies. <code>N</code>
+    is the number of ranks in the group. The volume column is the <em>per-rank</em>
+    bytes on the wire, which is what determines latency on a fixed-bandwidth link.
+  </p>
+
+  <h2 id="broadcast">Broadcast</h2>
+
+  <div class="prim-card">
+    <h3>Definition</h3>
+    <p>
+      One rank (the <em>root</em>) sends its tensor to every other rank in the group.
+      Used to seed identical weights, token IDs, or seeds at startup.
+    </p>
+
+    <h4>Before</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0 (root)</span>[a, b, c, d]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>&mdash;</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>&mdash;</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>&mdash;</div>
+    </div>
+    <div class="center-arrow">&darr; <code>broadcast(src=0)</code> &darr;</div>
+    <h4>After</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[a, b, c, d]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[a, b, c, d]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[a, b, c, d]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[a, b, c, d]</div>
+    </div>
+
+    <div class="callout info">
+      <strong>vLLM uses:</strong> input-token broadcast from TP rank 0 to the rest
+      of a TP group, so every rank sees the same prompt before the forward pass.
+      See <span class="fileref">parallel_state.py</span>:
+      <code>use_message_queue_broadcaster=True</code> on the TP group.
+    </div>
+  </div>
+
+  <h2 id="allreduce">AllReduce</h2>
+
+  <div class="prim-card">
+    <h3>Definition</h3>
+    <p>
+      Every rank starts with a tensor of the <em>same shape</em>. Every rank ends
+      with the element-wise <em>sum</em> (or max/min/avg) of all input tensors.
+      Conceptually <code>AllReduce = ReduceScatter + AllGather</code>, which is
+      exactly how the ring algorithm implements it.
+    </p>
+
+    <h4>Before</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[1, 2, 3, 4]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[1, 1, 1, 1]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[0, 1, 0, 1]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[1, 0, 1, 0]</div>
+    </div>
+    <div class="center-arrow">&darr; <code>all_reduce(op=SUM)</code> &darr;</div>
+    <h4>After (every rank holds the sum)</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[3, 4, 5, 6]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[3, 4, 5, 6]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[3, 4, 5, 6]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[3, 4, 5, 6]</div>
+    </div>
+
+    <h4>When it shows up in vLLM</h4>
+    <ul>
+      <li>
+        <strong>End of every TP layer pair</strong>: after
+        <code>RowParallelLinear</code> (sharded on <em>input</em> dimension),
+        each rank holds a partial sum &mdash; AllReduce sums them to the full output.
+        <br><span class="fileref">vllm/model_executor/layers/linear.py</span>:1559 calls
+        <code>tensor_model_parallel_all_reduce(output_parallel)</code>.
+      </li>
+      <li>
+        <strong>DP synchronization barrier</strong>: a tiny AllReduce of a counter
+        decides whether all DP ranks are ready for the next step. See
+        <span class="fileref">vllm/v1/worker/dp_utils.py</span>.
+      </li>
+      <li>
+        <strong>Custom all-reduce</strong>: for small tensors over NVLink, vLLM ships
+        a hand-written kernel that beats NCCL by avoiding the ring. Toggle with
+        <code>--disable-custom-all-reduce</code>.
+      </li>
+    </ul>
+
+    <div class="callout warn">
+      <strong>The deceptive cost.</strong> AllReduce moves
+      <code>~2&times;</code> the message size on the wire vs AllGather or
+      ReduceScatter alone. When the layer's <em>output</em> is already going to be
+      sharded again immediately (e.g. fused TP + sequence parallelism), the right
+      move is to skip the full AllReduce and use ReduceScatter, saving half the
+      bandwidth.
+    </div>
+  </div>
+
+  <h2 id="allgather">AllGather</h2>
+
+  <div class="prim-card">
+    <h3>Definition</h3>
+    <p>
+      Each rank owns a shard of size <code>D/N</code>. After AllGather, every rank
+      holds the full concatenated tensor of size <code>D</code>. The reduction is
+      <em>concatenation</em>, not summation.
+    </p>
+
+    <h4>Before</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[a0]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[a1]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[a2]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[a3]</div>
+    </div>
+    <div class="center-arrow">&darr; <code>all_gather</code> &darr;</div>
+    <h4>After</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[a0, a1, a2, a3]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[a0, a1, a2, a3]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[a0, a1, a2, a3]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[a0, a1, a2, a3]</div>
+    </div>
+
+    <h4>Where vLLM uses it</h4>
+    <ul>
+      <li>
+        <strong>Vocab-parallel logits</strong>: each rank computes a slice of the
+        vocabulary's logits, AllGather concatenates so that argmax/softmax sees the
+        whole vocab.
+      </li>
+      <li>
+        <strong>MoE allgather-reducescatter backend</strong>: tokens are gathered to
+        every rank before the experts dispatch them (used when DeepEP is not
+        available). See <span class="fileref">all2all_backend = "allgather_reducescatter"</span>.
+      </li>
+      <li>
+        <strong>Sequence-parallel TP variant</strong>: after a ReduceScatter has
+        sharded activations by sequence dimension, AllGather is needed before the
+        next attention layer that consumes the full sequence.
+      </li>
+    </ul>
+  </div>
+
+  <h2 id="reducescatter">ReduceScatter</h2>
+
+  <div class="prim-card">
+    <h3>Definition</h3>
+    <p>
+      Every rank starts with the same shape <code>D</code>. After ReduceScatter,
+      every rank holds the element-wise sum &mdash; but only of its
+      <code>D/N</code> slice. The natural inverse of AllGather.
+    </p>
+
+    <h4>Before</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[1, 2, 3, 4]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[1, 1, 1, 1]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[0, 1, 0, 1]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[1, 0, 1, 0]</div>
+    </div>
+    <div class="center-arrow">&darr; <code>reduce_scatter(op=SUM)</code> &darr;</div>
+    <h4>After (each rank has the sum of <em>its</em> column)</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0</span>[3]</div>
+      <div class="rank-box r1"><span class="rname">rank 1</span>[4]</div>
+      <div class="rank-box r2"><span class="rname">rank 2</span>[5]</div>
+      <div class="rank-box r3"><span class="rname">rank 3</span>[6]</div>
+    </div>
+
+    <div class="callout good">
+      <strong>Why it pairs with AllGather.</strong> In the ring algorithm, AllReduce
+      <em>is</em> a ReduceScatter followed by an AllGather. When the next op only
+      needs a shard (e.g. another ColumnParallel layer that splits along the same
+      axis), the AllGather half is redundant &mdash; you can leave the activations
+      sharded across the layer boundary, saving bandwidth. This is the heart of
+      "sequence parallelism" optimisations.
+    </div>
+  </div>
+
+  <h2 id="alltoall">All2All</h2>
+
+  <div class="prim-card">
+    <h3>Definition</h3>
+    <p>
+      The most-misunderstood primitive. Every rank sends a <em>different</em>
+      payload to every other rank. Conceptually it transposes a 2-D tensor of
+      payloads across the rank dimension.
+    </p>
+    <p>
+      If you imagine a matrix where row <code>i</code> = "what rank
+      <code>i</code> wants to send" and column <code>j</code> = "what rank
+      <code>j</code> wants to receive", All2All is the rank-by-rank
+      <em>transpose</em>.
+    </p>
+
+    <h4>Before (each rank has a row, indexed by destination)</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0 sends</span>[a&rarr;0, a&rarr;1, a&rarr;2, a&rarr;3]</div>
+      <div class="rank-box r1"><span class="rname">rank 1 sends</span>[b&rarr;0, b&rarr;1, b&rarr;2, b&rarr;3]</div>
+      <div class="rank-box r2"><span class="rname">rank 2 sends</span>[c&rarr;0, c&rarr;1, c&rarr;2, c&rarr;3]</div>
+      <div class="rank-box r3"><span class="rname">rank 3 sends</span>[d&rarr;0, d&rarr;1, d&rarr;2, d&rarr;3]</div>
+    </div>
+    <div class="center-arrow">&darr; <code>all_to_all</code> &darr;</div>
+    <h4>After (each rank has a column, indexed by source)</h4>
+    <div class="ranks-row">
+      <div class="rank-box r0"><span class="rname">rank 0 has</span>[a&rarr;0, b&rarr;0, c&rarr;0, d&rarr;0]</div>
+      <div class="rank-box r1"><span class="rname">rank 1 has</span>[a&rarr;1, b&rarr;1, c&rarr;1, d&rarr;1]</div>
+      <div class="rank-box r2"><span class="rname">rank 2 has</span>[a&rarr;2, b&rarr;2, c&rarr;2, d&rarr;2]</div>
+      <div class="rank-box r3"><span class="rname">rank 3 has</span>[a&rarr;3, b&rarr;3, c&rarr;3, d&rarr;3]</div>
+    </div>
+
+    <h4>Worked example &mdash; MoE token dispatch</h4>
+    <p>
+      Each rank holds 4 tokens. The router decides each token's expert. With
+      <code>EP=4</code> (expert parallel size 4), expert <code>e</code> lives on rank
+      <code>e</code>. To send each token to its expert's rank we need an All2All.
+    </p>
+
+    <div class="diagram">
+      <div class="diagram-title">MoE dispatch: routing 16 tokens to 4 expert-ranks</div>
+      <table>
+        <thead>
+          <tr><th>Rank</th><th>Local tokens (id, chosen-expert)</th><th>After All2All this rank holds tokens for</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0</td><td>(t0, e1), (t1, e3), (t2, e0), (t3, e2)</td><td>expert 0: t2, t5, t6, t9, t12</td></tr>
+          <tr><td>1</td><td>(t4, e2), (t5, e0), (t6, e0), (t7, e3)</td><td>expert 1: t0, t8, t11, t13, t15</td></tr>
+          <tr><td>2</td><td>(t8, e1), (t9, e0), (t10, e3), (t11, e1)</td><td>expert 2: t3, t4, t14</td></tr>
+          <tr><td>3</td><td>(t12, e0), (t13, e1), (t14, e2), (t15, e1)</td><td>expert 3: t1, t7, t10</td></tr>
+        </tbody>
+      </table>
+      <div class="diagram-caption">
+        After dispatch, each rank holds only tokens whose expert lives here.
+        The reverse op (combine) is a second All2All in the opposite direction.
+      </div>
+    </div>
+
+    <h4>Variants in vLLM (<span class="fileref">all2all_backend</span>)</h4>
+    <ul>
+      <li>
+        <code>allgather_reducescatter</code> &mdash; the safe default: replace
+        All2All with AG + RS. Higher latency, no special kernel needed.
+      </li>
+      <li>
+        <code>deepep_high_throughput</code> / <code>deepep_low_latency</code>
+        &mdash; DeepEP kernels (NVLink + RDMA optimised).
+      </li>
+      <li>
+        <code>mori</code>, <code>nixl_ep</code>,
+        <code>flashinfer_nvlink_{one,two}_sided</code> &mdash; specialised kernels
+        per hardware target.
+      </li>
+    </ul>
+
+    <div class="callout warn">
+      <strong>Token counts are uneven.</strong> All2All in MoE is actually a
+      <em>ragged</em> All2All &mdash; each rank-pair sends a different number of
+      tokens. NCCL has a vectorised <code>all_to_all_single</code> for this; DeepEP
+      goes further and dispatches tokens with per-expert buckets.
+    </div>
+  </div>
+
+  <h2 id="sendrecv">Send / Recv</h2>
+
+  <div class="prim-card">
+    <h3>Definition</h3>
+    <p>
+      Point-to-point primitive: one rank sends a tensor to one peer. Unlike the
+      collectives above, this is <em>not</em> symmetric &mdash; the sender and
+      receiver run different operations.
+    </p>
+
+    <h4>Where vLLM uses it</h4>
+    <ul>
+      <li>
+        <strong>Pipeline parallel hidden-state hand-off</strong>: PP stage
+        <code>k</code>'s last layer sends activations to stage <code>k+1</code>'s
+        first layer.
+      </li>
+      <li>
+        <strong>KV transfer connectors</strong>: prefill workers send KV-cache
+        blocks to decode workers in disaggregated deployments (NIXL, Mooncake).
+        See <span class="fileref">vllm/distributed/kv_transfer/</span>.
+      </li>
+      <li>
+        <strong>EPLB weight migration</strong>: when experts are rebalanced,
+        affected weights are point-to-point shipped to the new rank.
+      </li>
+    </ul>
+  </div>
+
+  <h2 id="identities">Useful identities</h2>
+
+  <p>
+    Knowing these lets you compose collectives into custom layers and predict
+    where bandwidth will go:
+  </p>
+
+  <pre><code>AllReduce         &equiv;  ReduceScatter + AllGather
+AllGather + RS    &equiv;  AllReduce (round-trip cancels out)
+AllGather         &equiv;  N concurrent Broadcasts, each rank acting as root for its shard
+ReduceScatter     &equiv;  N concurrent Reduces, rank i as the root for slice i
+All2All           &equiv;  N concurrent SendRecvs, scheduled to avoid contention
+Broadcast         &equiv;  Trivial AllGather where only root has the payload</code></pre>
+
+  <p>
+    The first identity is why <strong>sequence parallelism</strong> works. AllReduce
+    leaves a full <code>[B, S, H]</code> tensor on every rank &mdash; but the next
+    LayerNorm + residual after an attention block doesn't <em>need</em> the full
+    tensor; those ops are elementwise along <code>S</code>. So we can stop the
+    collective halfway: do only the ReduceScatter, run LayerNorm/residual on the
+    rank-local sequence shard, and AllGather just before the next TP region needs
+    the full sequence again.
+  </p>
+
+  <h4>Concrete example: one Llama-style transformer block, TP=4</h4>
+
+  <table>
+    <thead>
+      <tr><th>Step</th><th>Without SP</th><th>With SP</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Block input</td>
+        <td>X <code>[B, S, H]</code> replicated on all 4 ranks</td>
+        <td>X <code>[B, S/4, H]</code> &mdash; each rank holds 1/4 of the sequence</td>
+      </tr>
+      <tr>
+        <td>Pre-attn LayerNorm</td>
+        <td>Each rank redundantly normalises the full <code>[B, S, H]</code></td>
+        <td>Each rank normalises its <code>[B, S/4, H]</code> shard. <strong>1/4 the compute, 1/4 the activation memory.</strong></td>
+      </tr>
+      <tr>
+        <td>Enter TP region (attention)</td>
+        <td>Input already full</td>
+        <td><strong>AllGather along S</strong> &rarr; <code>[B, S, H]</code></td>
+      </tr>
+      <tr>
+        <td>Attention compute</td>
+        <td>Sharded by head; output is partial sum <code>[B, S, H]</code></td>
+        <td>Same</td>
+      </tr>
+      <tr>
+        <td>End of TP region</td>
+        <td><strong>AllReduce</strong> &rarr; full <code>[B, S, H]</code> replicated</td>
+        <td><strong>ReduceScatter along S</strong> &rarr; <code>[B, S/4, H]</code> shard of the sum</td>
+      </tr>
+      <tr>
+        <td>Residual + LayerNorm (pre-MLP)</td>
+        <td>Each rank redundantly runs it on full <code>[B, S, H]</code></td>
+        <td>Each rank runs it on its <code>[B, S/4, H]</code> shard.</td>
+      </tr>
+      <tr>
+        <td>MLP: same as attention</td>
+        <td>AllReduce at end</td>
+        <td>AllGather at start, ReduceScatter at end</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Compare the comm cost. The identity says
+    <code>AllReduce &equiv; ReduceScatter + AllGather</code>, so per block:
+  </p>
+  <pre><code>Without SP:  2 &times; AllReduce              = 2 &times; (RS + AG)  bytes on the wire
+With SP:     2 &times; (RS at end + AG at start) = 2 &times; (RS + AG)  bytes on the wire</code></pre>
+
+  <p>
+    <strong>Identical bandwidth.</strong> What SP actually buys you is:
+  </p>
+  <ul>
+    <li>
+      <strong>Activation memory drops by 1/N</strong> between TP regions, because
+      between the RS and the next AG, each rank holds only its sequence shard.
+      For a 70B model at <code>B&middot;S = 8192</code>, that's
+      <code>~6 GB</code> of activation memory saved <em>per layer</em> at TP=4.
+    </li>
+    <li>
+      <strong>Elementwise compute (LayerNorm, residual, dropout) drops by 1/N</strong>,
+      since each rank only processes its shard instead of redundantly computing
+      the full tensor.
+    </li>
+  </ul>
+
+  <p>
+    Why was a bandwidth claim plausible? Because if you don't split RS and AG
+    across the layer boundary &mdash; if you do the full AllReduce, then later
+    explicitly shard the activations &mdash; you've paid for the AG and thrown it
+    away. SP just doesn't pay for the throw-away half: it leaves activations
+    sharded right up until the next TP layer genuinely needs them.
+  </p>
+
+  <p>
+    The third identity (AllGather as N concurrent Broadcasts) explains the
+    per-rank bandwidth <code>D &minus; D/N</code>: each rank receives
+    <code>(N&minus;1) &middot; D/N</code> bytes (everyone else's shard) and sends
+    <code>(N&minus;1) &middot; D/N</code> bytes (its own shard to the rest). On a
+    fully-connected topology those <code>N</code> broadcasts run in parallel in
+    a single hop; on a ring NCCL pipelines them across <code>N&minus;1</code> steps.
+  </p>
+
+  <h2 id="vllm">How vLLM exposes them</h2>
+
+  <p>
+    Every parallel layer in vLLM uses the helper wrappers in
+    <span class="fileref">vllm/distributed/communication_op.py</span> rather than
+    calling <code>torch.distributed</code> directly. The wrappers:
+  </p>
+
+  <ul>
+    <li>Pick the right <em>group</em> (TP, DP, PP, DCP, PCP, EP, EPLB).</li>
+    <li>Dispatch to the right <em>backend</em>: NCCL, custom-all-reduce, Gloo, PyNccl, or a device-specific manager (CUDA / XPU / CPU).</li>
+    <li>Handle CUDA-graph capture safely (some backends require special staging buffers).</li>
+  </ul>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Common helpers</h3>
+      <ul>
+        <li><code>tensor_model_parallel_all_reduce(x)</code> &mdash; TP group AllReduce</li>
+        <li><code>tensor_model_parallel_all_gather(x, dim)</code> &mdash; TP group AllGather</li>
+        <li><code>get_dp_group().all_reduce(x)</code></li>
+        <li><code>get_ep_group().all_to_all(send_buf, recv_buf)</code></li>
+        <li><code>get_pp_group().send_tensor_dict(...) / recv_tensor_dict(...)</code></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Group coordinators</h3>
+      <ul>
+        <li><strong>TP</strong>: tensor-parallel rank inside a layer.</li>
+        <li><strong>PP</strong>: pipeline stage, used for hand-off only.</li>
+        <li><strong>DP</strong>: data-parallel replicas, sync at step boundaries.</li>
+        <li><strong>EP</strong>: expert-parallel ranks for MoE All2All.</li>
+        <li><strong>DCP / PCP</strong>: decode / prefill context-parallel groups.</li>
+        <li><strong>EPLB</strong>: separate group for expert-weight migration.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source:</strong>
+    <a href="../../vllm/distributed/parallel_state.py">vllm/distributed/parallel_state.py</a>
+    builds every group at startup, then exposes <code>get_*_group()</code>
+    accessors. The pinout is:
+    <code>ExternalDP &times; DP &times; PP &times; PCP &times; TP</code> &mdash; see
+    the comment around <code>parallel_state.py:1566</code>.
+  </div>
+
+  <h2>Next</h2>
+
+  <p>
+    Now the rest of the docs make sense:
+  </p>
+
+  <ul>
+    <li><a href="TP.html">TP.html</a> &mdash; how the AllReduce shows up at every attention/MLP layer.</li>
+    <li><a href="DP.html">DP.html</a> &mdash; why DP needs only barrier-style AllReduces and no per-layer ops.</li>
+    <li><a href="EP.html">EP.html</a> &mdash; All2All in production: MoE token dispatch.</li>
+    <li><a href="CP.html">CP.html</a> &mdash; how DCP turns AllReduce into AllGather of LSE.</li>
+    <li><a href="PP.html">PP.html</a> &mdash; Send/Recv as a stage boundary, plus chunked-prefill bubbles.</li>
+  </ul>
+
+</main>
+</body>
+</html>

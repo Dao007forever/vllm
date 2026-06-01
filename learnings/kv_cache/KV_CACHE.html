@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KV Cache &mdash; Prefix Caching Design & SWA Limits</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <a href="KV_CACHE.md">KV_CACHE.md</a>
+  </div>
+
+  <h1>KV Cache: Prefix Caching Today &amp; SWA Limits</h1>
+  <p class="subtitle">
+    How vLLM's two-tier prefix cache (local + connector) is wired,
+    and why a tempting "share by suffix" scheme for sliding-window
+    attention is silently unsound.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      <em>Part 1.</em> Prefix caching has two stacked layers:
+      <code>KVCacheManager</code> (local GPU) and an optional
+      <code>KVConnector</code> (external). The connector reports
+      <em>additional</em> tokens beyond the local hit, and the
+      scheduler allocates fresh blocks for the connector to fill
+      on the worker.
+    </p>
+    <p>
+      <em>Part 2.</em> "Share blocks across requests with the same
+      sliding-window suffix" looks attractive but is wrong for any
+      transformer of depth &ge; 2. K/V values at a position depend
+      on the residual stream from layers below, whose receptive
+      field reaches past the per-layer attention window. Today's
+      chained hash + R&rarr;L scan returns exactly the hits that
+      are provably correct &mdash; no more.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#cast">Cast of classes</a></li>
+      <li><a href="#flow">Per-request flow</a></li>
+      <li><a href="#worker">Worker-side transfer</a></li>
+      <li><a href="#closing">Closing the loop</a></li>
+      <li><a href="#async">Async cleanup</a></li>
+      <li><a href="#layering">Layering summary</a></li>
+      <li><a href="#wall">The correctness wall</a></li>
+      <li><a href="#worked">Worked counter-example</a></li>
+      <li><a href="#today">What today's design extracts correctly</a></li>
+      <li><a href="#scans">L&rarr;R vs R&rarr;L scans</a></li>
+      <li><a href="#wins">Where the real wins are</a></li>
+      <li><a href="#tests">Test ideas for any future scheme</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="part1">Part 1 &mdash; How prefix caching works today</h2>
+
+  <p>
+    There are two prefix caches in vLLM: the
+    <strong>local GPU prefix cache</strong> (owned by
+    <code>KVCacheManager</code>) and an optional
+    <strong>external prefix cache</strong> (owned by a
+    <code>KVConnector</code>). They're stacked, not separate paths
+    &mdash; the connector adds tokens <em>beyond</em> what the
+    local cache hit.
+  </p>
+
+  <h3 id="cast">Cast of classes</h3>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Local cache side <span class="tag full">vllm/v1/core/</span></h3>
+      <ul>
+        <li><code>KVCacheManager</code> &mdash; request-level API the scheduler calls. Wraps coordinator + block pool.</li>
+        <li><code>KVCacheCoordinator</code> (Unitary/Hybrid) &mdash; fans the lookup across one or more KV-cache groups.</li>
+        <li><code>SingleTypeKVCacheManager</code> &mdash; per-attention-type <code>find_longest_cache_hit</code>. FullAttention scans L&rarr;R, SWA R&rarr;L, etc.</li>
+        <li><code>BlockPool</code> + <code>BlockHashToBlockMap</code> + <code>FreeKVCacheBlockQueue</code> &mdash; the physical layer: a hash&rarr;block index over an LRU free list, ref-counted blocks.</li>
+        <li><code>KVCacheBlock</code> + <code>hash_block_tokens</code> &mdash; chained hash: <code>SHA256(parent_hash, token_ids, extra_keys)</code>.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Driver &amp; external cache</h3>
+      <ul>
+        <li><code>Scheduler.schedule()</code> in <span class="fileref">vllm/v1/core/sched/scheduler.py</span> &mdash; orchestrates the whole flow per step.</li>
+        <li><code>KVConnectorBase_V1</code> in <span class="fileref">vllm/distributed/kv_transfer/kv_connector/v1/base.py</span> &mdash; two roles: scheduler-side (lookup, metadata) and worker-side (transfer).</li>
+      </ul>
+      <p class="small" style="color:var(--muted)">
+        Concrete connectors: Mooncake Store, LMCache, NIXL,
+        SimpleCPUOffloadConnector, OffloadingConnector.
+      </p>
+    </div>
+  </div>
+
+  <h3 id="flow">Per-request flow when prefix caching is involved</h3>
+
+  <p>
+    When a <code>WAITING</code> request is being promoted in
+    <code>Scheduler.schedule()</code> (Phase 2), starting at
+    <span class="fileref">scheduler.py:610</span>:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Local cache lookup</strong>
+<pre><code>new_computed_blocks, num_new_local_computed_tokens = (
+    self.kv_cache_manager.get_computed_blocks(request)
+)</code></pre>
+      <p>
+        <code>get_computed_blocks</code> &rarr;
+        <code>Coordinator.find_longest_cache_hit</code> &rarr;
+        per-group <code>SingleTypeKVCacheManager.find_longest_cache_hit</code>
+        &rarr; walks block hashes through
+        <code>BlockHashToBlockMap</code>. Returns the longest matched
+        prefix as a list of already-cached <code>KVCacheBlock</code>s
+        and a token count.
+      </p>
+    </li>
+    <li>
+      <strong>External cache lookup</strong> (only if a connector is configured)
+<pre><code>if self.connector is not None:
+    ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+        request, num_new_local_computed_tokens
+    )</code></pre>
+      <p>
+        The connector reports how many <em>additional</em> tokens beyond
+        the local hit it can supply (from peer GPU, CPU offload, NIXL fabric,
+        LMCache, Mooncake, etc.) and whether the load needs to be async.
+      </p>
+    </li>
+    <li>
+      <strong>Async path</strong> (<span class="fileref">scheduler.py:656</span>)
+      &mdash; if <code>load_kv_async</code>, schedule
+      <code>num_new_tokens=0</code> and the request stalls in a
+      <code>WAITING_FOR_REMOTE_KVS</code> state until the connector reports
+      transfer done. Only then does it become eligible for real allocation.
+    </li>
+    <li>
+      <strong>Allocation</strong>
+<pre><code>self.kv_cache_manager.allocate_slots(
+    request, num_new_tokens,
+    num_new_computed_tokens=num_new_local_computed_tokens,
+    num_external_computed_tokens=num_external_computed_tokens,
+    new_computed_blocks=new_computed_blocks,
+    ...,
+)</code></pre>
+      <ul>
+        <li><code>BlockPool.touch()</code> reactivates locally-hit blocks (removes them from the free queue, increments <code>ref_cnt</code>).</li>
+        <li><code>BlockPool.get_new_blocks()</code> pops new blocks for the <em>uncached remainder</em> &mdash; including the range the connector promised to fill. Evicts cached blocks via <code>_maybe_evict_cached_block</code> if needed.</li>
+        <li>The new "external" blocks are allocated empty; the connector will fill them on the worker.</li>
+      </ul>
+    </li>
+    <li>
+      <strong>Connector hook for staging the transfer</strong>
+<pre><code>self.connector.update_state_after_alloc(
+    request, blocks, num_external_computed_tokens
+)</code></pre>
+      <p>Tells the connector exactly which physical blocks it must populate and what tokens they correspond to.</p>
+    </li>
+    <li>
+      <strong>Per-step metadata</strong>
+<pre><code>meta = self.connector.build_connector_meta(scheduler_output)</code></pre>
+      <p>Serialized into <code>SchedulerOutput</code> and shipped to workers.</p>
+    </li>
+  </ol>
+
+  <h3 id="worker">Worker-side: the transfer actually happens</h3>
+
+  <p>On each forward pass:</p>
+  <ol>
+    <li><code>bind_connector_metadata(meta)</code> then <code>start_load_kv(forward_context)</code> &mdash; kicks off async receives for any pending external prefix.</li>
+    <li>Per attention layer: <code>wait_for_layer_load(layer_name)</code> blocks until that layer's KV has landed in the paged buffer (<span class="fileref">model_executor/layers/attention/kv_transfer_utils.py:50</span>). Attention then runs against blocks the manager allocated in step 4.</li>
+    <li>On the producer side, <code>save_kv_layer</code> writes to the connector after each layer; <code>wait_for_save()</code> flushes at end-of-pass.</li>
+  </ol>
+
+  <h3 id="closing">Closing the loop: blocks become local cache entries</h3>
+
+  <p>
+    After the forward pass, the scheduler calls
+    <code>KVCacheManager.cache_blocks()</code> for completed prefill
+    chunks. <code>BlockPool.cache_full_blocks()</code> hashes each
+    filled block (<code>hash_block_tokens</code> chained from the
+    parent) and inserts it into <code>BlockHashToBlockMap</code> &mdash;
+    so the <em>next</em> request gets a local hit on this prefix
+    without needing the connector at all.
+  </p>
+  <div class="callout good">
+    <strong>Key idea</strong>
+    External cache becomes local cache as a side effect of normal
+    forward execution. The connector is purely additive &mdash; it
+    skips compute when someone else already has the KV.
+  </div>
+
+  <h3 id="async">Async cleanup</h3>
+
+  <p>
+    When a request finishes,
+    <code>request_finished(request, block_ids)</code> returns
+    <code>(delay_free_blocks, kv_transfer_params)</code>. If the
+    connector is still pushing blocks somewhere (e.g., back to LMCache,
+    or to a decode peer), the scheduler keeps <code>ref_cnt &gt; 0</code>
+    on those blocks until <code>get_finished()</code> reports the
+    transfer done &mdash; preventing use-after-free.
+  </p>
+
+  <h3 id="layering">Layering summary</h3>
+<pre><code>Scheduler.schedule()
+  &#9500;&#9472;&#9472; KVCacheManager.get_computed_blocks()       # local hit (N tokens)
+  &#9474;     &#9492;&#9472; Coordinator &rarr; SingleTypeManager &rarr; BlockHashToBlockMap
+  &#9500;&#9472;&#9472; connector.get_num_new_matched_tokens()      # external hit (+M tokens)
+  &#9500;&#9472;&#9472; KVCacheManager.allocate_slots()             # touch local + new blocks
+  &#9474;     &#9492;&#9472; BlockPool.touch / get_new_blocks
+  &#9500;&#9472;&#9472; connector.update_state_after_alloc()        # which blocks to fill
+  &#9492;&#9472;&#9472; connector.build_connector_meta()            # ship plan to workers
+
+Worker forward
+  &#9500;&#9472;&#9472; start_load_kv &rarr; wait_for_layer_load(L)      # attention waits per layer
+  &#9492;&#9472;&#9472; save_kv_layer(L) &rarr; wait_for_save()          # producer side
+
+Post-forward
+  &#9500;&#9472;&#9472; KVCacheManager.cache_blocks()               # external&rarr;local promotion
+  &#9492;&#9472;&#9472; (on finish) connector.request_finished()    # delay_free_blocks if async send</code></pre>
+
+  <div class="divider"></div>
+
+  <h2 id="part2">Part 2 &mdash; What SWA prefix caching can and cannot do</h2>
+
+  <p>
+    An earlier draft proposed a <strong>suffix-digest hash</strong> for
+    SWA blocks: hash the window-bounded tail and absolute block position,
+    and let two requests with the same suffix at the same positions share K/V.
+    <strong>That is unsound for any transformer of depth &ge; 2.</strong>
+    This section explains why and what the legitimate engineering wins are.
+  </p>
+
+  <h3 id="wall">The correctness wall: K/V receptive field</h3>
+
+  <p>
+    At every layer <code>L</code>,
+    <code>K_L[p] = W_K &middot; h_{L-1}[p]</code> and
+    <code>V_L[p] = W_V &middot; h_{L-1}[p]</code>. K/V values are a
+    function of the <em>layer's input hidden state</em>, not of the
+    input tokens directly. The hidden state's dependency on tokens grows
+    with depth:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Stack below layer L</th>
+        <th><code>h_{L-1}[p]</code> depends on tokens at</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Embedding only (L = 1)</td><td><code>{p}</code></td></tr>
+      <tr><td>1 SWA layer (window W)</td><td><code>[p &minus; (W&minus;1), p]</code></td></tr>
+      <tr><td>L&minus;1 stacked SWA layers</td><td><code>[p &minus; (L&minus;1)(W&minus;1), p]</code></td></tr>
+      <tr><td>Any full-attention layer at any depth &lt; L</td><td><code>[0, p]</code> &mdash; the entire prefix</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram">
+    <div class="diagram-title">Receptive field of K/V at position 15, window W=4 &mdash; expanding cone</div>
+    <div class="field">
+      <div class="field-row">
+        <span class="field-lbl">L=1 (embed)</span>
+        <div class="field-tok">0</div><div class="field-tok">1</div><div class="field-tok">2</div><div class="field-tok">3</div>
+        <div class="field-tok">4</div><div class="field-tok">5</div><div class="field-tok">6</div><div class="field-tok">7</div>
+        <div class="field-tok">8</div><div class="field-tok">9</div><div class="field-tok">10</div><div class="field-tok">11</div>
+        <div class="field-tok">12</div><div class="field-tok">13</div><div class="field-tok">14</div><div class="field-tok lit cur">15</div>
+      </div>
+      <div class="field-row">
+        <span class="field-lbl">L=2 (1 SWA below)</span>
+        <div class="field-tok">0</div><div class="field-tok">1</div><div class="field-tok">2</div><div class="field-tok">3</div>
+        <div class="field-tok">4</div><div class="field-tok">5</div><div class="field-tok">6</div><div class="field-tok">7</div>
+        <div class="field-tok">8</div><div class="field-tok">9</div><div class="field-tok">10</div><div class="field-tok">11</div>
+        <div class="field-tok lit">12</div><div class="field-tok lit">13</div><div class="field-tok lit">14</div><div class="field-tok lit cur">15</div>
+      </div>
+      <div class="field-row">
+        <span class="field-lbl">L=3 (2 SWA below)</span>
+        <div class="field-tok">0</div><div class="field-tok">1</div><div class="field-tok">2</div><div class="field-tok">3</div>
+        <div class="field-tok">4</div><div class="field-tok">5</div><div class="field-tok">6</div><div class="field-tok">7</div>
+        <div class="field-tok">8</div><div class="field-tok lit">9</div><div class="field-tok lit">10</div><div class="field-tok lit">11</div>
+        <div class="field-tok lit">12</div><div class="field-tok lit">13</div><div class="field-tok lit">14</div><div class="field-tok lit cur">15</div>
+      </div>
+      <div class="field-row">
+        <span class="field-lbl">L=4 (3 SWA below)</span>
+        <div class="field-tok">0</div><div class="field-tok">1</div><div class="field-tok">2</div><div class="field-tok">3</div>
+        <div class="field-tok">4</div><div class="field-tok">5</div><div class="field-tok lit">6</div><div class="field-tok lit">7</div>
+        <div class="field-tok lit">8</div><div class="field-tok lit">9</div><div class="field-tok lit">10</div><div class="field-tok lit">11</div>
+        <div class="field-tok lit">12</div><div class="field-tok lit">13</div><div class="field-tok lit">14</div><div class="field-tok lit cur">15</div>
+      </div>
+      <div class="field-row">
+        <span class="field-lbl">L=5 (4 SWA below)</span>
+        <div class="field-tok">0</div><div class="field-tok">1</div><div class="field-tok">2</div><div class="field-tok lit">3</div>
+        <div class="field-tok lit">4</div><div class="field-tok lit">5</div><div class="field-tok lit">6</div><div class="field-tok lit">7</div>
+        <div class="field-tok lit">8</div><div class="field-tok lit">9</div><div class="field-tok lit">10</div><div class="field-tok lit">11</div>
+        <div class="field-tok lit">12</div><div class="field-tok lit">13</div><div class="field-tok lit">14</div><div class="field-tok lit cur">15</div>
+      </div>
+      <div class="field-row">
+        <span class="field-lbl">L &ge; 6</span>
+        <div class="field-tok lit">0</div><div class="field-tok lit">1</div><div class="field-tok lit">2</div><div class="field-tok lit">3</div>
+        <div class="field-tok lit">4</div><div class="field-tok lit">5</div><div class="field-tok lit">6</div><div class="field-tok lit">7</div>
+        <div class="field-tok lit">8</div><div class="field-tok lit">9</div><div class="field-tok lit">10</div><div class="field-tok lit">11</div>
+        <div class="field-tok lit">12</div><div class="field-tok lit">13</div><div class="field-tok lit">14</div><div class="field-tok lit cur">15</div>
+      </div>
+      <div class="field-row" style="margin-top:6px">
+        <span class="field-lbl" style="color:var(--red);font-weight:650">L=2 with 1 FULL below</span>
+        <div class="field-tok lit">0</div><div class="field-tok lit">1</div><div class="field-tok lit">2</div><div class="field-tok lit">3</div>
+        <div class="field-tok lit">4</div><div class="field-tok lit">5</div><div class="field-tok lit">6</div><div class="field-tok lit">7</div>
+        <div class="field-tok lit">8</div><div class="field-tok lit">9</div><div class="field-tok lit">10</div><div class="field-tok lit">11</div>
+        <div class="field-tok lit">12</div><div class="field-tok lit">13</div><div class="field-tok lit">14</div><div class="field-tok lit cur">15</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:var(--blue)"></span>token K/V at pos 15 depends on this token</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#fafaf8"></span>token outside the receptive field</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#fff;outline:2px solid var(--red)"></span>pos 15 itself</div>
+    </div>
+    <div class="diagram-caption">
+      Each SWA layer adds <code>W&minus;1</code> tokens of reach to the cone. After <code>L = &lceil;(N+1)/(W&minus;1)&rceil;</code> SWA layers, every prior token is in the receptive field. <strong>One Full-attention layer anywhere below short-circuits the whole stack to <code>[0, p]</code></strong> &mdash; that's why hybrid models (Gemma-3, etc.) cannot share suffixes even at layer 2.
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>The conflation that breaks suffix-digest</strong>
+    The attention <em>mask</em> at layer L bounds which K/V entries
+    <code>Q_L[p]</code> mixes with at that layer. The K/V <em>values
+    themselves</em> are computed from <code>h_{L-1}</code>, whose
+    receptive field reaches further back than the mask. The earlier
+    draft conflated these two.
+  </div>
+
+  <p>
+    Two requests with identical window-bounded suffix tokens at
+    identical positions but divergent earlier prefixes do <strong>not</strong>
+    produce identical K/V at any SWA layer beyond the first of a
+    pure-SWA stack. In Gemma-3's hybrid (5 SWA : 1 full), the moment
+    any SWA layer sits above any full-attention layer, its K/V depends
+    on the entire prefix.
+  </p>
+
+  <h3 id="worked">Worked example: why "same suffix at same positions" is not enough</h3>
+
+  <p>
+    <code>block_size=4</code>, <code>sliding_window=8</code>,
+    two requests:
+  </p>
+<pre><code>A: tokens = [1, 2, 3, 4,  5, 6, 7, 8,  9,10,11,12]
+B: tokens = [99,99,99,99, 5, 6, 7, 8,  9,10,11,12]</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Why a "shared suffix" lookup would silently corrupt B's output</div>
+    <div class="diagram-row">
+      <span class="cell label">A tokens</span>
+      <div class="cell-row tight">
+        <div class="cell xs full-grp">1</div><div class="cell xs full-grp">2</div><div class="cell xs full-grp">3</div><div class="cell xs full-grp">4</div>
+        <div class="cell xs cached">5</div><div class="cell xs cached">6</div><div class="cell xs cached">7</div><div class="cell xs cached">8</div>
+        <div class="cell xs cached">9</div><div class="cell xs cached">10</div><div class="cell xs cached">11</div><div class="cell xs cached">12</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">B tokens</span>
+      <div class="cell-row tight">
+        <div class="cell xs evicted">99</div><div class="cell xs evicted">99</div><div class="cell xs evicted">99</div><div class="cell xs evicted">99</div>
+        <div class="cell xs cached">5</div><div class="cell xs cached">6</div><div class="cell xs cached">7</div><div class="cell xs cached">8</div>
+        <div class="cell xs cached">9</div><div class="cell xs cached">10</div><div class="cell xs cached">11</div><div class="cell xs cached">12</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">SWA mask @ pos 8 (W=8)</span>
+      <div class="cell-row tight">
+        <div class="cell xs null">&nbsp;</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">1</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">2</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">3</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">4</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">5</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">6</div>
+        <div class="cell xs lit" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">7</div>
+        <div class="cell xs lit cur" style="background:var(--green-soft);border-color:#abd1bb;color:var(--green)">8</div>
+        <div class="cell xs null"></div>
+        <div class="cell xs null"></div>
+        <div class="cell xs null"></div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      At layer 1, the SWA mask at pos 8 reads positions 1..8 &mdash; identical tokens for A and B? <strong>No.</strong> A reads <code>(1,2,3,4,5,6,7,8)</code>; B reads <code>(99,99,99,99,5,6,7,8)</code>. Even though the slot at pos 8 looks shareable by "same recent tail," the layer-1 K/V at pos 8 already depends on tokens 1..4 &mdash; which differ. Block 2 (pos 8..11) cannot be reused.
+    </div>
+  </div>
+
+  <p>Block 2 spans positions 8..11. Claim from the draft: A's and B's block 2 K/V are bit-identical because tokens at positions 4..11 match. They are not:</p>
+
+  <ul>
+    <li>At SWA layer 1 in a pure-SWA stack: <code>h_1[8]</code> for A depends on tokens at <code>[1..8] = (2,3,4,5,6,7,8,9)</code>; for B it depends on <code>(99,99,99,5,6,7,8,9)</code>. Different.</li>
+    <li>Therefore <code>K_2[8] = W_K &middot; h_1[8]</code> differs between A and B. Likewise for positions 9, 10, 11.</li>
+    <li>In Gemma-3, divergence happens even faster: one full-attention layer below pulls the entire prefix into <code>h_{L-1}[8..11]</code>, so every SWA layer above has K/V depending on tokens 0..3.</li>
+  </ul>
+
+  <div class="callout bad">
+    <strong>Silent failure mode</strong>
+    Returning A's cached block 2 K/V on a B request inserts numerically
+    wrong values. Subsequent attention reads them. There is no
+    kernel-level signal &mdash; the model just gets quietly worse on
+    long conversations with shared tails. This is exactly the failure
+    mode prefix caching is supposed to never have.
+  </div>
+
+  <h3>Why the symmetric refutation applies</h3>
+
+  <p>
+    The earlier draft refuted <strong>bounded-chain hashing</strong>
+    by graph reachability: block <code>i</code>'s hash transitively reaches block 0
+    via the W-stride chain, regardless of how many hops away.
+  </p>
+  <p>
+    The same argument refutes <strong>suffix-digest hashing</strong>,
+    applied to the model's residual stream rather than the hash chain.
+    Suffix-digest's <em>input</em> edges don't reach token 0, but the
+    model's <em>computation</em> edges do. A correct fingerprint must
+    cover a function's full dependency set; otherwise hits between
+    distinct dependency-set values are aliasing collisions.
+  </p>
+
+  <h3 id="today">What today's design already extracts correctly</h3>
+
+  <p>
+    The current chained-hash + R&rarr;L scan in
+    <code>SlidingWindowManager.find_longest_cache_hit</code>
+    (<span class="fileref">single_type_kv_cache_manager.py:548</span>)
+    returns the legitimate hits:
+  </p>
+  <ul>
+    <li><strong>Same-prefix continuation</strong> &mdash; multi-turn chat, branching from a shared system prompt. The prefix matches up to divergence, K/V is provably identical, the chained hash hits. The R&rarr;L scan terminates as soon as it has <code>ceil((W&minus;1)/B)</code> contiguous matched blocks.</li>
+    <li><strong>Window eviction</strong> via <code>remove_skipped_blocks()</code> &mdash; blocks that fall out of the SWA window are freed. SWA memory win, independent of hashing.</li>
+    <li><strong>Cross-instance prefix sharing</strong> through connectors &mdash; identical prefixes hit across machines because connectors use the same chained hash.</li>
+  </ul>
+
+  <div class="callout good">
+    <strong>Not leaving hits on the table</strong>
+    The hits today's design omits are hits that would be unsound.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Code: where the R&rarr;L scan terminates</strong>
+<pre><code># single_type_kv_cache_manager.py
+# Search from right to left and early stop when a match is found.
+for i in range(max_num_blocks - 1, -1, -1):
+    if cached_block := block_pool.get_cached_block(...):
+        # ... insert null blocks for positions before i
+        computed.extend([block_pool.null_block] * i)
+        computed.append(cached)
+        break</code></pre>
+    Earlier slots get filled with <code>null_block</code> because the
+    SWA layer literally won't read them &mdash; and those positions'
+    K/V <em>would</em> have been wrong anyway under suffix-digest.
+  </div>
+
+  <h3 id="scans">Aside: L&rarr;R vs R&rarr;L scanning in <code>find_longest_cache_hit</code></h3>
+
+  <div class="grid">
+    <div class="box">
+      <h3>FullAttentionManager &rarr; L&rarr;R</h3>
+      <p>
+        A full-attention layer at position <code>p</code> attends to
+        all positions <code>[0, p]</code>. Once any block diverges from
+        cache, every subsequent block must also be wrong (its parent
+        hash differs). Scan from block 0, stop at first miss.
+      </p>
+<pre><code>block_size=4, blocks B0..B2
+cache: B0=HIT, B1=HIT, B2=MISS
+L&rarr;R: B0 hit &rarr; B1 hit &rarr; B2 miss &rarr; stop.
+Matched = 8 tokens.</code></pre>
+    </div>
+    <div class="box">
+      <h3>SlidingWindowManager &rarr; R&rarr;L</h3>
+      <p>
+        SWA at position <code>p</code> only attends to
+        <code>[p &minus; W + 1, p]</code>. The block at the request end
+        only needs <code>ceil((W&minus;1)/B)</code> contiguous matched
+        blocks ending at <em>its</em> position; earlier matches are
+        irrelevant. Scan from the last block, accumulate contiguous
+        hits, stop when you have W of them.
+      </p>
+<pre><code>block_size=4, sliding_window=8 &rarr; W_blocks=2
+B0..B4 cache: HIT, MISS, HIT, HIT, HIT
+L&rarr;R: 4 tokens (useless &mdash; loses B3+B4)
+R&rarr;L: i=4 hit (contig=1) &rarr; i=3 hit (contig=2!) stop.
+Result blocks = [NULL, NULL, NULL, B3, B4].
+Matched = 20 tokens.</code></pre>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Same cache state, different scan strategies extract different hits</div>
+    <p style="font-size:0.85em;color:var(--muted);text-align:center;margin:6px 0">Cache state: B<sub>0</sub>=HIT, B<sub>1</sub>=MISS, B<sub>2</sub>=HIT, B<sub>3</sub>=HIT, B<sub>4</sub>=HIT &nbsp;|&nbsp; SWA window = 2 blocks</p>
+    <div class="diagram-row" style="margin-top:10px">
+      <span class="cell label">blocks</span>
+      <div class="cell-row">
+        <div class="cell lg cached">B<sub>0</sub><br><span class="lo">HIT</span></div>
+        <div class="cell lg evicted">B<sub>1</sub><br><span class="lo">MISS</span></div>
+        <div class="cell lg cached">B<sub>2</sub><br><span class="lo">HIT</span></div>
+        <div class="cell lg cached">B<sub>3</sub><br><span class="lo">HIT</span></div>
+        <div class="cell lg cached">B<sub>4</sub><br><span class="lo">HIT</span></div>
+      </div>
+    </div>
+    <div class="diagram-row" style="margin-top:14px">
+      <span class="cell label">Full L&rarr;R</span>
+      <div class="cell-row">
+        <div class="cell lg match">B<sub>0</sub> &check;</div>
+        <div class="cell lg" style="background:#f5f5f3;color:var(--muted)">STOP at miss</div>
+        <div class="cell lg null">&mdash;</div>
+        <div class="cell lg null">&mdash;</div>
+        <div class="cell lg null">&mdash;</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">SWA R&rarr;L</span>
+      <div class="cell-row">
+        <div class="cell lg null">&mdash;</div>
+        <div class="cell lg null">&mdash;</div>
+        <div class="cell lg null">&mdash;</div>
+        <div class="cell lg match">B<sub>3</sub> &check; (2/2)</div>
+        <div class="cell lg match">B<sub>4</sub> &check; (1/2)</div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Full attention is happy with 4 matched tokens (B<sub>0</sub> only). SWA gets <strong>8 matched tokens</strong> (B<sub>3</sub>, B<sub>4</sub>) &mdash; enough to fill its window &mdash; without caring that B<sub>1</sub> missed. The scan direction is dictated by what the layer <em>needs</em>, not what looks tidy.
+    </div>
+  </div>
+
+  <p>
+    <strong>MambaManager &rarr; R&rarr;L.</strong> Mamba caches state at
+    block boundaries; you want the latest checkpoint matching the
+    prefix, so scan from the end. See <a href="MAMBA.html">MAMBA.html</a>.
+  </p>
+
+  <h3>Position encoding: a smaller wall behind the receptive-field wall</h3>
+
+  <p>
+    RoPE applied to K bakes absolute position into the cached tensor for
+    almost every modern SWA model (Llama, Mistral, Gemma-3, Qwen). With
+    the receptive-field wall correctly stated, RoPE is just a tightening
+    &mdash; even on a pure-ALiBi or learned-relative model where RoPE
+    wouldn't exclude same-suffix-different-position cases, suffix-digest
+    still aliases across divergent prefixes because the K/V values themselves
+    differ. RoPE excludes a strictly smaller set than the receptive field does.
+  </p>
+
+  <h3 id="wins">Where the legitimate engineering wins are</h3>
+
+  <div class="grid">
+    <div class="box">
+      <h3>1. Sparser SWA block allocation (the biggest win)</h3>
+      <p>
+        <code>HybridKVCacheCoordinator</code> allocates blocks in
+        lock-step across groups. An SWA layer fundamentally only needs
+        <code>ceil(W/B)</code> blocks live at any moment per request.
+        Today the allocator over-allocates and
+        <code>remove_skipped_blocks</code> evicts after the fact &mdash;
+        peak allocation is still proportional to context length per
+        SWA layer.
+      </p>
+      <p>
+        A streaming allocator that never allocates blocks for
+        out-of-window positions in SWA groups would shrink peak memory
+        without changing correctness or hashing. For Gemma-3 with 5:1
+        SWA:full ratio, peak SWA-group memory drops from O(N) per layer
+        to O(W) per layer.
+      </p>
+    </div>
+    <div class="box">
+      <h3>2. R&rarr;L scan micro-optimization</h3>
+      <p>
+        The TODO at <span class="fileref">single_type_kv_cache_manager.py</span>
+        &mdash; skip-ahead by <code>ceil(W/B)</code> blocks rather than
+        one at a time when there's a miss. Orthogonal to hashing.
+      </p>
+      <h3>3. Connector SWA coverage</h3>
+      <p>
+        Cross-instance K/V reuse for SWA group blocks is just as valid
+        as for full-attention blocks (both rely on identical prefixes).
+        Confirm Mooncake / LMCache / NIXL index SWA group blocks
+        symmetrically (using the existing chained hash with <code>group_id</code>
+        plumbed through). No hash change needed.
+      </p>
+    </div>
+  </div>
+
+  <h3>What this doesn't help: Mamba / RWKV / pure linear attention</h3>
+
+  <p>
+    Mamba's <code>(h, conv_state)</code> at position <code>p</code> is a
+    function of <em>all</em> prior tokens with exponentially-decaying
+    weights, not a literal window. There's no token-level "fall-off"
+    point. <code>MambaManager.find_longest_cache_hit</code> already does
+    what's possible: longest-prefix match with checkpoint replay, R&rarr;L
+    scan. Windowed hashing doesn't apply.
+  </p>
+  <p>
+    The only way to extend prefix sharing for true linear attention is
+    <strong>state checkpointing across requests</strong> &mdash; and
+    that's already chained-hash-equivalent. The wins there are
+    connector-side. See <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a>.
+  </p>
+
+  <h3 id="tests">Test ideas before any future windowed-hash proposal</h3>
+
+  <div class="callout warn">
+    <strong>Failures here are silent</strong>
+    Receptive-field aliasing has no kernel-level trip-wire. Any new
+    SWA hash scheme must be guarded by:
+    <ul>
+      <li><strong>Two-request K/V comparison at every SWA layer</strong>: <code>A = [X*N, Y*M]</code>, <code>B = [X'*N, Y*M]</code> with <code>X &ne; X'</code>. Compute K/V at every SWA layer for the Y range. They must differ; any scheme that returns a hit for B after A primed the cache is unsound.</li>
+      <li><strong>Numerical equivalence test</strong>: run B's prefill cold, then again with the cache primed by A's run. Outputs must be bit-identical to cold. If a windowed hash is wired in incorrectly, they won't be &mdash; and the difference may be small enough that eval scores barely move.</li>
+    </ul>
+  </div>
+
+  <h3>Build order</h3>
+
+  <ol>
+    <li><strong>Sparser SWA block allocation</strong> &mdash; measure peak memory delta on long-context Gemma-3 / Mistral workloads. No correctness risk.</li>
+    <li><strong>R&rarr;L scan micro-opt</strong> &mdash; close the TODO.</li>
+    <li><strong>Connector SWA audit</strong> &mdash; confirm Mooncake / LMCache / NIXL handle SWA group blocks correctly for identical-prefix sharing.</li>
+  </ol>
+
+  <div class="callout bad">
+    <strong>There is no step 4</strong> that recovers a
+    suffix-digest-style "win." It does not exist for transformers of
+    depth &ge; 2.
+  </div>
+
+  <h3>Risks if anyone proposes a windowed hash again</h3>
+
+  <ul>
+    <li>Reviewers must demand the K/V-comparison + numerical-equivalence tests above before any new SWA hash scheme lands.</li>
+    <li>Anyone proposing per-layer or per-group hash variants must enumerate the dependency set of each cache entry's <em>contents</em> and prove the hash covers it. "The mask only reads W tokens" is not the dependency set; the dependency set is the receptive field of the residual stream feeding K/V.</li>
+    <li><code>extra_keys</code> (LoRA, MM hash, cache salt) must remain part of every group's key regardless of scheme. See <a href="KV_CACHE_ASSUMPTIONS.html#k13">KV_CACHE_ASSUMPTIONS.html &sect;13</a>.</li>
+    <li>Hybrid models (Gemma-3) make the constraint stricter, not looser: even <em>if</em> a windowed hash were sound for pure-SWA layers, the moment a full-attention layer appears below an SWA layer, that SWA layer's K/V depends on the full prefix and must use the chained hash.</li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <p class="subtitle">
+    See also: <a href="BEGINNER_GUIDE.html">BEGINNER_GUIDE.html</a>
+    for the on-ramp, <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a>
+    for group layout, and <a href="KV_CACHE_ASSUMPTIONS.html">KV_CACHE_ASSUMPTIONS.html</a>
+    for hidden assumptions.
+  </p>
+</main>
+</body>
+</html>

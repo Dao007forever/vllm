@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Data Parallelism (DP) &mdash; vLLM Parallelism</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .replica {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    text-align: center;
+  }
+  .replica.r0 { border-left: 4px solid var(--blue); }
+  .replica.r1 { border-left: 4px solid var(--green); }
+  .replica.r2 { border-left: 4px solid var(--amber); }
+  .replica.r3 { border-left: 4px solid var(--red); }
+  .replicas {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin: 12px 0;
+  }
+  .replicas .replica .role { color: var(--muted); font-size: 0.78em; }
+  .step-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin: 12px 0;
+  }
+  .step-grid .step {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 8px 10px;
+    text-align: center;
+    font-size: 0.85em;
+  }
+  .padded {
+    background: var(--amber-soft);
+    color: var(--amber);
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">parallelism/</a> &rsaquo; <strong>DP</strong> &mdash;
+    Data Parallelism
+  </div>
+
+  <h1>Data Parallelism (DP)</h1>
+  <p class="subtitle">
+    Each rank holds a <em>full copy</em> of the model and serves an independent
+    batch. Communication is minimal &mdash; until you mix it with MoE/EP, at which
+    point DP and EP become inseparable.
+  </p>
+
+  <section class="tldr">
+    <strong>One-line model</strong>
+    <p>
+      DP replicates the model. In a dense-only deployment, DP ranks barely talk to
+      each other. In a wide-MoE deployment, DP groups define the <em>batch</em>
+      that an All2All has to dispatch and combine over &mdash; so DP and
+      <a href="EP.html">EP</a> end up coupled through the MoE layers.
+    </p>
+  </section>
+
+  <div class="nav">
+    <ol>
+      <li><a href="#shape">The shape of DP in vLLM</a></li>
+      <li><a href="#dense">Dense models &mdash; the easy case</a></li>
+      <li><a href="#moe">MoE models &mdash; where DP gets coupled</a></li>
+      <li><a href="#sync">DP synchronisation: padding and barriers</a></li>
+      <li><a href="#modes">External, internal, hybrid LB</a></li>
+      <li><a href="#dbo">Dual-batch overlap (DBO)</a></li>
+      <li><a href="#config">Config and code pointers</a></li>
+      <li><a href="#contrast">DP vs TP vs PP</a></li>
+    </ol>
+  </div>
+
+  <h2 id="shape">The shape of DP in vLLM</h2>
+
+  <p>
+    <code>data_parallel_size = N</code> means the engine launches
+    <code>N</code> identical workers, each running the same model on the same
+    weights. Where they differ:
+  </p>
+
+  <ul>
+    <li>Each DP rank gets its own <em>requests</em>. There is no shared batch.</li>
+    <li>Each DP rank has its own KV cache and its own scheduler.</li>
+    <li>DP ranks coordinate only at well-defined points (start of step, MoE dispatch, end of step).</li>
+  </ul>
+
+  <div class="replicas">
+    <div class="replica r0">
+      <strong>DP rank 0</strong>
+      <div class="role">full model copy</div>
+      <div class="role">requests A, B, C</div>
+    </div>
+    <div class="replica r1">
+      <strong>DP rank 1</strong>
+      <div class="role">full model copy</div>
+      <div class="role">requests D, E</div>
+    </div>
+    <div class="replica r2">
+      <strong>DP rank 2</strong>
+      <div class="role">full model copy</div>
+      <div class="role">requests F, G, H, I</div>
+    </div>
+    <div class="replica r3">
+      <strong>DP rank 3</strong>
+      <div class="role">full model copy</div>
+      <div class="role">requests J, K</div>
+    </div>
+  </div>
+
+  <p>
+    The full grid is <code>ExternalDP &times; DP &times; PP &times; PCP &times; TP</code>
+    (see <span class="fileref">parallel_state.py</span>:1566). Each DP rank is itself
+    a TP/PP slab. If you set <code>DP=2, TP=4</code> on 8 GPUs you get two
+    independent 4-GPU TP groups, each running the model.
+  </p>
+
+  <h2 id="dense">Dense models &mdash; the easy case</h2>
+
+  <p>
+    For a non-MoE model, DP ranks are functionally independent during the
+    forward pass. The only inter-DP communication is:
+  </p>
+
+  <ol>
+    <li>
+      A tiny AllReduce at the <em>start</em> of each step deciding whether to
+      execute (so no rank deadlocks waiting for a peer that has no work).
+      See <span class="fileref">vllm/v1/worker/dp_utils.py</span>.
+    </li>
+    <li>
+      Background gossip on the coordinator (request count, KV blocks free) used
+      by the front-end's load balancer to pick which rank gets the next request.
+    </li>
+  </ol>
+
+  <div class="callout good">
+    <strong>The bandwidth advantage</strong>: dense DP does no per-layer
+    communication. If your model fits on one GPU and you have many GPUs, DP gives
+    you near-linear throughput scaling. This is why "TP=1, DP=N" is the right
+    setting for small models on big boxes &mdash; latency stays single-GPU low,
+    throughput grows with N.
+  </div>
+
+  <h2 id="moe">MoE models &mdash; where DP gets coupled</h2>
+
+  <p>
+    A Mixture-of-Experts layer has many experts (say 256 for DeepSeek-V3).
+    With <a href="EP.html">expert parallelism</a>, each expert lives on exactly
+    one rank. A token sent to expert <code>e</code> must travel to whichever rank
+    holds expert <code>e</code>.
+  </p>
+
+  <p>
+    The natural <em>batch</em> for that All2All is "all tokens currently in
+    flight across all DP ranks." So at every MoE layer:
+  </p>
+
+  <div class="step-grid">
+    <div class="step">
+      <strong>1. Local forward</strong><br>
+      Run attention + router locally on each DP rank.
+    </div>
+    <div class="step">
+      <strong>2. All2All dispatch</strong><br>
+      Send each token to the rank holding its expert.<br>
+      (Bandwidth: <code>~B&times;H</code> per rank.)
+    </div>
+    <div class="step">
+      <strong>3. Expert MLP</strong><br>
+      Each rank runs only the experts it owns, on the tokens it received.
+    </div>
+    <div class="step">
+      <strong>4. All2All combine</strong><br>
+      Send results back to the rank that originated the token.
+    </div>
+  </div>
+
+  <p>
+    This couples the DP ranks: they must enter the MoE All2All together. So
+    DP <em>scheduling</em> ends up coordinated even though the rest of the
+    forward pass is independent.
+  </p>
+
+  <h2 id="sync">DP synchronisation: padding and barriers</h2>
+
+  <p>
+    The All2All needs every DP rank to participate, even if a rank has zero
+    real tokens at this step. The trick:
+  </p>
+
+  <ul>
+    <li>
+      Each DP rank publishes its current token count to peers via a small
+      AllReduce of an integer.
+    </li>
+    <li>
+      The max becomes the All2All bucket size; ranks pad with dummy tokens up
+      to that size, then mask them out on the receiving side.
+    </li>
+  </ul>
+
+  <div class="diagram">
+    <div class="diagram-title">MoE step with uneven DP loads (DP=4, padding)</div>
+    <table>
+      <thead>
+        <tr><th>DP rank</th><th>Real tokens</th><th>Padded to</th><th>Wasted compute</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0</td><td>32</td><td>64</td><td>32 tokens</td></tr>
+        <tr><td>1</td><td>64</td><td>64</td><td>&mdash;</td></tr>
+        <tr><td>2</td><td>16</td><td>64</td><td><span class="padded">48 tokens</span></td></tr>
+        <tr><td>3</td><td>8</td><td>64</td><td><span class="padded">56 tokens</span></td></tr>
+      </tbody>
+    </table>
+    <div class="diagram-caption">
+      The slowest (largest) rank sets the pace. Long-tail latency comes from
+      <em>imbalance</em>, not from comm cost.
+    </div>
+  </div>
+
+  <p>
+    The DP load balancer (next section) tries to keep batches even so that
+    padding stays small.
+  </p>
+
+  <h2 id="modes">Internal, external, hybrid LB</h2>
+
+  <p>
+    vLLM exposes three DP load-balancer modes:
+  </p>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>Internal LB (default)</h3>
+      <p>
+        One API server fronts all DP ranks. It tracks queue depths and KV-block
+        availability per rank, and routes incoming requests to the least-loaded.
+      </p>
+      <p>
+        Good for single-node deployments. Simple to operate.
+      </p>
+    </div>
+    <div class="box">
+      <h3>External LB</h3>
+      <p>
+        Each DP rank gets its own API server. An <em>external</em> load
+        balancer (the one in your Kubernetes ingress) decides which rank
+        receives each request.
+      </p>
+      <p>
+        Pattern: one-pod-per-rank in K8s, useful for wide-EP deployments where
+        DP and EP both span many nodes. Set
+        <code>data_parallel_external_lb=True</code>.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Hybrid LB</h3>
+      <p>
+        Each <em>node</em> runs its own API server that balances among the
+        local DP ranks on that node, but an external LB balances among the nodes.
+      </p>
+      <p>
+        Sweet spot for multi-node MoE: locality-aware on the node, infrastructure-aware across nodes.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="dbo">Dual-batch overlap (DBO)</h2>
+
+  <p>
+    Bandwidth idle time during MoE All2All can be hidden by running <em>two</em>
+    micro-batches concurrently &mdash; while batch A is doing its All2All, batch B
+    runs its attention/MLP locally, and vice versa.
+  </p>
+
+  <pre><code>// Without DBO
+[attn][MLP][AllToAll][expert][AllToAll][attn][MLP][AllToAll]...
+                ^ stall ^                 ^ stall ^
+
+// With DBO (two ubatches A and B, interleaved)
+A:  [attn][MLP][a2a]   [exp]   [a2a]   [attn]...
+B:           [attn][MLP][a2a]   [exp]   [a2a]...</code></pre>
+
+  <ul>
+    <li><code>enable_dbo: bool = False</code> &mdash; opt-in flag.</li>
+    <li><code>ubatch_size: int = 0</code> &mdash; microbatch size; auto if 0.</li>
+    <li>
+      Thresholds at <code>dbo_prefill_token_threshold = 512</code> and
+      <code>dbo_decode_token_threshold = 32</code> guard against splitting tiny
+      batches (where the overlap doesn't pay back the overhead).
+    </li>
+  </ul>
+
+  <h2 id="config">Config and code pointers</h2>
+
+  <pre><code># Multi-DP serving (internal LB)
+vllm serve deepseek-ai/DeepSeek-V3 --data-parallel-size 4
+
+# DP with TP (DP=2, TP=4 &Rightarrow; 8 GPUs)
+vllm serve meta-llama/Llama-3-70B \
+  --data-parallel-size 2 \
+  --tensor-parallel-size 4
+
+# External LB across pods
+vllm serve ... \
+  --data-parallel-size 16 \
+  --data-parallel-external-lb \
+  --data-parallel-rank $POD_RANK</code></pre>
+
+  <ul>
+    <li>
+      <span class="fileref">vllm/config/parallel.py</span>:117 &mdash;
+      <code>data_parallel_size</code>, <code>data_parallel_size_local</code>,
+      <code>data_parallel_rank</code>, master IP/port for messaging.
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/parallel_state.py</span>:1259
+      &mdash; <code>_DP</code> group coordinator, accessed via
+      <code>get_dp_group()</code>.
+    </li>
+    <li>
+      <span class="fileref">vllm/v1/worker/dp_utils.py</span> &mdash; the
+      per-step DP sync logic. Has a flag to force Gloo over NCCL
+      (<code>disable_nccl_for_dp_synchronization</code>) for async safety.
+    </li>
+    <li>
+      <span class="fileref">vllm/v1/engine/coordinator.py</span> &mdash; DP
+      coordinator and its TCPStore-based gossip channel.
+    </li>
+  </ul>
+
+  <h2 id="contrast">DP vs TP vs PP &mdash; the comm-vs-memory triangle</h2>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Memory per rank</th><th>Per-step comm</th><th>Latency</th><th>Best when</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>DP</strong></td>
+        <td>full model (worst)</td>
+        <td>minimal (or 2&times;A2A/MoE layer)</td>
+        <td>single-rank fast</td>
+        <td>model fits; want throughput</td>
+      </tr>
+      <tr>
+        <td><strong>TP</strong></td>
+        <td><code>1/N</code> (best for big models)</td>
+        <td>2 AllReduce / layer</td>
+        <td>lowest if NVLink available</td>
+        <td>single-node; model doesn't fit one GPU</td>
+      </tr>
+      <tr>
+        <td><strong>PP</strong></td>
+        <td><code>1/N</code> by layer</td>
+        <td>1 SendRecv / pipeline stage boundary</td>
+        <td>bubble in pipeline costs steps</td>
+        <td>multi-node; slow interconnect</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    They <em>compose</em>. A common DeepSeek-V3 deployment is
+    <code>DP=16, TP=4, EP=64</code> &mdash; meaning 64 GPUs total, each TP=4 box is
+    one DP replica, and the EP dimension is "TP &times; DP" (since the routers
+    span all 64 ranks for expert lookup).
+  </p>
+
+  <h2>Next</h2>
+
+  <p>
+    Read <a href="EP.html">EP.html</a> for the MoE-specific All2All in detail, or
+    <a href="CP.html">CP.html</a> if you're working with very long sequences that
+    won't fit per-head.
+  </p>
+
+</main>
+</body>
+</html>

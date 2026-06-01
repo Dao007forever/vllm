@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>A Mathematical Abstraction for Heterogeneous-Parallel KV Transfer</title>
+<link rel="stylesheet" href="../../_shared.css" />
+<style>
+  .meet-grid { display: inline-grid; gap: 3px; margin: 14px 0; background: var(--border); padding: 3px; border-radius: 6px; }
+  .meet-grid .hd { background: var(--panel); font-weight: 650; font-size: 0.8em; text-align: center; padding: 6px 8px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+  .meet-grid .rl { background: var(--panel); font-weight: 650; font-size: 0.8em; padding: 6px 10px; display: flex; align-items: center; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+  .meet-grid .mc { padding: 8px 10px; border-radius: 3px; font-family: "SF Mono", Monaco, monospace; font-size: 0.74em; text-align: center; line-height: 1.45; min-width: 96px; }
+  .p0t0 { background: var(--green-soft); border: 1px solid #abd1bb; }
+  .p0t1 { background: var(--blue-soft); border: 1px solid #a6c8df; }
+  .p1t0 { background: var(--amber-soft); border: 1px solid #e3c88a; }
+  .p1t1 { background: var(--violet-soft); border: 1px solid #c3b0e0; }
+  .meet-grid .mc .dst { color: var(--muted); display: block; font-size: 0.92em; margin-top: 2px; }
+  .axis-strip { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  .pcell { border: 1px solid var(--border); border-radius: 4px; padding: 4px 9px; font-family: "SF Mono", Monaco, monospace; font-size: 0.8em; background: var(--code); }
+  .pcell.b1 { background: var(--green-soft); border-color: #abd1bb; }
+  .pcell.b2 { background: var(--blue-soft); border-color: #a6c8df; }
+  .pcell.b3 { background: var(--amber-soft); border-color: #e3c88a; }
+  .pcell.b4 { background: var(--violet-soft); border-color: #c3b0e0; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; KV Cache Transfer</a> &nbsp;|&nbsp;
+    companion to <a href="PARALLELISM.html">PARALLELISM.html</a> &amp; <a href="NIXL.html">NIXL.html</a>
+  </div>
+
+  <h1>A Mathematical Abstraction for Heterogeneous-Parallel KV Transfer</h1>
+  <p class="subtitle">
+    The NIXL connector reconciles heterogeneous PP and TP between prefill (P)
+    and decode (D) with two hand-rolled, axis-specific mappings composed in a
+    nested loop. This note names the mathematical objects that structure is an
+    instance of &mdash; <em>product index spaces</em>, <em>partition lattices</em>,
+    and <em>affine layouts</em> &mdash; so a future abstraction can add a new
+    parallel dimension by adding a factor, not by writing new mapping code.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      The global KV cache is a <strong>product index space</strong>
+      <code>Layer &times; Head &times; Block &times; &hellip;</code>. A parallel
+      layout <em>partitions</em> each axis independently and hands the pieces to
+      workers arranged in a <strong>mesh</strong>. Because the axes are
+      orthogonal, the set of P&rarr;D transfers is the <strong>common refinement
+      (meet)</strong> of P's and D's partitions, and that meet
+      <em>factorizes</em>:
+    </p>
+    <div class="eq" style="text-align:center">
+      P &and; D &nbsp;=&nbsp; (P<sub>Layer</sub> &and; D<sub>Layer</sub>) &nbsp;&times;&nbsp; (P<sub>Head</sub> &and; D<sub>Head</sub>) &nbsp;&times;&nbsp; (P<sub>Block</sub> &and; D<sub>Block</sub>)
+    </div>
+    <p>
+      Compute one tiny meet per axis, take the product &mdash; that <em>is</em> the
+      transfer plan. The within-cell address math is an <strong>affine map on an
+      integer lattice</strong> (a CuTe-style <em>layout</em>). These are exactly
+      the objects behind PyTorch <code>DTensor</code> (<code>DeviceMesh</code> +
+      <code>Placement</code>), JAX/GSPMD (<code>Mesh</code> +
+      <code>PartitionSpec</code>), and CUTLASS/CuTe <code>Layout</code>s.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#product">The KV cache is a product index space</a></li>
+      <li><a href="#partition">What &ldquo;partition&rdquo; means (with examples)</a></li>
+      <li><a href="#meet">The transfer plan <em>is</em> a common refinement</a></li>
+      <li><a href="#product-meet">What <code>P &and; D = (P_A &and; D_A) &times; (P_B &and; D_B)</code> means</a></li>
+      <li><a href="#affine">Inside a cell: affine layouts</a></li>
+      <li><a href="#replication">Where partitions break: replication (MLA / GQA)</a></li>
+      <li><a href="#mesh">The rank side is also a product: the mesh</a></li>
+      <li><a href="#prior-art">Prior art: DTensor, GSPMD, CuTe</a></li>
+      <li><a href="#code-map">Mapping to the current NIXL code</a></li>
+      <li><a href="#proposal">Proposed abstraction: ordered-sequence <code>Placement</code> + <code>plan_transfer</code></a></li>
+    </ol>
+  </nav>
+
+  <h2 id="product">1. The KV cache is a product index space</h2>
+
+  <p>
+    Forget sharding for a moment. The <em>logical</em> KV state of a model is a
+    single tensor addressed by a tuple of independent coordinates:
+  </p>
+
+  <div class="eq" style="text-align:center">
+    G &nbsp;=&nbsp; Layer &nbsp;&times;&nbsp; Head &nbsp;&times;&nbsp; Block &nbsp;&times;&nbsp; {K, V} &nbsp;&times;&nbsp; intra-block-slot
+  </div>
+
+  <p>
+    This is a <strong>Cartesian product</strong>: a global address is a tuple
+    <code>(&#8467;, h, b, &hellip;)</code>, and the axes are
+    <em>orthogonal</em> &mdash; the set of valid layer indices doesn't depend on
+    which head you picked, and vice versa. That orthogonality is not a
+    coincidence of the implementation; it is a property of the model's KV state,
+    and it is the entire reason &ldquo;one mapping after another&rdquo; works.
+  </p>
+
+  <p>A parallel layout is then a function</p>
+
+  <div class="eq" style="text-align:center">
+    place: G &nbsp;&rarr;&nbsp; (worker, local_offset)
+  </div>
+
+  <p>
+    and each parallelism strategy partitions <em>one</em> axis:
+  </p>
+
+  <table>
+    <thead><tr><th>Strategy</th><th>Axis it partitions</th><th>vLLM knob</th></tr></thead>
+    <tbody>
+      <tr><td>Pipeline parallel (PP)</td><td><code>Layer</code></td><td><code>pipeline_parallel_size</code></td></tr>
+      <tr><td>Tensor parallel (TP)</td><td><code>Head</code> (KV heads)</td><td><code>tensor_parallel_size</code></td></tr>
+      <tr><td>Block-size / kernel paging</td><td><code>Block</code></td><td><code>block_size</code>, <code>physical_blocks_per_logical</code></td></tr>
+      <tr><td>K/V-split backends</td><td><code>{K, V}</code></td><td>attention backend</td></tr>
+      <tr><td><em>(future)</em> Context/sequence parallel</td><td><code>Block</code> (token ranges)</td><td>&mdash;</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>The claim of this note.</strong> Because <code>place</code> factorizes
+    over orthogonal axes, <em>every</em> question about heterogeneous transfer
+    decomposes per-axis and recombines by a product. PP and TP are not special;
+    they are two factors in the same construction.
+  </div>
+
+  <h2 id="partition">2. What &ldquo;partition&rdquo; means (with examples)</h2>
+
+  <p>
+    A <strong>partition</strong> of a set <code>S</code> is a way of cutting
+    <code>S</code> into pieces (<em>cells</em>) such that:
+  </p>
+
+  <ol class="steps">
+    <li><strong>Every element is covered</strong> &mdash; the cells' union is all of <code>S</code>.</li>
+    <li><strong>Cells don't overlap</strong> &mdash; they are pairwise disjoint.</li>
+    <li><strong>Cells are non-empty.</strong></li>
+  </ol>
+
+  <p>
+    Equivalently: every element of <code>S</code> belongs to <strong>exactly
+    one</strong> cell. &ldquo;Sharding axis <code>X</code> across <code>N</code>
+    workers&rdquo; <em>is</em> a partition of axis <code>X</code> into
+    <code>N</code> cells, where cell <code>i</code> = the coordinates owned by
+    worker <code>i</code>.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Example &mdash; the Layer axis under PP.</strong>
+    Take a model with 8 hidden layers, <code>S = {0,1,2,3,4,5,6,7}</code>.
+    <div class="axis-strip" style="margin-top:10px">
+      <span style="font-size:0.8em;color:var(--muted);min-width:120px">P side, <code>PP=2</code>:</span>
+      <span class="pcell b1">pp0 = {0,1,2,3}</span>
+      <span class="pcell b3">pp1 = {4,5,6,7}</span>
+    </div>
+    <div class="axis-strip">
+      <span style="font-size:0.8em;color:var(--muted);min-width:120px">D side, <code>PP=4</code>:</span>
+      <span class="pcell b1">pp0 = {0,1}</span>
+      <span class="pcell b2">pp1 = {2,3}</span>
+      <span class="pcell b3">pp2 = {4,5}</span>
+      <span class="pcell b4">pp3 = {6,7}</span>
+    </div>
+    <p style="font-size:0.86em;margin-bottom:0">
+      Both are valid partitions of the same 8-element set: disjoint, covering,
+      non-empty. They are <em>different</em> partitions &mdash; that difference is
+      exactly &ldquo;heterogeneous PP.&rdquo; vLLM enforces partition-hood of the
+      layer axis in <span class="fileref">pp_layer_map.py</span>: the
+      <code>PPLayerMap</code> raises unless the P-side boundaries are
+      <em>contiguous</em> (no overlap) and <em>cover all hidden layers</em> (full
+      coverage).
+    </p>
+  </div>
+
+  <p>
+    Partitions of a fixed set are themselves ordered: partition <code>A</code> is
+    <strong>finer</strong> than <code>B</code> (and <code>B</code> is
+    <em>coarser</em>) if every cell of <code>A</code> sits inside some cell of
+    <code>B</code>. Above, D's <code>PP=4</code> partition is finer than P's
+    <code>PP=2</code> partition. Under this &ldquo;finer-than&rdquo; order, the
+    partitions of a set form a <strong>lattice</strong> &mdash; which is what makes
+    the next section's &ldquo;meet&rdquo; well-defined.
+  </p>
+
+  <h2 id="meet">3. The transfer plan <em>is</em> a common refinement (meet)</h2>
+
+  <p>
+    P and D partition the <em>same</em> global set <code>G</code>, just
+    differently. A single NIXL read moves a chunk of KV from one P worker to one
+    D worker. So a valid chunk is a set of coordinates that lives entirely
+    inside <strong>one P cell</strong> (so it has a single source) <em>and</em>
+    entirely inside <strong>one D cell</strong> (so it has a single
+    destination). The largest such chunks are exactly the non-empty
+    intersections
+  </p>
+
+  <div class="eq" style="text-align:center">
+    P &and; D &nbsp;=&nbsp; { &nbsp;p &cap; d &nbsp;:&nbsp; p &isin; P, &nbsp; d &isin; D, &nbsp; p &cap; d &ne; &empty; &nbsp;}
+  </div>
+
+  <p>
+    This is the <strong>common refinement</strong>, or <strong>meet</strong>
+    (&and;), of the two partitions: the coarsest partition that is finer than
+    both. <em>The set of transfers you must perform is the set of cells of
+    <code>P &and; D</code>.</em> Each cell carries a unique
+    <code>(source worker, destination worker)</code> pair &mdash; that pair is the
+    transfer.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Worked example &mdash; one axis (Layer), uneven on both sides.</strong>
+    8 layers. Suppose (artificially uneven, to show the general case):
+    <div class="axis-strip" style="margin-top:10px">
+      <span style="font-size:0.8em;color:var(--muted);min-width:60px">P:</span>
+      <span class="pcell b1">P0 = {0,1,2,3,4}</span>
+      <span class="pcell b3">P1 = {5,6,7}</span>
+    </div>
+    <div class="axis-strip">
+      <span style="font-size:0.8em;color:var(--muted);min-width:60px">D:</span>
+      <span class="pcell b2">D0 = {0,1,2}</span>
+      <span class="pcell b2">D1 = {3,4,5}</span>
+      <span class="pcell b2">D2 = {6,7}</span>
+    </div>
+    <div class="axis-strip">
+      <span style="font-size:0.8em;color:var(--muted);min-width:60px">P&and;D:</span>
+      <span class="pcell">{0,1,2} &nbsp;P0&rarr;D0</span>
+      <span class="pcell">{3,4} &nbsp;P0&rarr;D1</span>
+      <span class="pcell">{5} &nbsp;P1&rarr;D1</span>
+      <span class="pcell">{6,7} &nbsp;P1&rarr;D2</span>
+    </div>
+    <p style="font-size:0.86em;margin-bottom:0">
+      Four cells &rarr; four transfers. Notice <code>D1 = {3,4,5}</code> had to be
+      <em>filled from two sources</em> (<code>P0</code> gives layers 3&ndash;4,
+      <code>P1</code> gives layer 5) &mdash; the meet discovered that automatically.
+      This is the layer-axis analogue of NIXL's &ldquo;a D worker reads from
+      multiple P ranks.&rdquo;
+    </p>
+  </div>
+
+  <div class="callout good">
+    <strong>Why this is the right object.</strong> &ldquo;Homogeneous&rdquo; is
+    just the special case where one partition refines the other (e.g. P=D, so
+    <code>P&and;D = P = D</code>, one transfer per worker). The meet handles
+    homogeneous, &ldquo;D finer than P,&rdquo; &ldquo;P finer than D,&rdquo; and
+    fully-misaligned partitions with <em>one</em> definition &mdash; no
+    case-split. The current code's three TP branches
+    (<code>D_TP &ge; P_TP</code>, <code>P_TP &gt; D_TP</code>, MLA) are
+    re-derivations of the meet for specific partition shapes &mdash; traced out
+    case by case in <a href="#three-branches-one-axis">&sect;10</a>.
+  </div>
+
+  <h2 id="product-meet">4. What <code>P &and; D = (P<sub>A</sub> &and; D<sub>A</sub>) &times; (P<sub>B</sub> &and; D<sub>B</sub>)</code> means</h2>
+
+  <p>
+    Now two axes at once &mdash; <code>A = Layer</code>, <code>B = Head</code> &mdash;
+    so <code>G = A &times; B</code>. A worker that is sharded on both axes owns a
+    <em>rectangle</em>: a Layer-cell crossed with a Head-cell. So P's partition
+    of <code>G</code> is itself a product, <code>P = P<sub>A</sub> &times;
+    P<sub>B</sub></code>, and likewise <code>D = D<sub>A</sub> &times;
+    D<sub>B</sub></code>.
+  </p>
+
+  <p>The theorem (a one-line set-algebra fact) is that the meet of two product partitions is the product of the per-axis meets:</p>
+
+  <div class="eq" style="text-align:center">
+    (a<sub>P</sub>&times;b<sub>P</sub>) &cap; (a<sub>D</sub>&times;b<sub>D</sub>)
+    &nbsp;=&nbsp; (a<sub>P</sub> &cap; a<sub>D</sub>) &times; (b<sub>P</sub> &cap; b<sub>D</sub>)
+    &nbsp;&nbsp;&rArr;&nbsp;&nbsp;
+    P &and; D &nbsp;=&nbsp; (P<sub>A</sub> &and; D<sub>A</sub>) &times; (P<sub>B</sub> &and; D<sub>B</sub>)
+  </div>
+
+  <p>
+    In words: <strong>a rectangle-vs-rectangle intersection is just the
+    intersection of the row-ranges crossed with the intersection of the
+    column-ranges.</strong> So to enumerate every transfer you do <em>not</em>
+    walk the giant global product. You compute the Layer meet (small), compute
+    the Head meet (small), and take their Cartesian product. That product
+    <em>is</em> the nested loop.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Worked example &mdash; two axes.</strong>
+    4 layers <code>{0,1,2,3}</code>, 4 KV heads <code>{0,1,2,3}</code>.
+    <div class="axis-strip" style="margin-top:10px">
+      <span style="font-size:0.8em;color:var(--muted);min-width:150px">Layer: P has PP=2, D has PP=1</span>
+      <span class="pcell">P<sub>L</sub>: {0,1} | {2,3}</span>
+      <span class="pcell">D<sub>L</sub>: {0,1,2,3}</span>
+      <span class="pcell b1">meet<sub>L</sub> = {0,1} | {2,3}</span>
+      <span style="font-size:0.8em;color:var(--muted)">(2 cells)</span>
+    </div>
+    <div class="axis-strip">
+      <span style="font-size:0.8em;color:var(--muted);min-width:150px">Head: P has TP=2, D has TP=4</span>
+      <span class="pcell">P<sub>H</sub>: {0,1} | {2,3}</span>
+      <span class="pcell">D<sub>H</sub>: {0}|{1}|{2}|{3}</span>
+      <span class="pcell b1">meet<sub>H</sub> = {0}|{1}|{2}|{3}</span>
+      <span style="font-size:0.8em;color:var(--muted)">(4 cells)</span>
+    </div>
+    <p style="font-size:0.86em">
+      Global space has <code>4&times;4 = 16</code> coordinates. P shards it into
+      <code>2&times;2 = 4</code> workers; D into <code>1&times;4 = 4</code>
+      workers. The transfer plan is <code>meet<sub>L</sub> &times;
+      meet<sub>H</sub> = 2 &times; 4 = 8</code> cells &mdash; computed from a
+      2-cell meet and a 4-cell meet, <strong>never</strong> by scanning all 16
+      coordinates.
+    </p>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">P &and; D as a grid: rows = Layer meet-cells, columns = Head meet-cells</div>
+    <div class="meet-grid" style="grid-template-columns:auto repeat(4, 1fr)">
+      <div class="hd"></div>
+      <div class="hd">head {0}</div><div class="hd">head {1}</div><div class="hd">head {2}</div><div class="hd">head {3}</div>
+
+      <div class="rl">layers<br>{0,1}</div>
+      <div class="mc p0t0">P(pp0,tp0)<span class="dst">&rarr; D(pp0,tp0)</span></div>
+      <div class="mc p0t0">P(pp0,tp0)<span class="dst">&rarr; D(pp0,tp1)</span></div>
+      <div class="mc p0t1">P(pp0,tp1)<span class="dst">&rarr; D(pp0,tp2)</span></div>
+      <div class="mc p0t1">P(pp0,tp1)<span class="dst">&rarr; D(pp0,tp3)</span></div>
+
+      <div class="rl">layers<br>{2,3}</div>
+      <div class="mc p1t0">P(pp1,tp0)<span class="dst">&rarr; D(pp0,tp0)</span></div>
+      <div class="mc p1t0">P(pp1,tp0)<span class="dst">&rarr; D(pp0,tp1)</span></div>
+      <div class="mc p1t1">P(pp1,tp1)<span class="dst">&rarr; D(pp0,tp2)</span></div>
+      <div class="mc p1t1">P(pp1,tp1)<span class="dst">&rarr; D(pp0,tp3)</span></div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>P worker (pp0,tp0)</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>P worker (pp0,tp1)</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--amber-soft);border-color:#e3c88a"></span>P worker (pp1,tp0)</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--violet-soft);border-color:#c3b0e0"></span>P worker (pp1,tp1)</div>
+    </div>
+    <div class="diagram-caption">
+      Each of the 8 boxes is one transfer (one NIXL read). Colour = source P
+      worker: each P worker's KV is split across two D workers (two columns),
+      because D's TP is finer on the Head axis. Reading <strong>down a
+      column</strong> is the PP axis (<code>meet<sub>L</sub></code>); reading
+      <strong>across a row</strong> is the TP axis (<code>meet<sub>H</sub></code>).
+      This grid <em>is</em> <span class="fileref">_read_blocks_for_req</span>:
+      the outer <code>for remote_pp_rank</code> loop walks the rows, the inner
+      <code>for spec in read_specs</code> loop walks the columns.
+    </div>
+  </div>
+
+  <div class="callout good">
+    <strong>This is the formal content of your intuition.</strong> &ldquo;Each
+    dimension is orthogonal and we can do one mapping after another&rdquo; is
+    precisely the statement that the meet <em>distributes over the product</em>.
+    Add a third orthogonal axis (say context parallel on the Block axis) and the
+    plan becomes <code>meet<sub>L</sub> &times; meet<sub>H</sub> &times;
+    meet<sub>B</sub></code> &mdash; one more nested loop, zero new mapping logic.
+  </div>
+
+  <h2 id="affine">5. Inside a cell: affine layouts</h2>
+
+  <p>
+    The meet tells you <em>which</em> P worker talks to <em>which</em> D worker.
+    It does not tell you the byte offsets. For that, each worker's local buffer
+    is described by a <strong>layout</strong>: a map from a logical coordinate to
+    a flat offset, built from a <em>shape</em> and a <em>stride</em> per axis &mdash;
+    exactly the CUTLASS / CuTe <code>Layout</code> object, whose defining
+    operation is <em>composition</em>.
+  </p>
+
+  <div class="eq">
+    offset(&#8467;, h, b, s) &nbsp;=&nbsp; stride<sub>L</sub>&middot;(&#8467; &minus; start<sub>L</sub>) + stride<sub>H</sub>&middot;(h &minus; start<sub>H</sub>) + stride<sub>B</sub>&middot;b + s
+  </div>
+
+  <p>
+    Each side's local buffer is an affine sub-map of the global layout (a base
+    offset plus per-axis strides), and a transfer reindexes one into the other:
+    <code>D_local = D_global&#8315;&#185; &compfn; P_global &compfn; P_local</code>.
+    Affine maps on integer lattices compose and invert cleanly &mdash; they form a
+    groupoid &mdash; which is why the messy-looking transforms in the connector are
+    actually closed under composition:
+  </p>
+
+  <ul>
+    <li><strong>Block-size ratio</strong> (<code>get_mapped_blocks</code>): a stride/scale on the Block axis &mdash; one logical block becomes <code>ratio</code> contiguous kernel blocks.</li>
+    <li><strong>Logical&rarr;physical kernel blocks</strong> (<code>_logical_to_remote_kernel_block_ids</code>): another Block-axis sub-lattice map, with a possibly <em>different</em> ratio per remote PP stage.</li>
+    <li><strong>Head-split offset</strong> (<code>rank_offset_factor</code>, head slots): the base offset on the Head axis selecting which sub-range of heads this D rank pulls.</li>
+    <li><strong>HND&harr;NHD permute</strong> (<code>enable_permute_local_kv</code>): a permutation of the stride vector &mdash; a relabeling layout, composable as a post-process.</li>
+  </ul>
+
+  <div class="callout info">
+    <strong>Why it matters for the abstraction.</strong> If a cell's address math
+    is &ldquo;an affine layout,&rdquo; then the per-axis meet only needs to emit,
+    for each cell, a tiny <code>(shape, stride, base)</code> triple on each side.
+    The transfer engine composes them generically &mdash; it never needs to know
+    that one axis was &ldquo;PP&rdquo; and another was &ldquo;TP.&rdquo;
+  </div>
+
+  <h2 id="replication">6. Where partitions break: replication (MLA / GQA)</h2>
+
+  <p>
+    A partition assumes each coordinate has <strong>exactly one</strong> owner.
+    Two important cases violate that:
+  </p>
+
+  <ul>
+    <li><strong>MLA</strong> replicates the (latent) KV cache across all TP ranks &mdash; every rank owns the whole Head axis.</li>
+    <li><strong>GQA</strong> with <code>num_kv_heads &lt; tp_size</code> replicates each KV head across several ranks.</li>
+  </ul>
+
+  <p>
+    A replicated axis is a <strong>covering</strong>, not a partition (cells
+    overlap). The fix is the same one DTensor uses: enrich the per-axis
+    placement vocabulary from &ldquo;always Shard&rdquo; to
+  </p>
+
+  <div class="eq" style="text-align:center">
+    Placement(axis) &nbsp;=&nbsp; Shard(into N) &nbsp;|&nbsp; Replicate
+  </div>
+
+  <p>
+    When an axis is <code>Replicate</code> on the source, the planner picks a
+    <strong>canonical owner</strong> (e.g. the first rank holding each head) so
+    the covering collapses back to a partition and the meet is well-defined
+    again. That canonicalization is exactly what the code does today:
+    <code>np.unique(&hellip;, return_index=True)</code> for GQA dedup, and the
+    single-read + notify-others path for MLA in
+    <span class="fileref">_read_blocks_for_req</span>. So the minimal extension
+    to &ldquo;just partitions&rdquo; is <code>Shard | Replicate</code> per axis &mdash;
+    nothing more exotic.
+  </p>
+
+  <div class="callout info">
+    <strong><code>Replicate</code> is directional.</strong> The phrase &ldquo;on
+    the source&rdquo; above is load-bearing: a <code>Replicate</code> axis means
+    opposite things depending on which side of the transfer it sits on.
+    <ul style="margin-bottom:0">
+      <li><strong>Source <code>Replicate</code> &rarr; dedup (pick one).</strong>
+      Every P rank holds an identical copy, so the meet's redundant owners
+      collapse to a single <em>canonical</em> holder &mdash; <em>fewer</em> reads.
+      This is the MLA single-read and the GQA <code>np.unique</code>.</li>
+      <li><strong>Destination <code>Replicate</code> &rarr; fan-out (give to
+      all).</strong> Every D rank needs its own full copy, so the one meet-cell
+      must be paired with <em>every</em> reader &mdash; <em>more</em> reads. This is
+      why the connector computes <code>compute_tp_mapping</code> <em>per local
+      rank</em>: each D rank independently re-issues the same read.</li>
+    </ul>
+    It is the same split DTensor draws between <code>Replicate&rarr;Shard</code>
+    (a local slice, no comms) and <code>Shard&rarr;Replicate</code> (an
+    all-gather/broadcast). In the owner-sequence model (&sect;10) a
+    <code>Replicate</code> placement is just <em>n identical sequences</em>, and
+    the planner reads them directionally:
+<pre><code>Replicate(size, n) = (range(size),) * n        # every rank holds the whole axis
+
+# axis_edges (§10) reads that directionally:
+#   SOURCE side: identical seqs -> keep ONE canonical rank   (dedup,   fewer reads)
+#   DEST   side: pair the data with EVERY rank that needs it (fan-out, more reads)</code></pre>
+    So a replicated axis needs no special case in the overlap itself &mdash; the
+    dedup-vs-fan-out asymmetry lives entirely in how <code>axis_edges</code>
+    enumerates source and destination ranks.
+  </div>
+
+  <div class="callout warn">
+    <strong>Hybrid models = a sum of products.</strong> Mamba/SSM groups index
+    the Block axis as <em>whole state</em>, not token-blocks, so their refinement
+    rule differs (you can't trim a partial prefix). The honest type is a
+    <em>coproduct over kv-cache groups</em>, <code>G = &Sigma;<sub>g</sub>
+    G<sub>g</sub></code>, each group its own product space with its own
+    per-axis placements. The connector's <code>source_ranks_per_group</code> and
+    <code>_group_spec_types</code> are this sum already.
+  </div>
+
+  <h2 id="mesh">7. The rank side is also a product: the mesh</h2>
+
+  <p>
+    The workers aren't a flat list; they're a grid. With PP and TP, worker
+    identity is the pair <code>(pp_rank, tp_rank)</code> &mdash; a coordinate in a
+    <code>PP &times; TP</code> <strong>device mesh</strong>, flattened to a linear
+    rank by mixed-radix encoding (<code>rank = pp_rank&middot;TP + tp_rank</code>,
+    or whatever the world ordering is). Heterogeneity is simply that the P-mesh
+    and D-mesh have different <em>extents</em>:
+  </p>
+
+  <div class="eq" style="text-align:center">
+    mesh<sub>P</sub> : 2 &times; 2 &nbsp;(PP=2, TP=2) &nbsp;&nbsp;&nbsp; mesh<sub>D</sub> : 1 &times; 4 &nbsp;(PP=1, TP=4)
+  </div>
+
+  <p>
+    The per-axis owner map answers &ldquo;given this meet-cell on axis
+    <code>X</code>, which P-mesh coordinate (along <code>X</code>) holds it?&rdquo;
+    Cross the per-axis answers and you get the full source/destination mesh
+    coordinates &mdash; the colored labels in the grid above. This is precisely
+    <code>DeviceMesh</code> (PyTorch) / <code>Mesh</code> (JAX): named axes with
+    extents, plus a rule to map mesh coordinates to ranks.
+  </p>
+
+  <h3 id="devicemesh">Mapping the abstraction onto <code>torch.DeviceMesh</code> / DTensor</h3>
+
+  <p>
+    The pieces line up one-to-one with PyTorch DTensor, which is worth making
+    explicit because it pins down <em>where</em> heterogeneity actually lives. A
+    <code>DeviceMesh</code> is the n-dimensional grid of ranks; its
+    <code>mesh_dim_names</code> are the parallel axes. A <code>DTensor</code>'s
+    <strong>placement list has one entry per <em>mesh</em> dim</strong> (this is a
+    hard DTensor rule: <code>len(placements) == device_mesh.ndim</code>), and each
+    entry &mdash; <code>Shard(tensor_dim)</code> or <code>Replicate()</code> &mdash;
+    says how the tensor is laid out <em>along that mesh dim</em>.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>The running example as two meshes + placements.</strong>
+<pre><code>from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard, Replicate
+
+# Rank grid: one mesh dim per parallel axis.
+mesh_P = init_device_mesh("cuda", (2, 2), mesh_dim_names=("pp", "tp"))   # 2×2 = 4 P ranks
+mesh_D = init_device_mesh("cuda", (1, 4), mesh_dim_names=("pp", "tp"))   # 1×4 = 4 D ranks
+
+# KV-cache logical tensor dims:  0 = layer,  1 = head,  2 = block, ...
+# One placement per MESH dim, in mesh-dim order (pp, tp):
+P_placements = [Shard(0), Shard(1)]      # pp-dim shards layers; tp-dim shards heads
+D_placements = [Shard(0), Shard(1)]      # SAME spec — only the mesh SHAPE differs
+D_placements_mla = [Shard(0), Replicate()]   # MLA: tp-dim replicates the head axis
+
+# The P→D KV transfer is conceptually a redistribute across the two meshes:
+kv = DTensor.from_local(local_kv, mesh_P, P_placements)   # what P holds
+kv.redistribute(mesh_D, D_placements)                     # what D needs   ← the NIXL reads</code></pre>
+  </div>
+
+  <div class="callout good">
+    <strong>Where heterogeneity lives.</strong> When P and D use the
+    <em>same strategy</em> (shard layers by PP, heads by TP), the placement lists
+    are <strong>byte-for-byte identical</strong> &mdash; <code>[Shard(0),
+    Shard(1)]</code> on both sides. The only difference is the mesh
+    <em>extents</em>: <code>(2,2)</code> vs <code>(1,4)</code>. So
+    &ldquo;heterogeneous PP/TP&rdquo; is precisely <code>mesh_P.shape &ne;
+    mesh_D.shape</code>, and the transfer plan is whatever
+    <code>redistribute</code> would compute &mdash; which, for orthogonal mesh
+    dims, is exactly the per-axis meet-product of &sect;4.
+  </div>
+
+  <table>
+    <thead><tr><th>This note's abstraction</th><th>DTensor / DeviceMesh</th></tr></thead>
+    <tbody>
+      <tr><td><code>Axis</code> (layer, head, &hellip;)</td><td>a (<code>mesh_dim_name</code>, sharded tensor-dim) pairing</td></tr>
+      <tr><td>per-axis <code>Placement</code> (<code>Shard(n)</code> / <code>Replicate</code>)</td><td>one entry of the <code>placements</code> list (indexed by mesh dim)</td></tr>
+      <tr><td>owner-sequence per rank (the <code>Placement</code>)</td><td><code>Shard(d)</code> splitting tensor-dim <code>d</code> over a size-<code>n</code> mesh dim (<code>torch.chunk</code> semantics)</td></tr>
+      <tr><td><code>axis_edges</code> src/dst rank</td><td>the coordinate along that mesh dim (<code>mesh.get_coordinate()[dim]</code>)</td></tr>
+      <tr><td>full src/dst rank = product of per-axis edges</td><td>the global rank stored at <code>mesh.mesh[pp_coord, tp_coord]</code> (mixed-radix)</td></tr>
+      <tr><td>sequence position (the run's <code>src_slot</code>/<code>dst_slot</code>)</td><td>local-shard offset on that dim (<code>global_coord &minus; shard_start</code>)</td></tr>
+      <tr><td><code>plan_transfer</code> (the meet-product)</td><td>the resharding plan inside <code>redistribute()</code></td></tr>
+      <tr><td>heterogeneous PP/TP between P and D</td><td><code>mesh_P.shape &ne; mesh_D.shape</code> (often identical placements)</td></tr>
+      <tr><td>MLA / GQA replication + canonical-owner dedup</td><td><code>Replicate()</code> on the tp mesh dim (read from any one holder)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Where the analogy stops (and why NIXL exists).</strong>
+    <code>DTensor.redistribute</code> operates <em>within a single
+    <code>DeviceMesh</code></em> &mdash; one process group, collectives over NCCL,
+    and the source and target placements share the same ranks. P/D
+    disaggregation has <strong>two separate worlds</strong> (the prefill cluster
+    and the decode cluster) with disjoint rank spaces, bridged by NIXL RDMA
+    rather than NCCL. So you can't literally call <code>.redistribute()</code>
+    across them; NIXL is the cross-mesh transport DTensor lacks. What transfers
+    cleanly is the <em>vocabulary and the algebra</em>: describe each side as
+    <code>(mesh, placements)</code>, and the read plan is the cross-mesh
+    generalization of redistribute &mdash; the per-axis meet-product. (Caveat:
+    DTensor's <code>Shard</code> uses <code>torch.chunk</code>, so an indivisible
+    axis gets an uneven last shard; the connector's contiguous-range splits
+    assume divisibility, which vLLM's configs enforce.)
+  </div>
+
+  <h2 id="prior-art">8. Prior art: the objects already have implementations</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>PyTorch DTensor</h3>
+      <p style="font-size:0.9em">
+        <code>DeviceMesh</code> (named axes + extents) and a per-<em>mesh</em>-dim
+        <code>Placement</code> list of <code>Shard(dim)</code> /
+        <code>Replicate()</code>. <code>redistribute(placement&rarr;placement)</code>
+        is exactly a heterogeneous reshard. Closest match to the
+        <code>Shard | Replicate</code> vocabulary you need for MLA/GQA &mdash; see
+        <a href="#devicemesh">&sect;7's concrete mapping</a> for the full
+        correspondence.
+      </p>
+    </div>
+    <div class="box">
+      <h3>JAX / GSPMD</h3>
+      <p style="font-size:0.9em">
+        <code>Mesh</code> + <code>PartitionSpec</code> (which mesh axis each
+        tensor dim maps to). The SPMD partitioner solves general resharding and
+        <em>decomposes it per mesh axis</em> &mdash; the production-grade version of
+        &ldquo;the meet distributes over the product.&rdquo;
+      </p>
+    </div>
+    <div class="box">
+      <h3>CUTLASS / CuTe</h3>
+      <p style="font-size:0.9em">
+        <code>Layout</code> = shape &times; stride, hierarchical and composable;
+        <em>composition</em> is the primitive operation. This is the right object
+        for the within-cell affine address math (block-size ratio, head-split
+        offset, HND/NHD permute) &mdash; &ldquo;do one mapping after another&rdquo;
+        as literal function composition.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="code-map">9. Mapping to the current NIXL code</h2>
+
+  <table>
+    <thead><tr><th>Code today (commit <code>b2da7722d</code>)</th><th>Mathematical object</th></tr></thead>
+    <tbody>
+      <tr><td><code>PPLayerMap</code> + contiguity/coverage check</td><td>Layer-axis partition + partition-validity proof</td></tr>
+      <tr><td><code>_local_region_indices_for_layer_names</code></td><td>Layer-axis correspondence (match by global coordinate, via name)</td></tr>
+      <tr><td><code>compute_tp_mapping</code> / <code>TPMapping</code></td><td>Head-axis meet + per-cell owner map</td></tr>
+      <tr><td><code>rank_offset_factor</code>, head slots</td><td>affine <code>base</code> offset on the Head axis (the layout)</td></tr>
+      <tr><td><code>get_mapped_blocks</code>, <code>physical_blocks_per_logical</code></td><td>Block-axis affine sub-lattice refinement</td></tr>
+      <tr><td><code>np.unique</code> GQA dedup; MLA single-read + notify</td><td>canonical-owner pick for a <code>Replicate</code> axis</td></tr>
+      <tr><td><code>source_ranks_per_group</code>, <code>_group_spec_types</code></td><td>coproduct over kv-cache groups (sum of products)</td></tr>
+      <tr><td><code>tp_mappings[(engine_id, pp_rank)]</code></td><td>per-row instance of the Head meet (one per Layer cell)</td></tr>
+      <tr><td>nested loop in <code>_read_blocks_for_req</code></td><td>enumeration of the product meet <code>meet<sub>L</sub> &times; meet<sub>H</sub></code></td></tr>
+      <tr><td>rank tuple <code>(pp_rank, tp_rank)</code></td><td>mixed-radix coordinate in the device mesh</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="proposal">10. Proposed abstraction: ordered-sequence <code>Placement</code> + <code>plan_transfer</code></h2>
+
+  <p>
+    The objects above suggest one interface, and &sect;5 pins the representation:
+    describe each side's placement on an axis as <strong>each rank's
+    owner-sequence, in local-buffer order</strong>. A global index's
+    <em>membership</em> in a sequence is the partition (who holds it); its
+    <em>position</em> is the local slot (the layout). One object answers both &mdash;
+    so there is no separate <code>owner</code>/<code>local_layout</code> method,
+    no interval arithmetic, and no per-axis <code>LayerAxis</code>/<code>HeadAxis</code>
+    class. An <code>Axis</code> is just metadata; the planner is dimension-agnostic.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>The whole interface.</strong>
+<pre><code># Placement = each rank's owner-sequence, in LOCAL BUFFER ORDER.
+#   membership = the partition        |        position = the local slot
+Placement = tuple[Sequence[int], ...]            # owners[r] = global indices rank r holds
+
+def Shard(size, n):     return tuple(range(i*size//n, (i+1)*size//n) for i in range(n))  # range = compact
+def Replicate(size, n): return (range(size),) * n                                         # n identical seqs
+#   blocks / permuted / strided: pass explicit lists instead of ranges — same interface.
+
+@dataclass
+class Axis:                  # just metadata now — no per-axis cells/owner/layout
+    name: str                # "layer" | "head" | "block" | ...
+    size: int
+
+@dataclass
+class Side:                  # one engine: mesh extents + an owner-sequence Placement per axis
+    mesh:  tuple[int, ...]   # extents per axis, in AXES order   (pp, tp)
+    place: dict[str, Placement]
+
+def meet_edge(src_seq, dst_seq):        # the ONLY core op: membership + slot in one pass
+    dst_slot = {e: j for j, e in enumerate(dst_seq)}
+    pairs    = [(i, dst_slot[e]) for i, e in enumerate(src_seq) if e in dst_slot]
+    return runs(pairs)                  # maximal (src_slot, dst_slot, len) where BOTH step by 1
+
+def axis_edges(P_place, D_place):       # per axis: (src_rank, dst_rank, runs) for overlapping pairs
+    seen, edges = {}, []
+    for dr, d in enumerate(D_place):    # destination fan-out: every reader that needs data
+        for sr, s in enumerate(P_place):
+            r = meet_edge(s, d)
+            if not r: continue
+            if (dr, tuple(s)) in seen: continue   # source dedup: identical replica already covers dr
+            seen[(dr, tuple(s))] = sr
+            edges.append((sr, dr, r))
+    return edges
+
+def plan_transfer(axes, P: Side, D: Side):
+    per_axis = [axis_edges(P.place[ax.name], D.place[ax.name]) for ax in axes]
+    for combo in itertools.product(*per_axis):           # one edge per axis == the nested loop
+        src = mesh_rank(P, [e[0] for e in combo])         # e = (src_rank, dst_rank, runs)
+        dst = mesh_rank(D, [e[1] for e in combo])
+        yield Read(src, dst, region=[e[2] for e in combo])  # product of per-axis runs = a descriptor box</code></pre>
+  </div>
+
+  <p>
+    <code>axis_edges</code> bakes in the directional <code>Replicate</code> of
+    &sect;6 for free: the outer loop over destination ranks <em>fans out</em>, and
+    the <code>seen</code> guard <em>dedups</em> identical source replicas to one
+    canonical holder. (<code>runs</code> and <code>mesh_rank</code> are spelled
+    out under &ldquo;Building the plan&rdquo; below.)
+  </p>
+
+  <p>The mechanical equivalences to today's code:</p>
+
+  <ul>
+    <li>layer owner-sequences (a <code>range</code> per PP rank) &rarr; replace <code>PPLayerMap</code> + the layer-name matching (which <em>is</em> <code>list.index(name)</code>).</li>
+    <li>head owner-sequences (<code>Shard</code> or <code>Replicate</code>) &rarr; replace all three branches of <code>compute_tp_mapping</code> plus the GQA/MLA dedup.</li>
+    <li>block-id sequences (explicit <code>list</code>s) &rarr; absorb <code>block_size_ratio</code> and <code>physical_blocks_per_logical</code> as the list contents.</li>
+    <li><code>plan_transfer</code>'s <code>itertools.product</code> &rarr; <em>is</em> the nested loop in <code>_read_blocks_for_req</code>; each <code>meet_edge</code> run &rarr; one NIXL descriptor.</li>
+  </ul>
+
+  <h3 id="concrete-pp-tp">Concrete instantiation &mdash; PP and TP on the running example</h3>
+
+  <p>
+    Same numbers as the grid in &sect;4: <strong>4 layers</strong>,
+    <strong>4 KV heads</strong>; <code>P</code> is <code>PP=2, TP=2</code>
+    (mesh 2&times;2), <code>D</code> is <code>PP=1, TP=4</code> (mesh 1&times;4).
+    There are no axis classes to write &mdash; the axes are metadata, and the
+    placements are owner-sequences the <code>Shard</code> constructor builds:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>The two axes and both sides' placements.</strong>
+<pre><code>AXES = [Axis("layer", 4), Axis("head", 4)]
+
+# layer axis (PP)                          # head axis (TP)
+P.place["layer"] = Shard(4, 2)             P.place["head"] = Shard(4, 2)
+   = (range(0,2), range(2,4))                 = (range(0,2), range(2,4))
+     pp0:{0,1}   pp1:{2,3}                       tp0:{0,1}   tp1:{2,3}
+
+D.place["layer"] = Shard(4, 1)             D.place["head"] = Shard(4, 4)
+   = (range(0,4),)                            = (range(0,1),range(1,2),range(2,3),range(3,4))
+     pp0:{0,1,2,3}                              tp0:{0} tp1:{1} tp2:{2} tp3:{3}</code></pre>
+  </div>
+
+  <p>
+    Reading a slot off a sequence is the whole layout story &mdash; no
+    <code>base</code>/<code>stride</code> object. On the head axis, P's tp0 holds
+    <code>range(0,2)=[0,1]</code>; the slot of head 1 is <code>[0,1].index(1)=1</code>,
+    and that &ldquo;1&rdquo; is exactly NIXL's <code>rank_offset_factor</code>. On
+    the layer axis, D's pp0 holds <code>range(0,4)=[0,1,2,3]</code>; the slot of
+    layer 2 is <code>index(2)=2</code>, exactly the layer-region base
+    <code>_local_region_indices_for_layer_names</code> computes. Because a cell is
+    a <code>range</code>, <code>.index(e) == e &minus; start</code> &mdash; O(1), no
+    materialization.
+  </p>
+
+  <h3 id="three-branches-one-axis">The three TP branches are one head placement</h3>
+
+  <p>
+    The claim from &sect;3 &mdash; that <code>compute_tp_mapping</code>'s three
+    branches (<code>D_TP &ge; P_TP</code>, <code>P_TP &gt; D_TP</code>, MLA) are
+    just the Head-axis edges for three placement shapes &mdash; is worth seeing
+    concretely. Hold PP fixed (it's orthogonal) and run <code>axis_edges</code>
+    on the head placements for 8 KV heads (to make the splits visible), shown
+    here as explicit owner-lists. The code is identical every time; only the two
+    head <code>Placement</code>s change.
+  </p>
+
+  <div class="callout info">
+    <strong>Reading the tables.</strong> Each row is one
+    <code>(P rank &rarr; D rank)</code> edge &mdash; the output of
+    <code>meet_edge(src_seq, dst_seq)</code> for that pair:
+    <ul style="margin-bottom:0">
+      <li><strong>shared</strong> &mdash; the global heads both ranks hold (<em>what</em> moves): <code>set(src_seq) &cap; set(dst_seq)</code>.</li>
+      <li><strong>src slots</strong> &mdash; <em>where</em> those heads sit in the <strong>source</strong> rank's local buffer: <code>src_seq.index(e)</code>.</li>
+      <li><strong>dst slots</strong> &mdash; where they sit in the <strong>destination</strong> rank's buffer: <code>dst_seq.index(e)</code>.</li>
+      <li><strong>run</strong> &mdash; those slot pairs collapsed into one contiguous descriptor <code>(src_slot&rarr;dst_slot &times;len)</code>: copy <code>len</code> contiguous slots from <code>src_slot</code> on the source into <code>dst_slot</code> on the destination.</li>
+    </ul>
+    <em>Example &mdash; Case 1's <code>P0 &rarr; D1</code>, with <code>P0=[0,1,2,3]</code>,
+    <code>D1=[2,3]</code>:</em> shared <code>{2,3}</code>; src slots
+    <code>[0,1,2,3].index(2,3)=2,3</code>; dst slots <code>[2,3].index(2,3)=0,1</code>;
+    pairs <code>(2,0),(3,1)</code> step together &rarr; one run <code>(2&rarr;0 &times;2)</code>
+    = &ldquo;send P0's slots 2&ndash;3 into D1's slots 0&ndash;1 as one 2-element copy.&rdquo;
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Case 1 &mdash; <code>D_TP &ge; P_TP</code> (D finer): <code>P=Shard(8,2)</code>, <code>D=Shard(8,4)</code>.</strong>
+<pre><code>P = ([0,1,2,3], [4,5,6,7])                   # P0           P1
+D = ([0,1], [2,3], [4,5], [6,7])             # D0    D1     D2     D3</code></pre>
+    <table>
+      <thead><tr><th>edge (src,dst)</th><th>shared</th><th>src slots</th><th>dst slots</th><th>run</th></tr></thead>
+      <tbody>
+        <tr><td>P0 &rarr; D0</td><td>{0,1}</td><td>0,1</td><td>0,1</td><td>(0&rarr;0 &times;2)</td></tr>
+        <tr><td>P0 &rarr; D1</td><td>{2,3}</td><td><code>index(2,3)=</code>2,3</td><td>0,1</td><td>(2&rarr;0 &times;2)</td></tr>
+        <tr><td>P1 &rarr; D2</td><td>{4,5}</td><td><code>index(4,5)=</code>0,1</td><td>0,1</td><td>(0&rarr;0 &times;2)</td></tr>
+        <tr><td>P1 &rarr; D3</td><td>{6,7}</td><td>2,3</td><td>0,1</td><td>(2&rarr;0 &times;2)</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.86em;margin-bottom:0">
+      One source per reader; the offset is on the <strong>source</strong>
+      (<code>src_slot</code> &isin; {0,2}). Reproduces
+      <code>attn_ranks=[j&middot;P_TP//D_TP]</code> (single owner) and
+      <code>rank_offset_factor</code> = <code>src_slot / len</code> &mdash; D3:
+      <code>2/2 = 1</code>, matching <code>3 % (4//2)=1</code>.
+    </p>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Case 2 &mdash; <code>P_TP &gt; D_TP</code> (P finer): <code>P=Shard(8,4)</code>, <code>D=Shard(8,2)</code>.</strong>
+<pre><code>P = ([0,1], [2,3], [4,5], [6,7])             # P0    P1     P2     P3
+D = ([0,1,2,3], [4,5,6,7])                   # D0           D1</code></pre>
+    <table>
+      <thead><tr><th>edge (src,dst)</th><th>shared</th><th>src slots</th><th>dst slots</th><th>run</th></tr></thead>
+      <tbody>
+        <tr><td>P0 &rarr; D0</td><td>{0,1}</td><td>0,1</td><td>0,1</td><td>(0&rarr;0 &times;2)</td></tr>
+        <tr><td>P1 &rarr; D0</td><td>{2,3}</td><td>0,1</td><td><code>index(2,3)=</code>2,3</td><td>(0&rarr;2 &times;2)</td></tr>
+        <tr><td>P2 &rarr; D1</td><td>{4,5}</td><td>0,1</td><td>0,1</td><td>(0&rarr;0 &times;2)</td></tr>
+        <tr><td>P3 &rarr; D1</td><td>{6,7}</td><td>0,1</td><td>2,3</td><td>(0&rarr;2 &times;2)</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.86em;margin-bottom:0">
+      D0 pulls from <strong>two</strong> sources (P0, P1), each contributed whole
+      (<code>src_slot=0</code>); the offset <strong>moved to the destination</strong>
+      (<code>dst_slot</code> &isin; {0,2}). Reproduces <code>attn_ranks=[P0,P1]</code>,
+      <code>rank_offset_factor=0</code>; the <code>dst_slot</code>s are the reader's
+      split-buffer chunks (<code>src_xfer_handles_by_shard_tp_ratio[...][i]</code>).
+    </p>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Case 3 &mdash; MLA: <code>P=Replicate(8,2)</code>, <code>D=Replicate(8,4)</code>.</strong>
+<pre><code>P = ([0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7])   # P0,P1 hold identical latent
+D = ([0,1,2,3,4,5,6,7],) * 4                  # D0..D3 each need the whole latent</code></pre>
+    <table>
+      <thead><tr><th>edge (src,dst)</th><th>shared</th><th>run</th><th>note</th></tr></thead>
+      <tbody>
+        <tr><td>P0 &rarr; D0</td><td>{0..7}</td><td>(0&rarr;0 &times;8)</td><td>dedup skips P1 (identical seq)</td></tr>
+        <tr><td>P0 &rarr; D1</td><td>{0..7}</td><td>(0&rarr;0 &times;8)</td><td>fan-out: new dst rank</td></tr>
+        <tr><td>P0 &rarr; D2</td><td>{0..7}</td><td>(0&rarr;0 &times;8)</td><td>fan-out</td></tr>
+        <tr><td>P0 &rarr; D3</td><td>{0..7}</td><td>(0&rarr;0 &times;8)</td><td>fan-out</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.86em;margin-bottom:0">
+      <strong>Source Replicate</strong>: the <code>seen</code> guard keeps one
+      canonical P rank per reader (the un-read replica is just notified).
+      <strong>Destination Replicate</strong>: the outer loop fans the whole-latent
+      run out to <em>every</em> D rank. One contiguous read per reader,
+      <code>src_slot=0</code>, no head-split &mdash; reproducing the MLA branch.
+      <em>(Picking <code>P0</code> for all is the simplest dedup policy; the
+      connector load-spreads via <code>j&middot;P_TP//D_TP</code> &rarr; P0,P0,P1,P1.
+      Any replica is correct.)</em>
+    </p>
+  </div>
+
+  <div class="callout good">
+    <strong>One axis, three branches.</strong> Same <code>axis_edges</code> &rarr;
+    <code>meet_edge</code> &rarr; <code>runs</code> every time &mdash; only the
+    placement sequences differ. The branches in <code>compute_tp_mapping</code>
+    exist only because it computes the edges' <em>output</em> by hand per shape,
+    instead of overlaying the two sequences. The offset asymmetry (source vs
+    destination) is just <em>which side's sequence the shared elements sit deeper
+    into</em>: <code>src_slot&gt;0</code> when D is finer, <code>dst_slot&gt;0</code>
+    when P is finer.
+  </div>
+
+  <h3 id="build-plan">Building the plan: from <code>Placement</code> + <code>Axis</code> to reads</h3>
+
+  <p>
+    Now the glue. Each engine is described by a <strong>spec</strong>: its mesh
+    extents plus an owner-sequence <code>Placement</code> per axis. That spec is
+    the <em>entire</em> input &mdash; building the plan is constructing the two
+    <code>Side</code>s and calling <code>plan_transfer</code>. Here are its two
+    remaining helpers (<code>runs</code>, <code>mesh_rank</code>) and the example's
+    specs, with every intermediate value the call produces:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Constructing the specs and calling the driver.</strong>
+<pre><code>def runs(pairs):                     # collapse (src_slot,dst_slot) into contiguous runs
+    out = []
+    for s, d in pairs:
+        last = out[-1] if out else None
+        if last and s == last[0]+last[2] and d == last[1]+last[2]:
+            out[-1] = (last[0], last[1], last[2]+1)              # extend the run by 1
+        else:
+            out.append((s, d, 1))                                # start a new run
+    return out
+
+def mesh_rank(side, coords):         # mixed-radix flatten of per-axis coords -> global rank
+    r = 0
+    for extent, c in zip(side.mesh, coords):
+        r = r * extent + c
+    return r
+
+# 1. Axes are metadata; each side = mesh extents + an owner-sequence per axis.
+AXES = [Axis("layer", 4), Axis("head", 4)]
+P = Side(mesh=(2, 2), place={"layer": Shard(4,2), "head": Shard(4,2)})   # PP=2, TP=2
+D = Side(mesh=(1, 4), place={"layer": Shard(4,1), "head": Shard(4,4)})   # PP=1, TP=4
+
+# 2. That is the entire input. Build the plan:
+reads = list(plan_transfer(AXES, P, D))        # -> 8 Reads
+
+# Inside, traced for read #6 (layer edge Lb, head edge H1):
+#   axis_edges(layer): (pp0,pp0,[(0,0,2)]) , (pp1,pp0,[(0,2,2)])             <- meet_edge per pair
+#   axis_edges(head) : (tp0,tp0,[(0,0,1)]),(tp0,tp1,[(1,0,1)]),(tp1,tp2,[(0,0,1)]),(tp1,tp3,[(1,0,1)])
+#   product          : 2 × 4 = 8 reads                                       <- itertools.product
+#   #6 = ( layer (pp1,pp0,[(0,2,2)]) , head (tp0,tp1,[(1,0,1)]) )
+#   src = mesh_rank(P,[1,0]) = 1*2+0 = 2     dst = mesh_rank(D,[0,1]) = 0*4+1 = 1
+#   region = [ layer (0->2 ×2) , head (1->0 ×1) ]    # a 2-layer × 1-head box</code></pre>
+  </div>
+
+  <ol class="steps">
+    <li><strong>Per-axis edges.</strong> <code>axis_edges</code> overlays the two sides' owner-sequences, emitting <code>(src_rank, dst_rank, runs)</code> for every overlapping pair. <em>This is the only place sequences are compared.</em></li>
+    <li><strong>Product = reads.</strong> <code>itertools.product</code> over the per-axis edge lists picks one edge per axis &mdash; <code>2&times;4 = 8</code> reads, the &sect;4 factorization mechanized.</li>
+    <li><strong>Ranks.</strong> <code>mesh_rank</code> mixed-radix-flattens the per-axis <code>src_rank</code>s (and <code>dst_rank</code>s) into a global source and destination rank on each mesh.</li>
+    <li><strong>Region.</strong> The read's region is the product of the per-axis runs &mdash; a multi-dim contiguous box; each run's <code>len</code> is a descriptor extent the transport composes (&sect;5).</li>
+  </ol>
+
+  <p>
+    Running that over all 8 reads produces exactly the grid's boxes &mdash; now
+    with the ranks and the per-axis runs each edge carried:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Output of <code>plan_transfer</code> &mdash; 8 reads (src colour matches the &sect;4 grid)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>src (pp,tp)</th><th>dst (pp,tp)</th>
+          <th>layer run<br>(s&rarr;d &times;len)</th><th>head run<br>(s&rarr;d &times;len)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td class="p0t0"><code>(pp0,tp0)</code></td><td><code>(pp0,tp0)</code></td><td><code>(0&rarr;0 &times;2)</code></td><td><code>(0&rarr;0 &times;1)</code></td></tr>
+        <tr><td>2</td><td class="p0t0"><code>(pp0,tp0)</code></td><td><code>(pp0,tp1)</code></td><td><code>(0&rarr;0 &times;2)</code></td><td><code>(1&rarr;0 &times;1)</code></td></tr>
+        <tr><td>3</td><td class="p0t1"><code>(pp0,tp1)</code></td><td><code>(pp0,tp2)</code></td><td><code>(0&rarr;0 &times;2)</code></td><td><code>(0&rarr;0 &times;1)</code></td></tr>
+        <tr><td>4</td><td class="p0t1"><code>(pp0,tp1)</code></td><td><code>(pp0,tp3)</code></td><td><code>(0&rarr;0 &times;2)</code></td><td><code>(1&rarr;0 &times;1)</code></td></tr>
+        <tr><td>5</td><td class="p1t0"><code>(pp1,tp0)</code></td><td><code>(pp0,tp0)</code></td><td><code>(0&rarr;2 &times;2)</code></td><td><code>(0&rarr;0 &times;1)</code></td></tr>
+        <tr><td>6</td><td class="p1t0"><code>(pp1,tp0)</code></td><td><code>(pp0,tp1)</code></td><td><code>(0&rarr;2 &times;2)</code></td><td><code>(1&rarr;0 &times;1)</code></td></tr>
+        <tr><td>7</td><td class="p1t1"><code>(pp1,tp1)</code></td><td><code>(pp0,tp2)</code></td><td><code>(0&rarr;2 &times;2)</code></td><td><code>(0&rarr;0 &times;1)</code></td></tr>
+        <tr><td>8</td><td class="p1t1"><code>(pp1,tp1)</code></td><td><code>(pp0,tp3)</code></td><td><code>(0&rarr;2 &times;2)</code></td><td><code>(1&rarr;0 &times;1)</code></td></tr>
+      </tbody>
+    </table>
+    <div class="diagram-caption">
+      Each run is <code>(src_slot &rarr; dst_slot &times; len)</code> = one
+      contiguous descriptor. Two patterns: the <strong>head <code>src_slot</code>
+      alternates <code>0, 1</code></strong> down each colour-pair &mdash; the TP
+      head-split (<code>rank_offset_factor</code>) picking which of the P rank's two
+      heads to read. The <strong>layer <code>dst_slot</code> jumps to <code>2</code></strong>
+      for the bottom four rows &mdash; the PP collapse: D's single pp0 stores all 4
+      layers, so layers {2,3} land at dst slot 2. The <code>&times;2</code> on the
+      layer run is the contiguous extent folded out for free; each axis contributed
+      its run independently and the read is their product.
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>One read end-to-end &mdash; #6, from sequences alone.</strong>
+    Layer edge <code>Lb</code> &times; head edge <code>H1</code>:
+    <ul style="margin-bottom:0">
+      <li><strong>Layer:</strong> P pp1 = <code>range(2,4)=[2,3]</code>, D pp0 = <code>range(0,4)=[0,1,2,3]</code>. <code>meet_edge</code> &rarr; shared {2,3}, src slots <code>index(2,3)=0,1</code>, dst slots <code>index(2,3)=2,3</code> &rarr; run <code>(0&rarr;2 &times;2)</code>. Ranks <code>(src pp1, dst pp0)</code>.</li>
+      <li><strong>Head:</strong> P tp0 = <code>range(0,2)=[0,1]</code>, D tp1 = <code>range(1,2)=[1]</code>. <code>meet_edge</code> &rarr; head 1, src slot <code>[0,1].index(1)=1</code>, dst slot <code>0</code> &rarr; run <code>(1&rarr;0 &times;1)</code>. Ranks <code>(src tp0, dst tp1)</code>.</li>
+      <li><strong>Ranks:</strong> <code>src = mesh_rank(P,[1,0]) = 1*2+0 = 2</code>; <code>dst = mesh_rank(D,[0,1]) = 0*4+1 = 1</code>.</li>
+      <li><strong>Region:</strong> product of the runs &mdash; a <code>2-layer &times; 1-head</code> box, copied from rank 2 (layer slots 0&ndash;1, head slot 1) into rank 1 (layer slots 2&ndash;3, head slot 0).</li>
+    </ul>
+  </div>
+
+  <div class="callout info">
+    <strong>MLA variant in one line.</strong> Swap both head placements to
+    <code>Replicate(4, &middot;)</code>: every head sequence becomes
+    <code>range(0,4)</code>, so each head edge is one whole-head run
+    <code>(0&rarr;0 &times;4)</code> &mdash; no head-split. <code>axis_edges</code>
+    dedups the redundant P replica (source) and fans out to every D rank
+    (destination, &sect;6), reproducing NIXL's &ldquo;single read, notify the
+    rest&rdquo; MLA path with no new branch &mdash; the 8 reads stay, but each is one
+    contiguous whole-latent copy instead of a head-slice.
+  </div>
+
+  <h3 id="sequences">Representation note: <code>range</code> for the regular case, <code>list</code> for the rest</h3>
+
+  <p>
+    Owner-sequences carried the whole section; the one per-axis decision left is
+    whether a rank's sequence is a <code>range</code> or an explicit
+    <code>list</code>. They share the sequence interface (<code>in</code>,
+    <code>index</code>, <code>len</code>, slicing), so <code>meet_edge</code> /
+    <code>axis_edges</code> are written once. <code>range</code> just makes the
+    slot lookup O(1) &mdash; <code>range(start,&hellip;).index(e) == e &minus; start</code>,
+    which <em>is</em> the <code>rank_offset_factor</code> the interval code
+    computes by hand:
+  </p>
+
+  <table>
+    <thead><tr><th>Axis</th><th>owner-sequence representation</th><th><code>.index(e)</code></th><th>covers</th></tr></thead>
+    <tbody>
+      <tr><td>Head, contiguous Layer shards</td><td><code>range(start, stop)</code> &mdash; O(1)</td><td><code>e &minus; start</code> (= <code>rank_offset_factor</code>)</td><td>the regular PP/TP case</td></tr>
+      <tr><td>Block ids, permuted / strided, GQA-replicated</td><td>explicit <code>list</code></td><td>inverse-dict lookup</td><td>blocks, HND&harr;NHD permute, replication</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>Why a sequence &mdash; not a set, not an interval.</strong> An
+    <em>interval</em> expresses only contiguous shards. A <em>set</em> gives
+    membership but drops order, forcing a separate layout to recover offsets. A
+    <em>sequence</em> keeps order, so one object is both the partition
+    (membership) and the layout (position) &mdash; and degrades gracefully to an
+    explicit <code>list</code> for blocks, permutations, and striding that
+    intervals can't express. It's also what the connector already stores:
+    <code>local_block_ids</code>/<code>remote_block_ids</code> are
+    <strong>lists</strong> zipped positionally, and
+    <code>_local_region_indices_for_layer_names</code> is literally
+    <code>list.index(name)</code> &mdash; the interval <code>base</code>/<code>stride</code>
+    is just the O(1) <code>range</code> encoding of those lists.
+  </div>
+
+  <div class="callout good">
+    <strong>Litmus test for the abstraction.</strong> Adding context/sequence
+    parallel should be: supply that axis's <strong>owner-sequences</strong> (a
+    <code>range</code> for a contiguous shard, an explicit <code>list</code>
+    otherwise) and register the axis. <em>Zero</em> changes to
+    <code>plan_transfer</code>, <code>meet_edge</code>, or the transport &mdash; no
+    new <code>owner</code>/<code>layout</code> method, no <code>Shard | Replicate</code>
+    branch. If a new parallel dimension forces an edit to the planner, the axis
+    abstraction has leaked &mdash; the per-axis meet + product structure is the
+    invariant to protect.
+  </div>
+
+  <div class="divider"></div>
+
+  <p class="subtitle">
+    See also: <a href="PARALLELISM.html">PARALLELISM.html</a> for the concrete
+    per-transport mechanisms (head-splitting, GQA dedup, MLA replication, Mamba's
+    three projections), <a href="NIXL.html">NIXL.html</a> for the handshake and
+    read path this models, and
+    <a href="../KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT.html</a> for
+    why the Block axis carries a kernel-imposed alignment stride.
+  </p>
+</main>
+</body>
+</html>

@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PR #44560 - Async Remote KV Load Reservations</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../kv_cache/index.html">&larr; learnings</a> &nbsp;|&nbsp;
+    source: <a href="https://github.com/vllm-project/vllm/pull/44560">vllm-project/vllm#44560</a>
+    &nbsp;|&nbsp; compared with:
+    <a href="https://github.com/vllm-project/vllm/pull/40968">#40968</a>
+    &nbsp;|&nbsp; author: njhill &nbsp;|&nbsp; opened 2026-06-04
+  </div>
+
+  <h1>PR #44560 - Async Remote KV Load Reservations</h1>
+  <p class="subtitle">
+    How the scheduler avoids the case where two requests both async-load remote
+    KV blocks, each parks a prefix in GPU memory, and then neither has enough
+    remaining blocks to finish prefill.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      PR #44560 fixes the wedge by making async remote KV-load admission
+      reserve capacity for already in-flight prefills. When request A is already
+      loading or chunk-prefilling, the scheduler computes how many more KV blocks
+      A still needs to hold its full prompt. A new async KV load for request B is
+      allowed to allocate its loaded-prefix blocks only from
+      <code>free_blocks - reserved_for_A</code>. If B would consume A's reserved
+      space, B stays <code>WAITING</code> and holds no blocks. That is the key:
+      B cannot block A, so at least A can finish prefill and make forward
+      progress. Compared with PR #40968, this is a prevention strategy rather
+      than a repair strategy: #40968 lets the wedge form and then laterally
+      preempts a non-running block holder; #44560 denies the risky async-load
+      admission up front.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#bug">The blocking pattern</a></li>
+      <li><a href="#before">Before #44560</a></li>
+      <li><a href="#change">What #44560 changes</a></li>
+      <li><a href="#walkthrough">Two-request walkthrough</a></li>
+      <li><a href="#compare-40968">Comparison with #40968</a></li>
+      <li><a href="#pessimistic">Is the policy pessimistic?</a></li>
+      <li><a href="#tests">Tests added by the PR</a></li>
+      <li><a href="#takeaways">Takeaways</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="bug">The blocking pattern</h2>
+
+  <p>
+    The dangerous state appears with async KV connector loads, usually in
+    P/D-style flows. The request has a remote prefix-cache hit, so vLLM allocates
+    KV blocks for the externally computed prefix and marks the request
+    <code>WAITING_FOR_REMOTE_KVS</code>. While the transfer is in flight, the
+    request is not running a forward pass, but its allocated blocks are already
+    unavailable to everyone else.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Request A</h3>
+      <p>
+        A async-loads remote KV for a prefix. It holds those prefix blocks while
+        waiting for the receive to complete. Later, it still needs extra blocks
+        for the rest of its prefill.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Request B</h3>
+      <p>
+        B also async-loads remote KV and parks its own prefix blocks. If the pool
+        cannot fit A's and B's full sequences together, B can consume the exact
+        capacity A needed to continue.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>Why this wedges</strong>
+    Both requests hold blocks while doing no local forward progress. When their
+    remote receives complete, each needs more blocks to finish prefill, but the
+    other request is occupying the headroom. Because these requests are not in
+    <code>running</code>, the usual running-request preemption path may have no
+    victim to free.
+  </div>
+
+  <h2 id="before">Before #44560</h2>
+
+  <p>
+    The existing <code>full_sequence_must_fit</code> admission check answered
+    only one question: can this request's full sequence fit against the blocks
+    that are free <em>right now</em>? For async loads, though, the actual
+    allocation was only for the remote prefix blocks. The future blocks needed
+    to finish the sequence were not held aside.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Before: latent capacity was not protected</div>
+    <div class="flow">
+      <div class="flow-step a"><span class="num">1</span>A loads prefix</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><span class="num">2</span>A holds prefix blocks</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">3</span>A's remaining blocks are only implicit</div>
+    </div>
+    <div class="flow">
+      <div class="flow-step a"><span class="num">4</span>B loads prefix</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><span class="num">5</span>B consumes headroom</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><span class="num">6</span>A and B can now block each other</div>
+    </div>
+  </div>
+
+  <p>
+    PR #40968 proposed resolving the same family of stalls after they form, by
+    laterally preempting a non-running block holder. PR #44560 instead prevents
+    the wedge from forming: do not admit the second async load if its initial
+    prefix allocation would eat space already needed by in-flight prefills.
+  </p>
+
+  <h2 id="change">What #44560 changes</h2>
+
+  <p>
+    The PR adds a small reservation model around async KV-load admission.
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Track in-flight prefills.</strong>
+      The scheduler adds <code>self._inflight_prefills</code>, containing
+      requests that are still in prefill and have already entered the scheduler:
+      in-progress async KV loads and chunked prefills that still need more
+      prompt work.
+    </li>
+    <li>
+      <strong>Compute remaining blocks for each tracked request.</strong>
+      <code>_request_remaining_blocks(request)</code> asks the KV-cache
+      coordinator how many more blocks that request needs to allocate to hold
+      its full sequence, capped at <code>max_model_len</code> and using the same
+      block accounting machinery as normal allocation.
+    </li>
+    <li>
+      <strong>Sum the reservations.</strong>
+      <code>_inflight_prefill_reserved_blocks()</code> sums those remaining
+      block counts. The candidate async load is not in the set yet, so the sum
+      represents older in-flight work that must not be starved.
+    </li>
+    <li>
+      <strong>Gate only async KV-load allocations.</strong>
+      When <code>load_kv_async</code> is true, the scheduler passes
+      <code>reserved_blocks</code> into <code>KVCacheManager.allocate_slots()</code>.
+      The cache manager then checks the candidate's actual allocation against
+      <code>free_blocks - reserved_blocks</code>.
+    </li>
+    <li>
+      <strong>Drop finished work from the set.</strong>
+      Requests are removed from <code>_inflight_prefills</code> when they stop
+      being prefill chunks, are preempted, or are freed.
+    </li>
+  </ol>
+
+  <div class="callout code-ref">
+    <strong>Files touched</strong>
+    The scheduler logic is in
+    <a href="https://github.com/vllm-project/vllm/pull/44560/files#diff-8ef7f1374f88bfaabdc781a2f043d6c564c203f62e1ee51ad02e1e76aa07947d">vllm/v1/core/sched/scheduler.py</a>.
+    The allocation gate is in
+    <a href="https://github.com/vllm-project/vllm/pull/44560/files#diff-8254244f938311cdcbfaedb5962a98d4c24e3c6bd664f91a86dbdfb62dc1ac2d">vllm/v1/core/kv_cache_manager.py</a>.
+  </div>
+
+  <pre><code>reserved = sum(remaining_blocks(req) for req in inflight_prefills)
+
+if candidate_is_async_kv_load:
+    available = free_blocks - reserved
+    admit_candidate_only_if(candidate_prefix_blocks &lt;= available)</code></pre>
+
+  <h2 id="walkthrough">Two-request walkthrough</h2>
+
+  <p>
+    The PR's scheduler test uses a compact version of the failure:
+    A needs 8 blocks for its full prompt, B needs 5 blocks, both have a 4-block
+    remote prefix, and the pool has only 9 usable blocks. Both prefixes fit
+    together, but both full prompts do not.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Moment</th>
+        <th>Without reservation</th>
+        <th>With #44560</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>A is considered</td>
+        <td>A async-loads 4 prefix blocks.</td>
+        <td>A async-loads 4 prefix blocks and enters <code>_inflight_prefills</code>.</td>
+      </tr>
+      <tr>
+        <td>Scheduler considers B</td>
+        <td>B can also allocate 4 prefix blocks because those blocks are currently free.</td>
+        <td>A's remaining 4 blocks are reserved. B sees only <code>free - 4</code> usable blocks.</td>
+      </tr>
+      <tr>
+        <td>B admission result</td>
+        <td>B enters <code>WAITING_FOR_REMOTE_KVS</code> and holds prefix blocks.</td>
+        <td>B stays <code>WAITING</code> and holds no blocks.</td>
+      </tr>
+      <tr>
+        <td>A's receive completes</td>
+        <td>A may be unable to allocate the rest of prefill because B holds the missing capacity.</td>
+        <td>A can allocate the reserved blocks and move to <code>RUNNING</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>The actual fix</strong>
+    The fix does not need to cancel B's transfer or preempt B after the fact.
+    It prevents B from holding any KV blocks in the first place unless doing so
+    leaves enough capacity for older in-flight prefills to finish.
+  </div>
+
+  <h2 id="compare-40968">Comparison with #40968</h2>
+
+  <p>
+    PR #40968 and PR #44560 target the same scheduler pathology: non-running
+    requests can hold KV blocks after an async remote KV load, and a head-of-line
+    request can then fail admission because the blocks it needs are parked behind
+    another request. They differ mainly in when they intervene.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Question</th>
+        <th>PR #40968: lateral preemption</th>
+        <th>PR #44560: reservation admission</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Intervention point</td>
+        <td>
+          After the wedge has formed. If the target request cannot allocate
+          blocks, the scheduler searches skipped waiting queues for a lateral
+          victim and frees it.
+        </td>
+        <td>
+          Before the wedge forms. A candidate async load is admitted only if it
+          leaves enough free blocks for older in-flight prefills to complete.
+        </td>
+      </tr>
+      <tr>
+        <td>Victim model</td>
+        <td>
+          Picks a non-running block holder: recv-done
+          <code>WAITING_FOR_REMOTE_KVS</code>, or <code>WAITING</code> /
+          <code>PREEMPTED</code> with loaded prefix progress. Running requests
+          are deliberately excluded.
+        </td>
+        <td>
+          No victim is needed in the normal fix path. The later async-load
+          candidate simply remains <code>WAITING</code> and holds no blocks.
+        </td>
+      </tr>
+      <tr>
+        <td>How it resolves A/B</td>
+        <td>
+          A and B may both load prefixes. When A later cannot allocate its
+          remaining blocks, B can be laterally preempted, freeing B's prefix
+          blocks so A can run.
+        </td>
+        <td>
+          A loads first and reserves its remaining blocks. B is not allowed to
+          load if B's prefix would consume A's reservation, so A can run once
+          its receive completes.
+        </td>
+      </tr>
+      <tr>
+        <td>Cost paid</td>
+        <td>
+          Usually preserves more async-load overlap. The cost is paid only on
+          wedge-like allocation failure: preemption bookkeeping, block frees,
+          clearing stale recv state, and retry.
+        </td>
+        <td>
+          May reduce overlap in tight pools because later async loads can wait
+          even while blocks are physically free. The benefit is simpler state:
+          no cancel/preempt/retry path is required for the common wedge.
+        </td>
+      </tr>
+      <tr>
+        <td>Complexity</td>
+        <td>
+          Adds candidate classification, victim search, lateral-preempt cleanup,
+          and <code>Request.has_executed</code> so never-executed victims reenter
+          the worker as new requests rather than resumed requests.
+        </td>
+        <td>
+          Adds <code>_inflight_prefills</code>, remaining-block accounting, and a
+          <code>reserved_blocks</code> argument to <code>allocate_slots()</code>.
+        </td>
+      </tr>
+      <tr>
+        <td>Policy flavor</td>
+        <td>
+          Optimistic. Admit more async work, overlap remote receives, and repair
+          only if the bad capacity shape actually appears.
+        </td>
+        <td>
+          Pessimistic. Protect completion capacity for older prefills first, even
+          if that means delaying a later remote KV load.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>Why #44560 is simpler for this specific bug</strong>
+    The A/B wedge precondition is "both requests hold prefix blocks, but the pool
+    cannot fit both full sequences." #44560 removes that precondition directly:
+    the second request never gets to hold prefix blocks unless the older
+    in-flight requests' remaining full-prefill capacity is still protected.
+  </div>
+
+  <p>
+    The tradeoff is exactly the one hinted in #40968's alternative section:
+    reservation-based admission can serialize async loads behind earlier
+    in-flight work under pressure, exposing remote-receive latency that might
+    otherwise have been overlapped. #40968 preferred throughput in the common
+    wedge-free case and paid only when a wedge occurred. #44560 chooses
+    predictability and a smaller scheduler state machine: it may be more
+    conservative, but it avoids preempting work that never needed to be admitted
+    in the first place.
+  </p>
+
+  <h2 id="pessimistic">Is the policy pessimistic?</h2>
+
+  <p>
+    Yes, in the useful sense. It is a conservative admission policy for async
+    remote KV loads: once a request is in-flight, its remaining prefill capacity
+    is treated as unavailable to later async loads. That can reduce overlap in a
+    tight KV pool, because a later remote load may wait even though there are
+    physically free blocks at that instant.
+  </p>
+
+  <p>
+    It is also pessimistic because <code>get_num_free_blocks()</code> is a
+    snapshot of the current block pool. The scheduler does not forecast that
+    running prefills or decodes might finish soon and return blocks. If the
+    candidate async load does not fit in
+    <code>current_free_blocks - reserved_blocks</code>, it is held back now and
+    retried in a later scheduling step after real frees have happened.
+  </p>
+
+  <p>
+    But it is not a blanket "one async load at a time" rule. It is capacity
+    based:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Conservative</h3>
+      <p>
+        It prefers preserving progress for already admitted prefills over
+        overlapping another remote load. This avoids deterministic wedges and
+        predictable preemptions.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Not over-serializing</h3>
+      <p>
+        If the pool has enough slack beyond the in-flight reservations, the next
+        async load is still admitted. The PR adds a sanity test for this case.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    A subtle point: the reservation protects older in-flight work from the new
+    candidate's <em>initial</em> async-load allocation. The candidate is added to
+    the in-flight set only after it is admitted. So the policy is pessimistic
+    about not stealing from older requests, but it does not globally solve a
+    bin-packing problem for all future completions. That is intentional for this
+    PR's scope: prevent mutual blocking by ensuring a newly admitted async load
+    cannot be the thing that robs older prefills of their completion blocks.
+  </p>
+
+  <h2 id="tests">Tests added by the PR</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Test</th>
+        <th>What it proves</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>test_async_load_reservation_prevents_wedge_e2e</code></td>
+        <td>
+          In the 8-block/5-block/9-usable-block scenario, A is admitted, B is
+          held in <code>WAITING</code>, and A reaches <code>RUNNING</code>
+          without preempting B.
+        </td>
+      </tr>
+      <tr>
+        <td><code>test_async_load_reserves_blocks_for_inflight</code></td>
+        <td>
+          A smaller unit case where A's remaining reservation leaves too little
+          effective capacity for B's prefix allocation, so B holds no blocks.
+        </td>
+      </tr>
+      <tr>
+        <td><code>test_async_loads_both_admitted_when_pool_fits</code></td>
+        <td>
+          A large pool still admits both async loads, showing the gate is based
+          on available capacity rather than a hard concurrency limit.
+        </td>
+      </tr>
+      <tr>
+        <td>Mamba prefix-cache fixture update</td>
+        <td>
+          The test monkeypatch for <code>allocate_slots()</code> accepts the new
+          <code>reserved_blocks</code> parameter.
+        </td>
+      </tr>
+      <tr>
+        <td><code>assert_scheduler_empty()</code></td>
+        <td>
+          Scheduler cleanup now checks that <code>_inflight_prefills</code> does
+          not leak state.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="takeaways">Takeaways</h2>
+
+  <ul>
+    <li>
+      Async remote KV loads are special because they can hold GPU KV blocks
+      while doing no forward-pass work.
+    </li>
+    <li>
+      The old full-ISL check proved a candidate could fit at admission time, but
+      it did not protect the unallocated remainder of already admitted prefills.
+    </li>
+    <li>
+      PR #44560 turns those unallocated remainders into an admission reservation
+      for later async loads.
+    </li>
+    <li>
+      The policy is deliberately conservative in tight pools: wait before
+      allocating B's remote prefix rather than allocate it and later discover A
+      cannot complete.
+    </li>
+    <li>
+      Compared with lateral preemption, this is a prevention strategy. The
+      scheduler keeps the wedge precondition from appearing instead of trying to
+      repair it after both requests already hold blocks.
+    </li>
+    <li>
+      The gate uses current free blocks, not predicted future frees, so it can
+      delay an async load that would have fit after a near-future decode or
+      prefill completion.
+    </li>
+  </ul>
+</main>
+</body>
+</html>
