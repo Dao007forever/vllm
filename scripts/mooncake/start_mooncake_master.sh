@@ -194,6 +194,7 @@ done
 
 # --- Build command ----------------------------------------------------------
 CMD=(
+    LD_LIBRARY_PATH=/usr/local/cuda-13.1/lib64:/home/inf-daole/.local/share/uv/python/cpython-3.12.13-linux-aarch64-gnu/lib:/home/inf-daole/.local/mooncake-deps/lib:$LD_LIBRARY_PATH
     "$MASTER_BIN"
     -rpc_port="$MC_RPC_PORT"
     -rpc_thread_num="$MC_RPC_THREADS"
