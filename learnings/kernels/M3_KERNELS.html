@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MiniMax M3 Hand-Written Kernels — a guided walkthrough</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  /* page-local helpers */
+  .op {
+    display: inline-block; font-family: "SF Mono", Monaco, monospace; font-size: 0.8em;
+    padding: 3px 8px; border-radius: 5px; border: 1px solid var(--border);
+    background: var(--panel); white-space: nowrap; line-height: 1.3;
+  }
+  .op.read  { border-left: 3px solid var(--blue); }
+  .op.comp  { border-left: 3px solid var(--violet); }
+  .op.write { border-left: 3px solid var(--amber); }
+  .op.comm  { border-left: 3px solid var(--red); }
+  .op.fused { border: 1px solid #abd1bb; background: var(--green-soft); color: var(--green); font-weight: 650; }
+  .arr { color: var(--muted); font-size: 1.1em; padding: 0 1px; }
+  .fusebar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+  .save { display: inline-block; font-size: 0.78em; color: var(--green); font-weight: 650; margin-left: 4px; }
+  .hbm { font-family: "SF Mono", Monaco, monospace; font-size: 0.72em; color: var(--red); font-weight: 650; }
+  details.qa { margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+  details.qa > summary { cursor: pointer; padding: 9px 13px; font-weight: 650; font-size: 0.92em; color: var(--blue); list-style: none; }
+  details.qa > summary::-webkit-details-marker { display: none; }
+  details.qa > summary::before { content: "▸ "; color: var(--muted); }
+  details.qa[open] > summary::before { content: "▾ "; }
+  details.qa > div { padding: 0 14px 12px; }
+  .lanes { display: flex; flex-wrap: wrap; gap: 2px; margin: 6px 0; }
+  .lane { flex: 0 0 auto; min-width: 30px; padding: 4px 3px; border: 1px solid var(--border);
+    border-radius: 3px; background: var(--panel); font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.66em; text-align: center; line-height: 1.25; }
+  .lane.a { background: var(--blue-soft); border-color: #a6c8df; color: var(--blue); }
+  .lane.b { background: var(--amber-soft); border-color: #e3c88a; color: var(--amber); }
+  .lane.p { background: var(--violet-soft); border-color: #c9b8dc; color: var(--violet); }
+  /* "kept" column highlight in the worked-example table */
+  td.used { background: var(--blue-soft); color: var(--blue); font-weight: 650; text-align: center; }
+  td.win  { background: var(--green-soft); color: var(--green); font-weight: 650; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../">&larr; learnings</a> &nbsp;|&nbsp; kernels &nbsp;|&nbsp;
+    repo: <span class="fileref">vllm-internal</span> &nbsp;branch <code>extenddecode</code> &nbsp;|&nbsp;
+    source: <span class="fileref">csrc/libtorch_stable/</span>
+  </div>
+
+  <h1>MiniMax M3 Hand-Written Kernels</h1>
+  <p class="subtitle">
+    The hand-written CUDA kernels in the MiniMax M3 implementation — read line-by-line.
+    These are <em>hand-written</em> fusions: M3 runs under breakable CUDA graph (no inductor), so the
+    compile-time fusion passes never fire and every fusion has to be a kernel someone wrote.
+    Companion to <a href="FUSIONS.html">FUSIONS.html</a> (the theory) — this is the practice.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    A handful of bespoke CUDA kernels live under <span class="fileref">csrc/libtorch_stable/</span>.
+    Two are the stars:
+    <b>(1)</b> <code>fused_minimax_m3_qknorm_rope_kv_insert</code> — the whole attention <em>prologue</em>
+    (four Gemma RMSNorms + partial-NeoX RoPE + KV/index-cache writes) collapsed into one kernel where
+    <b>each warp owns one (token, head)</b>; and <b>(2)</b> <code>minimax_allreduce_rms_qk</code> — a
+    cross-GPU <em>Lamport one-shot all-reduce</em> that reduces the QK variance across tensor-parallel
+    ranks and normalizes in the same launch. Around them sit MoE helpers: a fused
+    <code>silu_and_mul_per_block_quant</code>, a tiny <code>fp32_router_gemm</code>, and MXFP8 grouped
+    matmuls. The recurring toolkit — warp-per-head, shuffle reductions, vectorized bf16 I/O,
+    compile-time template gating, and PDL — is the same kit you'd reach for writing your own.
+  </div>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#found">1. How these were found</a></li>
+      <li><a href="#bigpic">2. Where each kernel sits</a></li>
+      <li><a href="#attn">3. Sparse attention + the lightning indexer</a></li>
+      <li><a href="#caches">  3a. Two caches, two head counts</a></li>
+      <li><a href="#index">  3b. The indexer: score → top-k blocks</a></li>
+      <li><a href="#attend">  3c. The sparse attend</a></li>
+      <li><a href="#pd">  3d. Prefill vs decode: same pick, different kernels</a></li>
+      <li><a href="#example">  3e. Worked example: 4000 tokens (and why 1000 is dense)</a></li>
+      <li><a href="#prologue">4. Kernel ①: QK-norm + RoPE + KV-insert</a></li>
+      <li><a href="#warp">  4a. Grid: one warp per (token, head)</a></li>
+      <li><a href="#norm">  4b. Gemma RMSNorm by warp-shuffle</a></li>
+      <li><a href="#rope">  4c. Partial-NeoX RoPE by XOR-shuffle</a></li>
+      <li><a href="#io">  4d. Vectorized bf16 I/O</a></li>
+      <li><a href="#gating">  4e. Compile-time gating &amp; PDL</a></li>
+      <li><a href="#arqk">5. Kernel ②: cross-TP AllReduce + RMS (Lamport)</a></li>
+      <li><a href="#moe">6. The MoE kernels</a></li>
+      <li><a href="#toolkit">7. The recurring toolkit</a></li>
+      <li><a href="#map">8. File &amp; commit map</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="found">1. How these were found</h2>
+
+  <p>
+    The hand-written M3 kernels all live under <span class="fileref">csrc/libtorch_stable/</span> (the
+    torch <em>stable-ABI</em> tree). To list M3's device code and trace where each piece came from:
+  </p>
+
+  <pre><span class="c"># list the M3 / MoE device sources</span>
+git ls-files <span class="s">'csrc/libtorch_stable/**/*.cu'</span> | grep -E <span class="s">'minimax|fp32_router|mxfp8|silu_mul_block'</span>
+<span class="c"># and the commit that introduced (or last touched) one</span>
+git log --follow --oneline -- <span class="s">csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu</span></pre>
+
+  <p>
+    Several files arrived via a mechanical <em>stable-ABI migration</em> (which only moves files, not
+    compute). Filtering that out, the genuinely hand-written compute kernels are:
+  </p>
+
+  <table>
+    <thead><tr><th>Kernel</th><th>Fuses</th><th>Introduced by</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>fused_minimax_m3_qknorm_rope_kv_insert</code></td>
+        <td>4× RMSNorm + RoPE + KV/index-cache insert (+ gather)</td>
+        <td><span class="mono">0a1c5034f</span> "Add MiniMax M3 support (#45381)"; fp8-q <span class="mono">40b5d9aad</span> (#138)</td>
+      </tr>
+      <tr>
+        <td><code>minimax_allreduce_rms_qk</code></td>
+        <td>cross-TP all-reduce of QK variance + RMSNorm</td>
+        <td><span class="mono">ecd1ea136</span> "Port TRT-LLM minimax_allreduce_rms (#37045)"; stable-ABI <span class="mono">59d023619</span> (#44365)</td>
+      </tr>
+      <tr>
+        <td><code>silu_and_mul_per_block_quant</code></td>
+        <td>SwiGLU activation + per-block fp8 quant</td>
+        <td><span class="mono">c09ad767c</span> "silu block-quant fusion (#32996)"; perf <span class="mono">a4b14b98c</span> (#44173)</td>
+      </tr>
+      <tr>
+        <td><code>fp32_router_gemm</code></td>
+        <td>MoE router GEMV (act × fp32 weight → fp32)</td>
+        <td><span class="mono">559d6710b</span> "MiniMax-M2 gate kernel (#38445)"; ext-to-64 <span class="mono">3d224ea29</span></td>
+      </tr>
+      <tr>
+        <td><code>cutlass_mxfp8_grouped_mm</code>, <code>mxfp8_experts_quant</code></td>
+        <td>MXFP8 grouped matmul + expert quant for MoE</td>
+        <td><span class="mono">59d023619</span> stable-ABI migration (#44365)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>Why hand-written at all?</strong>
+    M3 auto-enables <b>breakable CUDA graph</b> (<code>VLLM_USE_BREAKABLE_CUDAGRAPH=1</code>), which sets
+    the compilation mode to <code>NONE</code> — no dynamo, no inductor, so none of vLLM's pattern-matcher
+    fusion passes run. Any fusion M3 wants, it must ship as an explicit kernel. See
+    <a href="FUSIONS.html#byhand">FUSIONS.html §10</a> for the why; this page is the <em>how</em>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="bigpic">2. Where each kernel sits</h2>
+
+  <p>
+    One M3 decoder layer, with the hand-written kernels marked. The attention block is block-sparse GQA
+    with a lightning indexer (opened up in <a href="#attn">§3</a>); the FFN is a big MoE.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">M3 sparse decoder layer — hand-written kernels in green</div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">in</span>hidden, residual</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><span class="num">①+②</span>QKV proj → <b>qknorm+rope+kv-insert</b><br><span style="font-size:.85em;color:var(--muted)">(② if heads are TP-sharded)</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><span class="num">attn</span><a href="#attn">block-sparse GQA + indexer</a></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><span class="num">MoE</span><b>fp32 router GEMV</b> → topk → experts<br>(<b>silu+blockquant</b>, <b>mxfp8 grouped mm</b>)</div>
+    </div>
+    <div class="diagram-caption">
+      ① folds the entire attention prologue into one launch. ② is the alternative QK-norm path used when
+      a head is split across tensor-parallel ranks (variance must cross GPUs). The MoE uses three more
+      bespoke kernels.
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="attn">3. Sparse attention + the lightning indexer</h2>
+
+  <p>
+    §2 drew the attention block as a single box. This section opens it — and answers "what actually
+    happens for a prompt of <em>N</em> tokens." Unlike §4–§5, the code here is <b>Triton</b> (with an
+    SM100 <em>MSA</em> fast path, <a href="M3_MSA.html">M3_MSA.html</a>), not hand-written CUDA; it is on
+    this page because it is the consumer that <a href="#prologue">kernel ① (§4)</a> feeds.
+  </p>
+  <p>
+    By the time control reaches here, kernel ① has already run for the current tokens: it normalized +
+    RoPE'd the main <code>q</code> and the index <code>index_q</code>, scatter-inserted <code>k</code>/<code>v</code>
+    into the main GQA cache, and wrote one <code>index_k</code> vector per token into the indexer
+    side-cache. Two steps remain, both behind a single <code>eager_break</code>:
+  </p>
+  <div class="fusebar">
+    <span class="op comp">indexer scores every visible block</span><span class="arr">→</span>
+    <span class="op comp">top-k = 16 blocks per (head, token)</span><span class="arr">→</span>
+    <span class="op write">topk_indices_buffer</span><span class="arr">→</span>
+    <span class="op read">attend only those blocks</span>
+  </div>
+
+  <h3 id="caches">3a. Two caches, two head counts</h3>
+  <p>M3 attention keeps <b>two</b> paged caches, both filled by kernel ①:</p>
+  <table>
+    <thead><tr><th>Cache</th><th>Shape (per block)</th><th>Holds</th></tr></thead>
+    <tbody>
+      <tr><td><b>main GQA KV</b></td><td><code>[blocks, 2, 128, 4, 128]</code></td>
+        <td>K&amp;V (the <code>2</code>), 128 tokens/block, <b>4 KV heads</b> × 128 head_dim</td></tr>
+      <tr><td><b>indexer side-cache</b></td><td><code>[blocks, 128, 128]</code></td>
+        <td><b>one</b> 128-dim index key per token — no head dim (<code>index_k</code> is replicated, not sharded)</td></tr>
+    </tbody>
+  </table>
+  <p>
+    The head bookkeeping is the crux. M3 has <b>64 query heads, 4 KV heads</b> (GQA group of 16) and
+    <b>4 index-query heads</b> — exactly the KV-head count (<code>num_index_heads == num_kv_heads</code>).
+    Each index head scores against the <em>one shared</em> index key per token and selects blocks
+    <b>for its own KV head</b>; the 16 query heads in that group then attend to those blocks. Clean map:
+    index head <code>h</code> → KV head <code>h</code> → 16 query heads. So the 4 KV heads can each pick a
+    <em>different</em> set of 16 blocks.
+  </p>
+  <div class="callout">
+    <strong>Only 57 of 60 layers do this</strong>
+    <code>sparse_attention_freq = [0]*3 + [1]*57</code>: layers 0–2 are ordinary dense GQA (full causal
+    attention, no indexer); layers 3–59 are the sparse layers described here.
+  </div>
+
+  <h3 id="index">3b. The indexer: score → top-k blocks</h3>
+  <p>
+    <b>Score.</b> A "block" is one 128-token page. For query token <code>t</code> and index head
+    <code>h</code>, the block's score is the <b>max</b> over its 128 positions of the index dot product
+    (<code>sparse_score_type = "max"</code>), causal-masked so a token never scores positions after itself:
+  </p>
+  <pre>score[h, t, blk] = max<sub>pos ∈ blk, pos ≤ t</sub>  ( index_q[t, h] · index_k[pos] )</pre>
+  <p>
+    — a block scores high if <em>any</em> token in it is a strong match. The dot is a small per-page
+    <code>q @ kᵀ</code> fused with the running per-block max.
+  </p>
+  <p>
+    <b>Top-k.</b> Per <code>(head, token)</code>, keep the <b>16</b> highest-scoring blocks
+    (<code>sparse_topk_blocks = 16</code>). Two ranges are <em>force-kept</em> regardless of score:
+    <code>sparse_init_block = 0</code> (none) and <code>sparse_local_block = 1</code> — the query's own
+    current block always stays in. Output: <code>topk_idx[4, total_q, 16]</code> of 0-indexed block ids,
+    <code>−1</code> padding any unused slot.
+  </p>
+  <div class="callout info">
+    <strong>The shared buffer + the eager break</strong>
+    The indexer writes <code>topk_idx</code> into a stable-address <code>topk_indices_buffer</code>
+    (decode at <code>[:, :nd]</code>, prefill at <code>[:, nd:]</code>) and the attend reads it back.
+    Handing it across the eager break as a fresh Python tensor would freeze the indices into a captured
+    graph; the fixed-address buffer keeps the pointer stable for cudagraph replay while the values change
+    each step.
+  </div>
+
+  <h3 id="attend">3c. The sparse attend</h3>
+  <p>
+    The real attention. Each query head reads its KV head's 16 block ids, gathers those pages from the
+    <b>main</b> KV cache via the request's <code>block_table</code>, and runs a flash-style online softmax
+    over them — at most <code>16 × 128 = 2048</code> keys, <em>independent of context length</em>. That
+    fixed ceiling is the whole point: per-token attention cost stops growing once the context passes 2048
+    tokens.
+  </p>
+
+  <h3 id="pd">3d. Prefill vs decode — same pick, different kernels</h3>
+  <p>The selection rule is identical; the kernels differ because the batch shapes do.</p>
+  <table>
+    <thead><tr><th></th><th>Prefill</th><th>Decode</th></tr></thead>
+    <tbody>
+      <tr><td><b>query tokens</b></td><td>all prompt tokens at once (varlen)</td><td>1 per request (1+N with MTP), flattened request-major</td></tr>
+      <tr><td><b>score</b></td><td><code>minimax_m3_index_score</code></td><td><code>minimax_m3_index_decode</code> — <b>split-K</b>, fixed chunk count</td></tr>
+      <tr><td><b>top-k</b></td><td><code>minimax_m3_index_topk</code> — per-token <b>bitonic sort</b></td><td>split-K partial top-k + merge</td></tr>
+      <tr><td><b>attend</b></td><td><code>minimax_m3_sparse_attn</code></td><td><code>minimax_m3_sparse_attn_decode</code> — split-K over the 16 blocks</td></tr>
+      <tr><td><b>CUDA graph</b></td><td>no (varlen, eager)</td><td>yes — grids are shape-constant (<code>UNIFORM_BATCH</code>)</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Decode pays the split-K complexity for one reason: a cudagraph needs a <em>fixed</em> grid, so chunk
+    counts come from shape constants (not <code>seq_len</code>) and the partials are combined in a merge
+    pass. Prefill is variable-length and runs eager, so it can size its grid to the real sequence.
+  </p>
+
+  <h3 id="example">3e. Worked example: a 4000-token prompt (and why 1000 is dense)</h3>
+  <div class="callout good">
+    <strong>A 1000-token prompt runs fully dense.</strong>
+    1000 tokens at <code>block_size = 128</code> is ⌈1000/128⌉ = <b>8 blocks</b> ≤ 16 top-k, so every
+    token's "top-16" is simply <em>all</em> of its visible blocks. The indexer still scores, the buffer is
+    still written, the attend still runs — but nothing is pruned, and the result is <b>numerically
+    identical to dense causal GQA</b>. Sparsity only <em>engages</em> once a token sees more than 16
+    blocks, i.e. once the context passes <code>topk × block_size = 16 × 128 = 2048</code> tokens.
+  </div>
+  <p>
+    <b>4000 tokens</b> is ⌈4000/128⌉ = <b>32 blocks</b> (block 31 holds the last 32 tokens), so pruning is
+    real — but it kicks in part-way through, because the threshold is per <em>token position</em>, not per
+    prompt:
+  </p>
+  <div class="flow">
+    <div class="flow-step v"><span class="num">prefill</span>all 4000 tokens in one pass · token at position <code>p</code> sees ⌈(p+1)/128⌉ blocks</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step b"><span class="num">p ≤ 2047</span>≤ 16 blocks → top-k is the identity (<b>dense</b>)</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step g"><span class="num">p ≥ 2048</span>17–32 blocks → indexer keeps 16 (1 local + 15 by score) (<b>sparse</b>)</div>
+  </div>
+  <p>
+    So a single prefill pass is <em>mixed</em>: the first 2048 query tokens attend densely, the back ~half
+    are pruned to 16 blocks each. Then every <b>decode</b> step (generating tokens 4001, 4002, …) is fully
+    sparse — at running length <code>L</code> a token sees ⌈L/128⌉ ≥ 32 blocks and keeps 16:
+  </p>
+  <table class="tight">
+    <thead><tr><th>phase</th><th>position / length</th><th>blocks ⌈·/128⌉</th><th>kept</th><th>regime</th></tr></thead>
+    <tbody>
+      <tr><td>prefill</td><td>p = 2047 (last dense token)</td><td>16</td><td class="used">16</td><td>dense</td></tr>
+      <tr><td>prefill</td><td>p = 2048 (first pruned)</td><td>17</td><td class="win">16</td><td><b>sparse</b></td></tr>
+      <tr><td>prefill</td><td>p = 3999 (end of prompt)</td><td>32</td><td class="win">16</td><td>sparse (½ kept)</td></tr>
+      <tr><td>decode</td><td>L = 4000</td><td>32</td><td class="win">16</td><td>sparse (½ kept)</td></tr>
+      <tr><td>decode</td><td>L = 8192</td><td>64</td><td class="win">16</td><td>sparse (¼ kept)</td></tr>
+      <tr><td>decode</td><td>L = 131072 (128k)</td><td>1024</td><td class="win">16</td><td>sparse (~1.5% kept)</td></tr>
+    </tbody>
+  </table>
+  <p>
+    <b>Zoom in on the boundary block.</b> Block 16 (positions <code>2048…2175</code>) is exactly where
+    pruning first appears. Every token in it sees blocks <code>0…16</code> = <b>17</b> blocks, so one must
+    go. Block 16 is the query's own block and is force-kept as the <code>local</code> block, which leaves
+    <b>15 slots for the 16 earlier blocks 0…15</b>: each token keeps <b>1 local block + the top-15 of its
+    16 previous blocks</b>, dropping exactly the single lowest-scoring earlier block. The pick is per token
+    <em>and</em> per KV head, so neighbouring tokens (and the 4 KV heads) may each drop a different one.
+  </p>
+  <div class="callout info">
+    <strong>How the local (diagonal) block's K/V is used when it isn't "full"</strong>
+    In this prefill, block 16 is <em>physically</em> full — the whole 4000-token prompt was scatter-inserted
+    into the cache up front by kernel ①. What makes the block "partial" for a given query is <b>causality</b>.
+    The selected page is always loaded as a full 128-slot tile; <em>two masks</em> in the attend kernel then
+    decide which of its keys count, so there is no special partial-block code path:
+    <ul>
+      <li><b>Causal mask</b> — <code>qk += where(q_pos − n ≥ blk·128, 0, −∞)</code>: a key at position
+        <code>blk·128 + n</code> survives only if it is ≤ the query's own position. This bites only on the
+        diagonal (local) block. For the <em>first</em> token of block 16, <code>p = 2048</code>, only
+        position 2048 survives, so the local block contributes <b>1 key</b>; by <code>p = 2175</code> all
+        128 do.</li>
+      <li><b>Seq-len mask</b> — <code>pos &lt; seq_len</code>: positions past the end of the sequence
+        (unwritten cache slots) drop out. This is the mask that handles a <em>physically</em> partial page:
+        the last block of the prompt (block 31 holds only 32 real tokens), and, in decode, the current block
+        as it fills one token per step.</li>
+    </ul>
+    Masked lanes load as <code>0</code> and take <code>−∞</code> in <code>qk</code> →
+    <code>exp2(−∞) = 0</code>, so they never enter the online-softmax numerator or denominator — the result
+    is exact regardless of how many real keys the page holds. The 15 earlier blocks need no causal mask
+    (every one of their 128 keys precedes the query) and contribute in full.
+  </div>
+  <table class="tight">
+    <thead><tr><th>query position in block 16</th><th>local-block keys (after causal mask)</th><th>earlier blocks attended</th></tr></thead>
+    <tbody>
+      <tr><td>2048 (first)</td><td><b>1</b></td><td>15 of 16</td></tr>
+      <tr><td>2049</td><td><b>2</b></td><td>15 of 16</td></tr>
+      <tr><td>…</td><td>…</td><td>…</td></tr>
+      <tr><td>2175 (last)</td><td><b>128</b></td><td>15 of 16</td></tr>
+    </tbody>
+  </table>
+  <p>
+    <b>So the KV each head actually attends</b> = the 15 full earlier blocks (<code>15 × 128 = 1920</code>
+    keys, unmasked) + the causal current block (1…128 keys). For a token in block 16 that is
+    <b><code>1920 + (1…128) = 1921…2048</code> effective keys</b> — 1921 at <code>p = 2048</code>, the full
+    2048 at <code>p = 2175</code>. All 64 query heads do this; the 16 heads in a GQA group reuse their
+    shared KV head's same 16 blocks (and the 4 KV heads may hold different sets). Note the kernel still
+    <em>streams the full <code>16 × 128 = 2048</code> QK tiles</em> and masks out-of-range lanes to
+    <code>−∞</code>, so the compute is a flat ~2048 scores/head — the mask only zeroes a lane's softmax
+    contribution; it doesn't skip the dot. This "15 full blocks + 1 causal block" shape holds for every
+    token once the context passes 16 blocks.
+  </p>
+  <p>
+    The win is asymptotic: the per-token attend is pinned at 16 blocks while the context grows without
+    bound. A 1000-token prompt never reaches the threshold, so it pays the indexer's bookkeeping for no
+    pruning; a 4000-token prompt prunes its back half during prefill and every token during decode.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">vllm/models/minimax_m3/common/indexer.py</span> (side cache, metadata,
+    <code>MiniMaxM3IndexerTritonImpl</code>) ·
+    <span class="fileref">common/ops/index_topk.py</span> (<code>minimax_m3_index_score</code> /
+    <code>_topk</code> / <code>_decode</code>) ·
+    <span class="fileref">common/sparse_attention.py</span> (<code>MiniMaxM3SparseTritonImpl</code>) ·
+    <span class="fileref">common/ops/sparse_attn.py</span> (<code>minimax_m3_sparse_attn</code> /
+    <code>_decode</code>). SM100 fast path: <a href="M3_MSA.html">M3_MSA.html</a>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="prologue">4. Kernel ①: <code>fused_minimax_m3_qknorm_rope_kv_insert</code></h2>
+
+  <p>
+    This is the headline. It replaces the per-token Python sequence in
+    <code>MiniMaxM3SparseAttention.forward</code>:
+  </p>
+
+  <pre><span class="c"># what the kernel replaces (5 norms/ropes + 2 cache writes, ~8 launches)</span>
+q  = q_norm(q);  k = k_norm(k);  q, k = rotary_emb(pos, q, k)
+index_q = index_q_norm(index_q);  index_k = index_k_norm(index_k)
+index_q, index_k = rotary_emb(pos, index_q, index_k)
+_insert_kv(k, v, index_k)</pre>
+
+  <p>
+    Everything arrives in <b>one packed <code>qkv</code> tensor</b> — the fused projection emits, per
+    token, <code>[ q | k | v | index_q | index_k ]</code> (the "5 results"; the dense layer emits just
+    <code>[ q | k | v ]</code>). The kernel reads each sub-block straight out of that row, normalizes
+    and rotates it, and scatters K/V/index into their paged caches — all in registers, no intermediates
+    to HBM.
+  </p>
+
+  <div class="fusebar">
+    <span class="op read">read packed qkv</span><span class="arr">→</span>
+    <span class="op comp">RMSNorm (q,k,iq,ik)</span><span class="arr">→</span>
+    <span class="op comp">partial-NeoX RoPE</span><span class="arr">→</span>
+    <span class="op write">store in place / gather</span><span class="arr">→</span>
+    <span class="op write">scatter K,V,index → caches</span>
+    <span class="save">~8 launches → 1</span>
+  </div>
+
+  <!-- ---------------------------------------------------------- -->
+  <h3 id="warp">4a. The grid: one warp owns one (token, head-slot)</h3>
+
+  <p>
+    The decomposition is the key idea. <code>head_dim = 128</code>. A warp is 32 lanes; give each lane
+    <b>4 contiguous dims</b> (32 × 4 = 128). So <b>one warp handles exactly one head</b> of one token,
+    and the whole RMSNorm reduction is a single warp-shuffle — no shared memory, no block sync.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">A warp covers head_dim=128 as 32 lanes × 4 dims</div>
+    <div class="lanes">
+      <span class="lane a">L0<br>0–3</span><span class="lane a">L1<br>4–7</span><span class="lane a">L2<br>8–11</span>
+      <span class="lane">L3<br>12–15</span><span class="lane">…</span><span class="lane">L15<br>60–63</span>
+      <span class="lane b">L16<br>64–67</span><span class="lane b">L17<br>68–71</span><span class="lane">…</span><span class="lane b">L31<br>124–127</span>
+    </div>
+    <div class="diagram-caption">Each lane loads its 4 dims as one 8-byte (<code>uint2</code>) read. blue = first RoPE half, amber = second half (see 4c).</div>
+  </div>
+
+  <p>
+    The grid is 1-D: <code>num_tokens × slots_per_token</code> warps, packed into 256-thread blocks
+    (8 warps each). Slots are enumerated per token:
+  </p>
+
+  <div class="cell-row wrap">
+    <span class="cell label">slots →</span>
+    <span class="cell used">Q×nq</span>
+    <span class="cell used">K×nkv</span>
+    <span class="cell dirty">V×nkv</span>
+    <span class="cell cached">IQ×niq</span>
+    <span class="cell cached">IK×1</span>
+  </div>
+
+  <pre><span class="c">// each warp decodes its job from one flat index</span>
+int globalWarpIdx = blockIdx.x * warpsPerBlock + threadIdx.x / 32;
+int slots_per_token = nq + nkv + v_slots + idx_slots;   <span class="c">// gated by template bools</span>
+int tokenIdx = globalWarpIdx / slots_per_token;
+int slot     = globalWarpIdx % slots_per_token;         <span class="c">// → isQ / isK / isV / isIQ / isIK</span></pre>
+
+  <div class="callout good">
+    <strong>Why warp-per-head is the right granularity here</strong>
+    The norm reduces over the 128-dim head. Mapping a head to a <em>warp</em> means the reduction is
+    <code>__shfl_xor_sync</code> only — the fastest possible reduce, entirely in registers. Mapping a
+    head to a <em>block</em> would force shared-memory + <code>__syncthreads</code>; mapping to a
+    <em>lane</em> would serialize 128 dims. The 32×4 split is exact for head_dim 128.
+  </div>
+
+  <!-- ---------------------------------------------------------- -->
+  <h3 id="norm">4b. Gemma RMSNorm by warp-shuffle</h3>
+
+  <p>
+    Each lane squares its 4 dims, then a butterfly <code>__shfl_xor</code> sums across the 32 lanes so
+    every lane ends up with the full head's sum-of-squares. Gemma form: scale by <code>(1 + w)</code>.
+  </p>
+
+  <pre><span class="k">__device__</span> float <span class="fn">warpReduceSum</span>(float v) {
+  <span class="k">for</span> (int mask = 16; mask > 0; mask >>= 1)
+    v += <span class="fn">__shfl_xor_sync</span>(FINAL_MASK, v, mask, 32);   <span class="c">// 5 steps → all-lane sum</span>
+  <span class="k">return</span> v;
+}
+<span class="c">// ── Gemma RMSNorm over the full head ──</span>
+float sumsq = 0;
+<span class="k">for</span> (int i=0;i&lt;4;i++) sumsq += elems[i]*elems[i];
+sumsq = <span class="fn">warpReduceSum</span>(sumsq);
+float rms_rcp = <span class="fn">rsqrtf</span>(sumsq / 128.0f + eps);
+<span class="k">for</span> (int i=0;i&lt;4;i++) {
+  float w = 1.0f + (float)weight[laneId*4 + i];          <span class="c">// Gemma (1+w)</span>
+  elems[i] = elems[i] * rms_rcp * w;
+}</pre>
+
+  <p>
+    The same <code>normAndRope</code> helper serves all four norms — pass <code>q_norm_w</code>,
+    <code>k_norm_w</code>, <code>iq_norm_w</code>, or <code>ik_norm_w</code>; pass <code>nullptr</code>
+    for V (which skips both norm and RoPE).
+  </p>
+
+  <!-- ---------------------------------------------------------- -->
+  <h3 id="rope">4c. Partial-NeoX RoPE by XOR-shuffle</h3>
+
+  <p>
+    RoPE rotates pairs <code>(i, i+half)</code> where <code>half = rotary_dim/2</code>. In NeoX layout
+    the partner of dim <code>i</code> lives <code>half</code> dims away — i.e. in <b>another lane</b>. The
+    kernel fetches the partner's 4 values with a single <code>__shfl_xor</code> across a fixed
+    lane-distance, so no element ever leaves registers.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Partner lane = current lane XOR (half / 4)</div>
+    <div class="fusebar">
+      <span class="lane a">L0 → dims 0–3</span>
+      <span class="arr">⟷ shfl_xor(half/4)</span>
+      <span class="lane b">L(half/4) → dims half..half+3</span>
+    </div>
+    <div class="diagram-caption">
+      Because <code>half</code> is a multiple of 4, a lane sits wholly in the first half (owns <code>x[i]</code>)
+      or the second (owns <code>x[i+half]</code>); its partner is always <code>half/4</code> lanes away.
+    </div>
+  </div>
+
+  <pre>int half = rotary_dim / 2;
+int lane_xor = half / 4;                  <span class="c">// partner-lane distance</span>
+float partner[4];
+<span class="k">for</span> (int i=0;i&lt;4;i++)
+  partner[i] = <span class="fn">__shfl_xor_sync</span>(FINAL_MASK, elems[i], lane_xor, 32);
+<span class="k">if</span> (in_rope) {
+  <span class="k">bool</span> first_half = dim0 &lt; half;
+  <span class="k">for</span> (int i=0;i&lt;4;i++) {
+    float c = cos_ptr[i_base+i], s = sin_ptr[i_base+i];
+    elems[i] = first_half ? elems[i]*c - partner[i]*s     <span class="c">// x·cos − x_partner·sin</span>
+                          : elems[i]*c + partner[i]*s;     <span class="c">// x·cos + x_partner·sin</span>
+  }
+}</pre>
+
+  <div class="callout">
+    <strong>"Partial" RoPE</strong>
+    Only the leading <code>rotary_dim</code> dims rotate; trailing dims pass through untouched
+    (<code>in_rope = dim0 &lt; rotary_dim</code>). All branches — q, k, index_q, index_k — share the
+    <em>same</em> <code>cos_sin_cache</code> table, so RoPE is one code path parameterized by the slot.
+  </div>
+
+  <!-- ---------------------------------------------------------- -->
+  <h3 id="io">4d. Vectorized bf16 I/O</h3>
+
+  <p>
+    Each lane moves its 4 bf16 values as a single 8-byte <code>uint2</code> load/store, converting
+    bf16↔fp32 in registers. One memory transaction per lane, fully coalesced across the warp (128
+    contiguous bytes).
+  </p>
+
+  <pre><span class="c">// 4 contiguous bf16 → 4 fp32 registers (one uint2 = 8 bytes)</span>
+uint2 v = *reinterpret_cast&lt;uint2 const*&gt;(src);
+<span class="c">// ...Converter::convert → elems[0..3]...</span>
+<span class="c">// and the mirror on store: 4 fp32 → uint2 → *dst</span></pre>
+
+  <div class="callout info">
+    <strong>The in-place + gather trick</strong>
+    Q/K/index are rewritten <em>in place</em> inside <code>qkv</code>. But Q and index_q can optionally be
+    written to dedicated contiguous buffers (<code>q_out</code>, <code>index_q_out</code>) instead — so the
+    downstream SM100 sparse kernel's flat TMA descriptor can address them as
+    <code>[tokens·heads, head_dim]</code> without a separate <code>q.contiguous()</code> copy. The
+    de-interleaving folds into the store the kernel was doing anyway.
+  </div>
+
+  <!-- ---------------------------------------------------------- -->
+  <h3 id="gating">4e. Compile-time gating &amp; PDL</h3>
+
+  <p>
+    Dense vs sparse, and whether to write caches, are <b>template bools</b> — so the index slots, V
+    slots, and cache writes <em>compile away</em> on paths that don't use them. Three instantiations:
+  </p>
+
+  <div class="cell-row wrap">
+    <span class="cell head">&lt;kIsSparse, kInsertKV&gt;</span>
+    <span class="cell">&lt;false,false&gt; dense</span>
+    <span class="cell">&lt;true,false&gt; sparse-profiling</span>
+    <span class="cell used">&lt;true,true&gt; sparse-serving</span>
+  </div>
+
+  <pre><span class="k">template</span> &lt;<span class="k">typename</span> scalar_t, <span class="k">bool</span> kIsSparse, <span class="k">bool</span> kInsertKV&gt;
+__global__ <span class="k">void</span> <span class="fn">fusedMiniMaxM3QNormRopeKVInsertKernel</span>(...);
+<span class="c">// host picks one:</span>
+has_index ? (insert_kv ? LAUNCH(true,true) : LAUNCH(true,false))
+          : LAUNCH(false,false);            <span class="c">// dense: generic Attention owns the KV write</span></pre>
+
+  <p>
+    The paged KV cache is addressed by <b>strides read off the tensor</b> (block / kv / token / head),
+    so the same kernel honors whichever physical layout the attention backend allocated —
+    <b>NHD</b> (<code>s_token &lt; s_head</code>) or <b>HND</b> (swapped) — with no extra argument.
+  </p>
+
+  <pre>int64_t off = b*kv_s_block + kv*kv_s_kv + t*kv_s_token + head*kv_s_head;
+<span class="fn">storeElems</span>(kv_cache + off + dim_base, elems);   <span class="c">// head_dim always stride-1</span></pre>
+
+  <p>
+    Finally, <b>PDL (Programmatic Dependent Launch)</b> overlaps this kernel with its neighbors. It waits
+    for the producing GEMM, then signals completion so a dependent successor can start early — pure
+    launch-latency hiding, a no-op on pre-Hopper.
+  </p>
+
+  <pre><span class="k">#if</span> __CUDA_ARCH__ &gt;= 900
+  <span class="fn">cudaGridDependencySynchronize</span>();          <span class="c">// wait for the qkv-projection GEMM</span>
+<span class="k">#endif</span>
+  <span class="c">// ... load → norm → rope → store → cache insert ...</span>
+<span class="k">#if</span> __CUDA_ARCH__ &gt;= 900
+  <span class="fn">cudaTriggerProgrammaticLaunchCompletion</span>();  <span class="c">// let the successor launch early</span>
+<span class="k">#endif</span></pre>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu</span> —
+    <code>fusedMiniMaxM3QNormRopeKVInsertKernel</code> (kernel), <code>normAndRope</code> (per-warp
+    pipeline), <code>launchFusedMiniMaxM3</code> (host), op
+    <code>fused_minimax_m3_qknorm_rope_kv_insert</code>. Test:
+    <span class="fileref">tests/.../test_fused_minimax_m3_qknorm_rope_kv_insert.py</span>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="arqk">5. Kernel ②: <code>minimax_allreduce_rms_qk</code> (cross-TP, Lamport)</h2>
+
+  <p>
+    Kernel ① assumes the whole 128-dim head lives on one GPU. When a head is <b>split across
+    tensor-parallel ranks</b>, the RMSNorm variance is a sum over dims that live on <em>different</em>
+    GPUs — so before you can normalize, you must all-reduce the per-token sum-of-squares. This kernel
+    fuses that cross-GPU reduction <em>and</em> the normalization into a single launch, using a
+    <b>Lamport one-shot all-reduce</b> (adapted from TensorRT-LLM).
+  </p>
+
+  <div class="fusebar">
+    <span class="op comp">local Σx² (this rank's shard)</span><span class="arr">→</span>
+    <span class="op comm">Lamport one-shot exchange</span><span class="arr">→</span>
+    <span class="op comp">Σ across ranks → rsqrt</span><span class="arr">→</span>
+    <span class="op write">normed q, k</span>
+  </div>
+
+  <h3>The Lamport one-shot, and the negative-zero sentinel</h3>
+  <p>
+    A normal all-reduce needs a separate "data ready" flag per peer. The Lamport trick removes the flag
+    by making the <em>data itself</em> the flag: peer buffers are pre-filled with <b>−0.0</b> (a value
+    the real data never legitimately takes), each rank writes its partial variance into every peer's
+    buffer, and consumers <b>spin until the slot is no longer −0.0</b>. No fences, no atomics on the hot
+    path — just polling a sentinel.
+  </p>
+
+  <pre><span class="c">// each rank publishes its partial variance to every peer's buffer...</span>
+<span class="k">if</span> (threadIdx.x == 0)
+  <span class="k">for</span> (int r=0; r&lt;NRanks; ++r)
+    ((float*)comm.data_bufs[r])[rank*tot_tokens + token_id] = sum_variance;
+
+<span class="c">// ...then spins reading until ALL ranks' slots are filled (not −0.0)</span>
+<span class="k">bool</span> done = <span class="k">false</span>;
+<span class="k">while</span> (!done) {
+  done = <span class="k">true</span>;
+  <span class="k">for</span> (int r=0; r&lt;NRanks; ++r) {
+    vars[r] = <span class="fn">ld_global_volatile</span>(&amp;((float*)comm.data_bufs[rank])[r*tot_tokens + token_id]);
+    done &amp;= !<span class="fn">is_neg_zero</span>(vars[r]);           <span class="c">// −0.0 == "not ready yet"</span>
+  }
+}
+<span class="k">for</span> (int r=0;r&lt;NRanks;++r) sum_variance += vars[r];   <span class="c">// full-head Σx²</span>
+<span class="c">// normalize with the full mean across all ranks</span>
+vals[i] = vals[i] * <span class="fn">rsqrtf</span>(sum_variance/hidden_dim/NRanks + eps) * weight[i];</pre>
+
+  <div class="callout">
+    <strong>Triple-buffered, self-clearing</strong>
+    The workspace rotates between 3 buffers (<code>flag_value % 3</code>) so consecutive all-reduces
+    never alias, and each call <em>clears</em> the buffer it'll reuse two rounds later back to −0.0 —
+    the sentinel maintains itself, so there's no separate reset kernel.
+  </div>
+
+  <h3>The QK float4 variant</h3>
+  <p>
+    The serving path uses <code>minimax_reduce_qk_rms_kernel_lamport_float4</code>: it reduces variance
+    for <b>Q and K together</b> in one launch (doubled comm buffer), processes <b>4 rows at a time</b> as
+    <code>float4</code> for coalescing, and on Hopper uses <b>cluster groups</b> + the
+    <code>griddepcontrol</code> PTX for PDL. Per-rank dimensions (<code>OriginQDim/NRanks</code>) are
+    template constants, so the warp counts are fixed at compile time.
+  </p>
+
+  <div class="callout warn">
+    <strong>This is the path behind the Python <code>minimax_qk_norm_fusion</code></strong>
+    The <code>MiniMaxText01RMSNormTP.forward_qkv</code> wrapper dispatches here when
+    <code>tp_world &gt; 1</code>, the Lamport workspace exists (needs P2P/IPC), and tokens ≤ 2048;
+    otherwise it falls back to eager all-reduce + RMSNorm. See
+    <a href="FUSIONS.html#minimax">FUSIONS.html §11</a> for the dispatch logic.
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source</strong>
+    <span class="fileref">csrc/libtorch_stable/minimax_reduce_rms_kernel.cu</span> — <code>LamportComm</code>
+    (the one-shot comm), <code>minimax_reduce_rms_kernel_lamport</code> /
+    <code>minimax_reduce_qk_rms_kernel_lamport_float4</code> (kernels), ops
+    <code>minimax_allreduce_rms</code> / <code>minimax_allreduce_rms_qk</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="moe">6. The MoE kernels</h2>
+
+  <p>The FFN is a 256-expert MoE; three more hand-written kernels feed it.</p>
+
+  <div class="grid">
+    <div class="box">
+      <h3><code>silu_and_mul_per_block_quant</code></h3>
+      <p>
+        SwiGLU activation <code>silu(gate)·up</code> fused with per-block fp8 quant for the expert GEMM.
+        Computes SiLU in fp32, finds the block abs-max with <code>fmaxf</code>, and quantizes — using
+        the same <b>warp-shuffle reduction + vectorized I/O</b> pattern as kernel ①.
+      </p>
+      <p><span class="fileref">quantization/fused_kernels/fused_silu_mul_block_quant.cu</span> · #44173</p>
+    </div>
+    <div class="box">
+      <h3><code>fp32_router_gemm</code></h3>
+      <p>
+        The router is a tiny, latency-critical GEMV: <code>act × W_router(fp32) → fp32</code> with
+        <code>H=3072, E=256, M≤32</code>. Hand-tuned for the skinny-M decode shape (bf16 or fp32
+        activation; weight always fp32 for routing stability). Adapted from DeepSeek-V3's router GEMM.
+      </p>
+      <p><span class="fileref">fp32_router_gemm.cu</span>, <span class="fileref">fp32_router_gemm_entry.cu</span> · #34</p>
+    </div>
+    <div class="box">
+      <h3><code>cutlass_mxfp8_grouped_mm</code></h3>
+      <p>
+        Grouped (per-expert) matmul in MXFP8 for the expert up/down projections, built on CUTLASS, plus
+        <code>mxfp8_experts_quant</code> to quantize activations into the MXFP8 block format the grouped
+        MM expects.
+      </p>
+      <p><span class="fileref">moe/mxfp8_moe/cutlass_mxfp8_grouped_mm.cu</span>, <span class="fileref">mxfp8_experts_quant.cu</span></p>
+    </div>
+    <div class="box">
+      <h3>+ custom all-reduce</h3>
+      <p>
+        The general TP all-reduce (<span class="fileref">custom_all_reduce.cu</span>) also moved into the
+        stable-ABI tree and is used for the MoE/attention output reductions that aren't folded into a
+        fused kernel.
+      </p>
+      <p><span class="fileref">custom_all_reduce.cu</span></p>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="toolkit">7. The recurring toolkit</h2>
+
+  <p>
+    Read all five kernels and the same handful of techniques keep showing up. This <em>is</em> the
+    vocabulary of a hand-written fusion — reach for these when you write your own:
+  </p>
+
+  <table>
+    <thead><tr><th>Technique</th><th>What it buys</th><th>Seen in</th></tr></thead>
+    <tbody>
+      <tr><td><b>Warp-per-row/head</b> (32 lanes × N dims)</td><td>reductions become pure shuffles; no shared mem / block sync</td><td>① ②⁺ silu</td></tr>
+      <tr><td><b><code>__shfl_xor_sync</code> butterfly reduce</b></td><td>full-warp sum/max in log₂(32)=5 steps, in registers</td><td>① silu (sum/abs-max)</td></tr>
+      <tr><td><b><code>__shfl_xor</code> for RoPE partners</b></td><td>pair-rotate without staging through shared mem</td><td>①</td></tr>
+      <tr><td><b>Vectorized I/O</b> (<code>uint2</code>/<code>float4</code>)</td><td>one coalesced transaction per lane; bf16↔fp32 in regs</td><td>① ② silu</td></tr>
+      <tr><td><b>Compile-time template gating</b></td><td>dead paths fold away; no runtime branches in the hot loop</td><td>① (dense/sparse) ② (NRanks/dims)</td></tr>
+      <tr><td><b>Stride-driven layout</b></td><td>one kernel serves NHD &amp; HND caches; no copies</td><td>①</td></tr>
+      <tr><td><b>PDL</b> (griddepcontrol / launch attrs)</td><td>overlap with neighbor kernels; hide launch latency</td><td>① ②</td></tr>
+      <tr><td><b>Lamport one-shot + sentinel</b></td><td>flag-free cross-GPU reduce; data value is the ready bit</td><td>②</td></tr>
+      <tr><td><b>fp32 math, scalar_t store</b></td><td>numerics match the unfused reference exactly</td><td>① ② silu</td></tr>
+    </tbody>
+  </table>
+
+  <details class="qa">
+    <summary>How do I verify a hand-written kernel matches the unfused model?</summary>
+    <div>
+      <p>
+        Each kernel has a companion pytest (e.g.
+        <code>test_fused_minimax_m3_qknorm_rope_kv_insert.py</code>) that builds the same inputs, runs the
+        eager <code>norm → rope → insert</code> sequence as the reference, and asserts
+        <code>allclose</code> at the dtype tolerance. The kernels deliberately do all reductions in
+        <b>fp32</b> and round to <code>scalar_t</code> only on store, matching the materialized unfused
+        output — that's what keeps the diff within tolerance.
+      </p>
+    </div>
+  </details>
+
+  <details class="qa">
+    <summary>Why "libtorch_stable"? Does it change the kernels?</summary>
+    <div>
+      <p>
+        It changes the <em>wrapper</em>, not the compute. The migration moves the torch op boundary to
+        the <b>stable ABI</b> (<code>torch::stable::Tensor</code>, <code>STD_TORCH_CHECK</code>,
+        <code>VLLM_STABLE_DISPATCH_*</code>) so the extension binary keeps working across PyTorch
+        versions without recompiling. The <code>__global__</code> kernel bodies are unchanged.
+      </p>
+    </div>
+  </details>
+
+  <div class="callout good">
+    <strong>The throughline to FUSIONS.html</strong>
+    Kernel ① is exactly the "hand-written route" from <a href="FUSIONS.html#byhand">§10</a>: an explicit
+    fused op called from <code>forward</code>, with a capability gate (template instantiation), an fp32
+    reference contract, and graceful fallbacks (dense path, pre-Hopper no-PDL). Kernel ② is the M3
+    realization of the AllReduce+Norm fusion the compile passes would otherwise do (<a href="FUSIONS.html#arnorm">§6</a>) —
+    but written by hand because, under breakable CG, there is no pass.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="map">8. File &amp; commit map</h2>
+
+  <table>
+    <thead><tr><th>File (under <code>csrc/libtorch_stable/</code>)</th><th>Kernel / op</th><th>Commit</th></tr></thead>
+    <tbody>
+      <tr><td><span class="fileref">fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu</span></td><td>① attention prologue (§4)</td><td><span class="mono">0a1c5034f</span> (#45381), <span class="mono">40b5d9aad</span> (#138)</td></tr>
+      <tr><td><span class="fileref">minimax_reduce_rms_kernel.cu</span> (+ <span class="fileref">.h</span>)</td><td>② cross-TP AR+RMS (§5)</td><td><span class="mono">ecd1ea136</span> (#37045), <span class="mono">59d023619</span> (#44365)</td></tr>
+      <tr><td><span class="fileref">quantization/fused_kernels/fused_silu_mul_block_quant.cu</span></td><td>SwiGLU + per-block fp8 (§6)</td><td><span class="mono">c09ad767c</span> (#32996)</td></tr>
+      <tr><td><span class="fileref">fp32_router_gemm.cu</span>, <span class="fileref">fp32_router_gemm_entry.cu</span></td><td>MoE router GEMV (§6)</td><td><span class="mono">559d6710b</span> (#38445), <span class="mono">3d224ea29</span></td></tr>
+      <tr><td><span class="fileref">moe/mxfp8_moe/cutlass_mxfp8_grouped_mm.cu</span>, <span class="fileref">mxfp8_experts_quant.cu</span></td><td>MXFP8 grouped MM (§6)</td><td><span class="mono">59d023619</span> (#44365)</td></tr>
+      <tr><td><span class="fileref">fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu</span></td><td>DeepSeek-V4 analogue of ① (not M3)</td><td><span class="mono">4d51588e2</span> (#40860)</td></tr>
+      <tr><td><span class="fileref">torch_bindings.cpp</span>, <span class="fileref">ops.h</span></td><td>op registration for all of the above</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Caveat &amp; verification</strong>
+    Kernel bodies, op names, and commit hashes were read directly from the
+    <span class="fileref">vllm-internal</span> tree on branch <code>extenddecode</code> at the time of
+    writing. Code snippets here are condensed for readability — line breaks, casts, and guards are
+    trimmed. Always read the actual <code>.cu</code> before relying on a specific detail; line numbers
+    drift and the libtorch-stable migration moves files.
+  </div>
+
+  <div class="foot">
+    MiniMax M3 hand-written kernels · <code>vllm-internal</code> @ <code>extenddecode</code> ·
+    sources: <span class="mono">csrc/libtorch_stable/{fused_minimax_m3_qknorm_rope_kv_insert,minimax_reduce_rms}_kernel.cu</span>,
+    <span class="mono">.../quantization/fused_kernels/fused_silu_mul_block_quant.cu</span>,
+    <span class="mono">.../fp32_router_gemm.cu</span>, <span class="mono">.../moe/mxfp8_moe/</span>.
+  </div>
+</main>
+</body>
+</html>

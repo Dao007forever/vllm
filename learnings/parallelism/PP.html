@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pipeline Parallelism &amp; Chunked Pipeline Parallel &mdash; vLLM Parallelism</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .gantt {
+    margin: 14px 0;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.78em;
+  }
+  .gantt-row {
+    display: grid;
+    grid-template-columns: 70px repeat(16, 1fr);
+    gap: 1px;
+    margin: 2px 0;
+    align-items: stretch;
+  }
+  .gantt-row .lbl { background: transparent; color: var(--muted); padding: 6px 6px; text-align: right; font-size: 0.86em; }
+  .gantt-row .slot { padding: 6px 2px; text-align: center; border-radius: 2px; }
+  .slot.f { background: var(--blue-soft); color: var(--blue); border: 1px solid #a6c8df; }
+  .slot.b { background: var(--green-soft); color: var(--green); border: 1px solid #abd1bb; }
+  .slot.bubble { background: #f1f1ee; color: var(--muted); border: 1px dashed var(--border); font-style: italic; }
+  .slot.send { background: var(--violet-soft); color: var(--violet); border: 1px solid #c9b8dc; }
+  .pipe-stage {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 6px 0;
+  }
+  .pipe-stage .layers { color: var(--muted); font-size: 0.85em; }
+  .chunk-table th:first-child { width: 10%; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">parallelism/</a> &rsaquo; <strong>PP</strong> &mdash;
+    Pipeline Parallelism &amp; Chunked Pipeline Parallel
+  </div>
+
+  <h1>Pipeline Parallelism (PP) &amp; Chunked Pipeline Parallel (CPP)</h1>
+  <p class="subtitle">
+    Pipeline parallel splits the model <em>by layer</em>. Stage <code>k</code>
+    holds layers <code>[k&middot;L/N, (k+1)&middot;L/N)</code> and ships activations
+    to stage <code>k+1</code>. The unit of communication is the entire
+    hidden state; the trade-off is bubbles. <strong>Chunked Pipeline Parallel</strong>
+    (CPP) is the optimisation that overlaps chunked-prefill chunks <em>across</em>
+    pipeline stages so multiple chunks are in flight at once, using async
+    (non-blocking) Send to remove the serial hand-off bottleneck.
+  </p>
+
+  <section class="tldr">
+    <strong>One-line model</strong>
+    <p>
+      PP is the right tool when you need to cross a node boundary. Per-step
+      communication is just two Send/Recv per stage transition, instead of
+      AllReduce per layer. The cost is the <em>bubble</em>: the time when
+      pipeline stages are idle while data flows through. <strong>CPP</strong> is
+      the cure for that bubble when chunked prefill is on: make the inter-stage
+      Send asynchronous so stage <code>k</code> can start chunk <code>N+1</code>
+      while stage <code>k+1</code> is still chewing on chunk <code>N</code>.
+    </p>
+  </section>
+
+  <div class="nav">
+    <ol>
+      <li><a href="#stages">Pipeline stages</a></li>
+      <li><a href="#hand-off">The stage hand-off</a></li>
+      <li><a href="#bubble">The bubble problem</a></li>
+      <li><a href="#cpp">Chunked Pipeline Parallel (CPP)</a></li>
+      <li><a href="#pp-vs-tp">PP vs TP: when to pick which</a></li>
+      <li><a href="#config">Config and code pointers</a></li>
+      <li><a href="#limits">Limits and gotchas</a></li>
+    </ol>
+  </div>
+
+  <h2 id="stages">Pipeline stages</h2>
+
+  <p>
+    <code>pipeline_parallel_size = N</code> means the model's layers are sliced
+    into <code>N</code> contiguous blocks. Each PP stage holds exactly one
+    block on its TP group. For Llama-3 70B with 80 layers and <code>PP=4</code>:
+  </p>
+
+  <div class="pipe-stage">
+    <strong>PP stage 0</strong> &mdash; embedding + layers 0&ndash;19
+    <div class="layers">Reads: token IDs &middot; Writes: hidden state</div>
+  </div>
+  <div class="pipe-stage">
+    <strong>PP stage 1</strong> &mdash; layers 20&ndash;39
+    <div class="layers">Reads: hidden state from stage 0 &middot; Writes: hidden state</div>
+  </div>
+  <div class="pipe-stage">
+    <strong>PP stage 2</strong> &mdash; layers 40&ndash;59
+    <div class="layers">Reads: hidden state from stage 1 &middot; Writes: hidden state</div>
+  </div>
+  <div class="pipe-stage">
+    <strong>PP stage 3</strong> &mdash; layers 60&ndash;79 + lm_head
+    <div class="layers">Reads: hidden state from stage 2 &middot; Writes: token logits</div>
+  </div>
+
+  <p>
+    Each stage can still be a TP group internally. The full grid:
+  </p>
+
+  <pre><code>world_size = DP &times; PP &times; PCP &times; TP
+
+# PP=4, TP=2 on 8 GPUs:
+PP stage 0: GPUs {0, 1}  (TP=2)
+PP stage 1: GPUs {2, 3}
+PP stage 2: GPUs {4, 5}
+PP stage 3: GPUs {6, 7}</code></pre>
+
+  <p>
+    The PP group spans across-node ranks (one rank per stage), while each TP
+    group stays within a single node. This is intentional: TP wants NVLink,
+    PP can survive on a slower network because it only sends per-stage hidden
+    states, not per-layer AllReduces.
+  </p>
+
+  <h2 id="hand-off">The stage hand-off</h2>
+
+  <p>
+    At the boundary between stage <code>k</code> and stage <code>k+1</code>,
+    every TP rank in stage <code>k</code> sends to its matching TP rank in
+    stage <code>k+1</code>. The protocol is:
+  </p>
+
+  <ol class="steps">
+    <li>
+      Stage <code>k</code> finishes its layer block. Each TP rank holds its
+      shard of the hidden state.
+    </li>
+    <li>
+      The PP group's <code>get_pp_group().send_tensor_dict({"hidden_states":
+      h_local, "residual": r_local}, dst=k+1)</code> is called.
+    </li>
+    <li>
+      Stage <code>k+1</code> calls <code>recv_tensor_dict(src=k)</code> to
+      receive the hidden state. Each TP rank receives the matching shard.
+    </li>
+    <li>
+      Stage <code>k+1</code> begins its layer block immediately.
+    </li>
+  </ol>
+
+  <p>
+    The bytes-per-send are <code>B &times; S &times; H/TP</code> per rank (the
+    hidden state, sharded). For a 70B model at <code>H=8192, TP=2</code>, that's
+    8 KB per token per layer-block boundary &mdash; trivial compared to
+    AllReduce volume.
+  </p>
+
+  <h2 id="bubble">The bubble problem</h2>
+
+  <p>
+    If you send a single batch through the pipeline, only one stage is busy at
+    a time. The others wait. For <code>PP=4</code>, GPU utilisation peaks at
+    <code>25%</code> without microbatching:
+  </p>
+
+  <div class="gantt">
+    <div class="gantt-row">
+      <div class="lbl">stage 0</div>
+      <div class="slot f">F</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 1</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 2</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+  </div>
+
+  <p>
+    Fix it by feeding multiple microbatches concurrently. Each stage processes
+    microbatch <code>m</code> for its layers, then immediately starts
+    microbatch <code>m+1</code> while stage <code>k+1</code> processes
+    <code>m</code>. With 4 microbatches and 4 stages, steady-state utilisation
+    is ~100% in the middle, with bubbles only at the start and end:
+  </p>
+
+  <div class="gantt">
+    <div class="gantt-row">
+      <div class="lbl">stage 0</div>
+      <div class="slot f">F0</div>
+      <div class="slot f">F1</div>
+      <div class="slot f">F2</div>
+      <div class="slot f">F3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F4</div>
+      <div class="slot f">F5</div>
+      <div class="slot f">F6</div>
+      <div class="slot f">F7</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 1</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F0</div>
+      <div class="slot f">F1</div>
+      <div class="slot f">F2</div>
+      <div class="slot f">F3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F4</div>
+      <div class="slot f">F5</div>
+      <div class="slot f">F6</div>
+      <div class="slot f">F7</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 2</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F0</div>
+      <div class="slot f">F1</div>
+      <div class="slot f">F2</div>
+      <div class="slot f">F3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F4</div>
+      <div class="slot f">F5</div>
+      <div class="slot f">F6</div>
+      <div class="slot f">F7</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F0</div>
+      <div class="slot f">F1</div>
+      <div class="slot f">F2</div>
+      <div class="slot f">F3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">F4</div>
+      <div class="slot f">F5</div>
+      <div class="slot f">F6</div>
+      <div class="slot f">F7</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+  </div>
+
+  <p>
+    For <em>inference</em> (no backward pass), the algebra is simpler than
+    Megatron's 1F1B training pipelines. vLLM's scheduler interleaves
+    microbatches from independent requests; you don't need backward passes
+    racing forward, just enough decode requests in flight to keep all stages
+    busy.
+  </p>
+
+  <h2 id="cpp">Chunked Pipeline Parallel (CPP)</h2>
+
+  <div class="callout info">
+    <strong>Disambiguation</strong>: "CPP" is used in the vLLM community for
+    two related-but-not-identical things. (1) The <em>narrow</em> reading
+    (rebel-jinhwan/vllm-rbln #5): chunked-prefill chunks driven through PP via
+    async Send. (2) The <em>broad</em> reading (vLLM RFC #28912, also called
+    <em>Context Pipeline Parallelism</em> or <em>Sequence Pipeline
+    Parallelism</em>, after arXiv 2409.17264): a redesign that adds
+    FLOPs-balanced chunking, an async scheduler, and async <code>isend</code>/
+    <code>irecv</code> so the four distinct PP bubbles can all be flattened.
+    The narrow reading is one piece of the broad one.
+  </div>
+
+  <p>
+    CPP is the combination of two ideas that vLLM already has separately:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Chunked prefill</strong>: split a long prefill into chunks of
+      ~2k tokens so the per-step latency stays bounded and decode requests can
+      run between chunks. (Scheduler knob:
+      <code>enable_chunked_prefill</code>; not a parallelism strategy on its
+      own.)
+    </li>
+    <li>
+      <strong>Pipeline parallel</strong>: split the model by layer-blocks; each
+      block is a stage.
+    </li>
+  </ol>
+
+  <p>
+    Stick the two together naively and you get the <em>sequential-chunks</em>
+    behaviour. Each chunk walks all PP stages before the next chunk starts:
+  </p>
+
+  <div class="callout bad">
+    <strong>The wasted gap</strong>: while chunk <code>N</code> is processed by
+    stage 1, stage 0 has finished its job for chunk <code>N</code> and is sitting
+    idle &mdash; even though chunk <code>N+1</code> is queued and ready. The
+    serial walk reintroduces the bubble that microbatching was supposed to
+    eliminate.
+  </div>
+
+  <h3>The four PP bubbles (per RFC #28912)</h3>
+
+  <p>
+    The vLLM RFC is precise about why naively combining PP with chunked prefill
+    isn't enough &mdash; it identifies four distinct sources of idle time, each
+    needing a different fix:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Bubble</th><th>Cause</th><th>What removes it</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Bubble 0</strong></td>
+        <td>Blocking inter-stage Send: stage <code>k</code> waits for stage <code>k+1</code> to receive before continuing.</td>
+        <td>Async P2P (<code>isend</code>/<code>irecv</code>), the narrow-CPP fix.</td>
+      </tr>
+      <tr>
+        <td><strong>Bubble 1</strong></td>
+        <td>Synchronous scheduler overhead: each PP rank has its own FCFS scheduler that runs serially with the worker.</td>
+        <td>Async scheduler &mdash; scheduling overlaps with the previous step's compute.</td>
+      </tr>
+      <tr>
+        <td><strong>Bubble 2</strong></td>
+        <td>
+          Adjacent <code>InputBatch</code>es differ in compute cost because
+          schedulers split on token count, not FLOPs (attention is
+          O(S<sup>2</sup>) on context, so a 2k chunk on a 100k context is far
+          heavier than a 2k chunk on a 2k context). When stage <code>k</code>'s
+          chunk is heavier than stage <code>k+1</code>'s previous chunk, stage
+          <code>k+1</code> finishes early, has nothing to receive yet, and
+          idles. <em>Downstream-stage idle</em>.
+        </td>
+        <td>FLOPs-balanced chunking: budget batches by <em>computational load</em> (a function of chunk size and context length), not by token count.</td>
+      </tr>
+      <tr>
+        <td><strong>Bubble 3</strong></td>
+        <td>
+          Mirror of Bubble 2: when stage <code>k</code>'s chunk is lighter than
+          stage <code>k+1</code>'s, stage <code>k</code> finishes early but
+          can't push its result downstream (K+1 is still busy). Even with async
+          send, the bounded send-queue fills, the scheduler can't usefully
+          start another chunk yet, and stage <code>k</code> stalls.
+          <em>Upstream-stage idle</em>.
+        </td>
+        <td>Same fix (FLOPs balancing) plus SLO-based prioritisation to keep the steady-state chunk-queue full.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The narrow-CPP fix (async Send) only addresses Bubble 0. The broad CPP
+    proposal aims for all four.
+  </p>
+
+  <h3>The CPP fix: async Send</h3>
+
+  <p>
+    Move the blocking <code>send_tensor_dict()</code> off the main thread. A
+    background daemon thread holds the in-flight Send while the worker keeps
+    going. The next chunk's forward pass starts immediately. Right before the
+    worker would <em>overwrite</em> the intermediate-tensors buffer (which the
+    background send still has a handle to), call <code>wait_pending_send()</code>
+    to ensure the previous send has drained.
+  </p>
+
+  <div class="callout good">
+    <strong>The pipeline as it should be</strong>: with PP=4 and 4 chunks in
+    flight, all four stages stay busy in steady state. Stage 0 processes chunk
+    4 while stage 3 is finishing chunk 1. Reported scaling efficiency in the
+    SGLang reference is ~83% at PP=4 &mdash; the gap to 100% being the start-up
+    and drain bubbles at the chunk-queue ends.
+  </div>
+
+  <h3>Concurrent chunks on the pipeline (PP=4, 4 chunks of a long prefill)</h3>
+
+  <div class="gantt">
+    <div class="gantt-row">
+      <div class="lbl">stage 0</div>
+      <div class="slot f">C1</div>
+      <div class="slot f">C2</div>
+      <div class="slot f">C3</div>
+      <div class="slot f">C4</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 1</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">C1</div>
+      <div class="slot f">C2</div>
+      <div class="slot f">C3</div>
+      <div class="slot f">C4</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 2</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">C1</div>
+      <div class="slot f">C2</div>
+      <div class="slot f">C3</div>
+      <div class="slot f">C4</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+    <div class="gantt-row">
+      <div class="lbl">stage 3</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot f">C1</div>
+      <div class="slot f">C2</div>
+      <div class="slot f">C3</div>
+      <div class="slot f">C4</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+      <div class="slot bubble">&middot;</div>
+    </div>
+  </div>
+
+  <p>
+    Same shape as the microbatch pipeline diagram above &mdash; but with a key
+    difference: the microbatches here are <em>chunks of a single prefill
+    request</em>, which CPP makes possible because each chunk only depends on
+    the prefix that the <em>previous</em> chunk wrote to KV cache, not on the
+    current chunk's downstream PP stages.
+  </p>
+
+  <h3>The bubble-ratio formula (SGLang)</h3>
+
+  <p>
+    SGLang quantifies the leftover bubble exactly:
+  </p>
+
+  <pre><code>Bubble Ratio = (P &minus; 1) / (P &minus; 1 + M)</code></pre>
+
+  <p>
+    where <code>P</code> = pipeline depth (number of PP stages) and
+    <code>M</code> = number of chunks. Both terms come straight from the gantt
+    above &mdash; here's the derivation:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Where the <code>P &minus; 1</code> comes from</h3>
+      <p>
+        The first useful output from the last stage appears only after
+        <code>P &minus; 1</code> fill steps (stage 0 &rarr; 1 &rarr; ... &rarr; P&minus;1).
+        Symmetrically, when the input ends, it takes another
+        <code>P &minus; 1</code> drain steps for the last chunk to walk through.
+      </p>
+      <p>
+        Per-device, fill and drain split that total: stage 0 is busy from the
+        start and idles for the last <code>P &minus; 1</code> steps; stage P&minus;1
+        idles for the first <code>P &minus; 1</code> steps and is busy at the end.
+        Either way, <em>each</em> device sits idle for exactly
+        <code>P &minus; 1</code> chunk-times.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Where the <code>M</code> comes from</h3>
+      <p>
+        Useful work per device = <code>M</code> chunks. The wall-clock for the
+        whole pipeline is <code>fill + work + drain</code> &mdash; but the fill
+        and drain overlap on different devices, so the <em>elapsed</em> time is:
+      </p>
+      <pre><code>total time = M (useful) + (P &minus; 1) (start fill or end drain)</code></pre>
+      <p>
+        Divide idle by total: <code>(P &minus; 1) / (P &minus; 1 + M)</code>.
+        When <code>M &gg; P</code> the ratio &rarr; 0; when <code>M = 1</code>
+        (one chunk, naive PP) the ratio is <code>(P&minus;1)/P</code> &mdash;
+        which for PP=4 is 75% bubble, matching the "GPU utilisation 25%"
+        diagram earlier.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    The formula tells you the two knobs: <strong>more chunks</strong> (smaller
+    chunk size) drives <code>M</code> up; <strong>shallower pipeline</strong>
+    drives <code>P</code> down. The first is preferred &mdash; per-chunk
+    overhead has to be paid in CUDA-graph launch cost, but chunks themselves
+    are nearly free to multiply.
+  </p>
+
+  <div class="callout warn">
+    <strong>Why fixed chunks underperform the formula in practice</strong>.
+    Attention is <code>O(S<sup>2</sup>)</code> on context, so a fixed-size 6k
+    chunk takes longer when it lands at position 100k than at position 6k.
+    Later chunks run slower than earlier ones; downstream stages keep waiting
+    on the slow tail. SGLang reports that with fixed chunks "the pipeline
+    bubble ratio will be greater than the theoretical expectation."
+  </div>
+
+  <h3>Dynamic Chunking (DCK)</h3>
+
+  <p>
+    DCK shrinks each later chunk so that the wall-clock for processing it
+    matches the wall-clock of the first chunk. Concretely, given prefix length
+    <code>L</code>:
+  </p>
+
+  <pre><code>Runtime(L + &Delta;L) &minus; Runtime(L) = Runtime(initial chunk size)</code></pre>
+
+  <p>
+    Cumulative attention runtime is modelled as quadratic in <code>L</code>;
+    SGLang solves the equation for <code>&Delta;L</code> and floors it to a
+    multiple of <code>max(--page-size, 64)</code>. A smoothing factor
+    (<code>SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR</code>, default 0.75, sweet
+    spot 0.6&ndash;0.85) damps the shrinkage so chunks don't become trivially
+    small at the tail. This is the concrete fix for Bubble 2/3 from the
+    four-bubble taxonomy above &mdash; "FLOPs-balanced chunking" in action.
+  </p>
+
+  <h3>Async P2P + multi-stream</h3>
+
+  <p>
+    The async-Send trick from the rbln implementation generalises in SGLang to
+    two pieces:
+  </p>
+
+  <ul>
+    <li>
+      <code>async_send</code> returns a <code>P2PWork</code> handle; the wait
+      is deferred to a later <code>_pp_commit_comm_work</code> call so the CPU
+      schedules the next batch while bytes are still in flight.
+    </li>
+    <li>
+      Dedicated CUDA streams (<code>forward_stream</code> and
+      <code>copy_stream</code>) overlap GPU compute and D2H copies with the
+      main sync stream &mdash; same idea as cudagraphs splitting the
+      attention-and-comm phases.
+    </li>
+  </ul>
+
+  <h3>Why this needs to be opt-in</h3>
+
+  <p>
+    Three things have to be true for CPP to be safe and useful:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Multiple in-flight batches per worker</strong>. vLLM V1 already
+      supports this through <code>step_with_batch_queue()</code> with
+      <code>max_concurrent_batches = pp_size</code>.
+    </li>
+    <li>
+      <strong>The Send buffer must not be overwritten in flight</strong>. The
+      worker reuses fixed staging tensors (<code>prefill_intermediate_tensors</code>,
+      <code>decode_intermediate_tensors</code>) to avoid allocation churn. The
+      async path calls <code>wait_pending_send()</code> at the top of the next
+      <code>execute_model()</code> step so the previous send is guaranteed
+      drained before the buffer is reused. Skipping this would corrupt the
+      data in flight.
+    </li>
+    <li>
+      <strong>Only one outstanding Send</strong> per worker. Bounded queue depth,
+      no head-of-line stalls beyond a single chunk's send time.
+    </li>
+  </ul>
+
+  <h3>The broad design (RFC #28912): FLOPs budgeting + async scheduler</h3>
+
+  <p>
+    Async Send alone removes Bubble 0. To remove the others, RFC #28912 proposes
+    two phases of change beyond the narrow rbln fix:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Phase 1 &mdash; request-grained PP with FLOPs-balanced chunking</h3>
+      <p>
+        Stop using "token count" as the scheduler budget. Use a
+        <em>computational-load</em> estimate that's a function of chunk size
+        <em>and</em> context length (attention is O(S<sup>2</sup>) so a 2k
+        chunk on a 100k context is much heavier than a 2k chunk on a 2k
+        context).
+      </p>
+      <ul>
+        <li>Adds FLOPs estimation to the scheduler.</li>
+        <li>Switches the budget metric from <code>max_num_batched_tokens</code> to a load metric.</li>
+        <li>SLO-based scheduling to keep TTFT bounded.</li>
+        <li>Tracks <a href="https://github.com/vllm-project/vllm/pull/20808">PR vllm#20808</a>.</li>
+      </ul>
+      <p>
+        Result: adjacent chunks have similar wall-clock cost, so Bubbles 2 and
+        3 (the per-stage hand-off mismatches) shrink.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Phase 2 &mdash; pack multiple chunks of one request per <code>InputBatch</code></h3>
+      <p>
+        Give the priority scheduler more flexibility by allowing several chunks
+        of the <em>same</em> request to coexist in one batch. Useful when one
+        long prefill dominates a stage.
+      </p>
+      <p>
+        The author flags this <em>"may impact certain dictionary variables
+        keyed by <code>req_id</code>"</em> &mdash; many vLLM internals assume
+        one entry per request per batch, so this phase is invasive.
+      </p>
+    </div>
+  </div>
+
+  <h3>The async ingredient pair</h3>
+
+  <p>
+    The RFC is emphatic that <strong>async scheduler and async P2P are both
+    required</strong>. Doing one without the other re-introduces the bubble:
+  </p>
+
+  <ul>
+    <li>
+      Async P2P without async scheduler: stages don't block on Send any more,
+      but each rank's <em>scheduler</em> still runs serially with its worker
+      &rarr; Bubble 1 dominates.
+    </li>
+    <li>
+      Async scheduler without async P2P: the scheduler is ready early, but the
+      Send is still blocking &rarr; Bubble 0 dominates.
+    </li>
+    <li>
+      vLLM's existing <code>recv_tensor_dict()</code> path in
+      <span class="fileref">gpu_worker.py</span> is synchronous; switching to
+      <code>isend</code>/<code>irecv</code> hits
+      <a href="https://github.com/pytorch/pytorch/issues/122597">PyTorch issue #122597</a>,
+      which is part of why the RFC predicts a long landing time.
+    </li>
+  </ul>
+
+  <h3>Reference numbers</h3>
+
+  <p>
+    Three data points across implementations:
+  </p>
+
+  <ul>
+    <li>
+      <strong>rbln implementation (narrow CPP)</strong>: Llama-3.2-1B, PP=2,
+      max_num_seqs=2 &mdash; async-Send-on vs off is essentially identical
+      (789 vs 797 tok/s, 16 reqs at 512in/64out). The author flags the bubble
+      is "too small" at this scale to demonstrate the optimisation.
+    </li>
+    <li>
+      <strong>RFC #28912 preliminaries</strong>: request-level PP had <em>higher</em>
+      TTFT than vanilla PP or chunk-level PP &mdash; explicitly cited as
+      evidence that "an asynchronous scheduler and asynchronous communication
+      are critical prerequisites". Without them, finer-grained PP is bitten
+      by per-iteration bubbles.
+    </li>
+    <li>
+      <strong>SGLang (broad CPP, fully overlapped) at scale</strong> &mdash; on
+      H20 nodes (8&times;96 GB) with DeepSeek-V3.1 and Qwen3-235B-A22B-FP8:
+    </li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr><th>Model / setup</th><th>Result</th><th>Baseline beaten</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DeepSeek-V3.1, PP4 TP8, DCK 12K (&sigma;=0.65), batch=1</td>
+        <td>3.31&times; throughput</td>
+        <td>vs TP8</td>
+      </tr>
+      <tr>
+        <td>Same vs best TP32</td>
+        <td>+30.5%</td>
+        <td>(even worst PP4 TP8 fixed-chunk beats TP32 by +18.4%)</td>
+      </tr>
+      <tr>
+        <td>Qwen3-235B-A22B-FP8, DCK 18K, PP8 (32 GPUs)</td>
+        <td>6.14&times; throughput</td>
+        <td>vs PP1 (4 GPUs)</td>
+      </tr>
+      <tr>
+        <td>DeepSeek-V3.1 strong-scaling at PP4 (ITL fixed, 128K input)</td>
+        <td>82.8% efficiency</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td>Qwen DCK 18K at PP8 strong scaling</td>
+        <td>76.9% efficiency</td>
+        <td>vs 69.6% with fixed-6K chunks &mdash; DCK win attributable</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>TTFT reduction (the headline use-case)</h4>
+
+  <table>
+    <thead>
+      <tr><th>Model</th><th>PP1 baseline</th><th>CPP</th><th>Reduction</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Qwen3-235B-A22B-FP8 @ 128K input</td>
+        <td>~55.5s (PP1 TP4)</td>
+        <td>~10.5s (PP8 TP4)</td>
+        <td>&minus;81.1%</td>
+      </tr>
+      <tr>
+        <td>DeepSeek-V3.1 @ 128K input</td>
+        <td>~48.5s (PP1 TP8)</td>
+        <td>~15.5s (PP4 TP8)</td>
+        <td>&minus;67.9%</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    And the scaling-out wall: Qwen3-235B at PP8 TP4 TTFT goes
+    <code>10.5s (128K) &rarr; 32.7s (256K) &rarr; 114.3s (512K) &rarr; 420.9s (1M)</code>.
+    The super-linear growth is the <code>S<sup>2</sup></code> attention cost
+    bleeding through &mdash; CPP makes 1M-token serving practical, but doesn't
+    repeal the quadratic.
+  </p>
+
+  <h4>The layer-partition tip</h4>
+
+  <div class="callout good">
+    Put the heavier partition on <em>higher</em> PP ranks
+    (<code>SGLANG_PP_LAYER_PARTITION=15,15,15,16</code> typically beats
+    <code>16,15,15,15</code> for DeepSeek-V3.1). The trailing rank's extra work
+    overlaps with upstream P2P traffic, eating into the drain bubble. Asymmetry
+    in the <em>right</em> direction is free latency.
+  </div>
+
+  <p>
+    Takeaway: CPP is a real win, but only after <em>all four</em> bubbles are
+    addressed. The narrow rbln implementation is one piece; the RFC is the
+    plan for the rest. Both were in flight at the time of writing; the RFC was
+    closed but cited as design context for ongoing work
+    (<a href="https://github.com/vllm-project/vllm/pull/20359">PR #20359</a>,
+    <a href="https://github.com/vllm-project/vllm/pull/23545">#23545</a>,
+    <a href="https://github.com/vllm-project/vllm/pull/20808">#20808</a>).
+  </p>
+
+  <h3>How CPP composes with TP and decode</h3>
+
+  <p>
+    The SGLang blog frames PP and TP as complements rather than substitutes:
+  </p>
+
+  <ul>
+    <li>
+      <strong>TP</strong>: AllReduce per layer, comm volume scales as
+      <code>4&middot;B&middot;S&middot;H&middot;L</code> &mdash; <em>grows with
+      every layer</em>, bandwidth-bound across nodes.
+    </li>
+    <li>
+      <strong>PP</strong>: Send/Recv only at stage boundaries, comm volume
+      <code>B&middot;S&middot;H&middot;(P&minus;1)</code> &mdash; independent
+      of layer count.
+    </li>
+    <li>
+      Recommended pattern: TP (or CP) <em>within</em> a node over NVLink, PP
+      <em>across</em> nodes to dodge cross-node bandwidth ceilings.
+    </li>
+    <li>
+      Note also: very wide TP runs into a <em>quantization wall</em> &mdash; FP8
+      block granularity doesn't divide MoE FFN weights cleanly past some TP
+      size, so MoE deployments often hit a hard TP ceiling well before
+      bandwidth becomes the binding constraint.
+    </li>
+  </ul>
+
+  <p>
+    CPP targets the <em>prefill</em> phase where <code>M &gg; P</code> makes
+    the bubble disappear. For decode, where each step has just one new token
+    per request, there's nothing to chunk &mdash; so SGLang uses
+    <em>PD-disaggregated</em> deployments: prefill nodes run heavy PP (e.g.
+    PP8 TP8) and decode nodes run a totally different layout
+    (PP1 TP8, PP1 DP16 EP16, etc.), letting each phase hit its own TTFT/TPOT
+    targets. KV cache transfers between them happen chunk-by-chunk via
+    backends like Mooncake instead of waiting for full prefill to finish.
+  </p>
+
+  <div class="callout info">
+    <strong>Don't confuse CPP with chunked prefill</strong>. Chunked prefill
+    alone is a scheduler trick to bound per-step latency; it does not require
+    PP. CPP is what happens when chunked prefill <em>plus</em> PP cooperate via
+    async Send, async scheduler, and FLOPs-balanced chunking so that the
+    per-chunk pipeline behaves like a microbatch pipeline. Without those, you
+    have PP + chunked prefill but not CPP &mdash; chunks still walk the
+    pipeline serially.
+  </div>
+
+  <h2 id="pp-vs-tp">PP vs TP &mdash; when to pick which</h2>
+
+  <table>
+    <thead>
+      <tr><th></th><th>TP</th><th>PP</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Comm per layer</td>
+        <td>2 AllReduce (each <code>2B&times;S&times;H</code> volume)</td>
+        <td>0 between stage interior; 1 Send/Recv at stage boundary</td>
+      </tr>
+      <tr>
+        <td>Comm hardware</td>
+        <td>Needs NVLink or NVSwitch (intra-node)</td>
+        <td>OK on Ethernet / IB (inter-node)</td>
+      </tr>
+      <tr>
+        <td>Memory split</td>
+        <td>Weights split <code>1/N</code> within each layer</td>
+        <td>Different layers on different GPUs</td>
+      </tr>
+      <tr>
+        <td>Latency for batch=1</td>
+        <td>Best (every GPU is computing every layer)</td>
+        <td>Worst (one GPU at a time)</td>
+      </tr>
+      <tr>
+        <td>Throughput at scale</td>
+        <td>Limited by AllReduce bandwidth</td>
+        <td>Limited by bubble</td>
+      </tr>
+      <tr>
+        <td>KV cache</td>
+        <td>Sharded per head</td>
+        <td>Each stage holds KV only for its layers</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The pragmatic rule for multi-node serving:
+    <strong>TP within a node, PP across nodes</strong>. So with 16 GPUs split
+    across 2 nodes of 8 each, the natural config is <code>TP=8, PP=2</code>.
+  </p>
+
+  <h2 id="config">Config and code pointers</h2>
+
+  <pre><code># PP only
+vllm serve meta-llama/Llama-3-405B \
+  --pipeline-parallel-size 8
+
+# PP + TP for multi-node (16 GPUs, 2 nodes)
+vllm serve ... \
+  --pipeline-parallel-size 2 \
+  --tensor-parallel-size 8
+
+# CPP requires PP + chunked prefill + async Send.
+# Chunked prefill is on by default in V1; PP is opt-in;
+# the async-Send hook is platform-specific (see references below).
+vllm serve ... \
+  --pipeline-parallel-size 4 \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 8192 \
+  --long-prefill-token-threshold 2048</code></pre>
+
+  <ul>
+    <li>
+      <span class="fileref">vllm/config/parallel.py</span>:111
+      &mdash; <code>pipeline_parallel_size</code>.
+    </li>
+    <li>
+      <span class="fileref">vllm/config/scheduler.py</span>:84
+      &mdash; <code>enable_chunked_prefill</code> (required for CPP to have
+      anything to overlap).
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/parallel_state.py</span>:1251
+      &mdash; <code>_PP</code> group; :1641 &mdash; PP group construction (transposed view of the all-ranks tensor).
+    </li>
+    <li>
+      <span class="fileref">vllm/v1/engine/core.py</span>
+      &mdash; <code>step_with_batch_queue()</code> with
+      <code>max_concurrent_batches = pp_size</code> is what lets multiple
+      chunks be in flight at once.
+    </li>
+    <li>
+      Reference CPP implementation (<em>narrow</em>, Bubble 0 fix):
+      <a href="https://github.com/rebel-jinhwan/vllm-rbln/issues/5">rebel-jinhwan/vllm-rbln issue #5</a>
+      &mdash; introduces an <code>AsyncPPCommunicator</code> with a daemon-thread
+      send and a <code>wait_pending_send()</code> barrier at
+      <code>execute_model()</code> entry. Gated by
+      <code>VLLM_RBLN_ASYNC_PP_SEND</code>.
+    </li>
+    <li>
+      <strong>vLLM RFC #28912</strong> (<em>broad</em>, also called
+      <em>Context Pipeline Parallelism</em> / <em>Sequence Pipeline
+      Parallelism</em>):
+      <a href="https://github.com/vllm-project/vllm/issues/28912">vllm-project/vllm#28912</a>
+      &mdash; identifies the four-bubble taxonomy and proposes the two-phase
+      design: FLOPs-balanced chunking + async scheduler + async <code>isend</code>/
+      <code>irecv</code>. Closed but cited as design context. Caveat:
+      <a href="https://github.com/pytorch/pytorch/issues/122597">PyTorch issue #122597</a>
+      affects the async tensor-dict path. Related:
+      <a href="https://github.com/vllm-project/vllm/pull/20359">PR vllm#20359</a>,
+      <a href="https://github.com/vllm-project/vllm/pull/23545">vllm#23545</a> (DCCP),
+      <a href="https://github.com/vllm-project/vllm/pull/20808">vllm#20808</a>.
+    </li>
+    <li>
+      Academic reference:
+      <a href="https://arxiv.org/abs/2409.17264">arXiv 2409.17264</a>
+      &mdash; the paper RFC #28912 draws on for the FLOPs-balanced chunked
+      sequence-pipeline design.
+    </li>
+    <li>
+      Design reference:
+      <a href="https://www.lmsys.org/blog/2026-01-15-chunked-pipeline/">SGLang's
+      Chunked Pipeline Parallelism blog</a> (LMSYS, Jan 2026) &mdash; the
+      production implementation that vLLM is tracking. Source of the bubble
+      ratio <code>(P&minus;1)/(P&minus;1+M)</code>, Dynamic Chunking (DCK),
+      multi-stream execution, the layer-partition asymmetry tip, and the
+      Qwen3 / DeepSeek-V3.1 benchmarks on H20 nodes used above. Reports 82.8%
+      strong scaling at PP=4 (DeepSeek-V3.1) and 81% TTFT reduction at 128K
+      (Qwen3-235B PP8 vs PP1).
+    </li>
+  </ul>
+
+  <h2 id="limits">Limits and gotchas</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Layer count must divide evenly</h3>
+      <p>
+        80 layers and <code>PP=3</code> won't balance cleanly. vLLM rounds, but
+        some stages end up larger. For Llama-3 70B prefer <code>PP &isin; {2, 4, 5, 8, 10}</code>.
+      </p>
+    </div>
+    <div class="box">
+      <h3>The embedding/lm_head asymmetry</h3>
+      <p>
+        Stage 0 has the embedding; the last stage has lm_head + sampler. Their
+        compute cost differs from a mid-stage of pure transformer blocks, so
+        even with equal layer counts the wall-clock per stage isn't perfectly
+        equal. Usually a sub-bubble effect, but visible at PP&gt;8.
+      </p>
+    </div>
+    <div class="box">
+      <h3>CPP correctness depends on send-buffer discipline</h3>
+      <p>
+        The async-Send optimisation only works because the worker waits for the
+        previous send to drain before reusing the intermediate-tensors buffer.
+        Skip that barrier and you get silent data corruption &mdash; a partially
+        overwritten activation lands at the next stage with no error raised.
+        If you're porting CPP to a new backend, this is the single most
+        important invariant to enforce.
+      </p>
+    </div>
+    <div class="box">
+      <h3>PP and prefix caching</h3>
+      <p>
+        Each PP stage runs its own scheduler-side bookkeeping but shares the
+        same prefix-cache hashes (computed centrally). Stages downstream just
+        skip layers for cache-hit tokens; no extra coordination needed.
+      </p>
+    </div>
+  </div>
+
+  <h2>Next</h2>
+
+  <p>
+    Back to the <a href="index.html">index</a>, or read up on the
+    <a href="COMMUNICATION.html">collective primitives</a> if the
+    Send/Recv vs AllReduce framing here doesn't yet click.
+  </p>
+
+</main>
+</body>
+</html>

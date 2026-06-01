@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KV Cache: Hidden Assumptions &amp; Constraints</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <a href="KV_CACHE_ASSUMPTIONS.md">KV_CACHE_ASSUMPTIONS.md</a>
+  </div>
+
+  <h1>KV Cache: Hidden Assumptions &amp; Constraints</h1>
+  <p class="subtitle">
+    Fifteen invariants that look arbitrary in the code until you ask
+    "what would break if we did the obvious other thing?"
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      The KV cache subsystem rests on a small number of load-bearing
+      decisions: blocks (not tokens), block-major memory, post-forward
+      hashing, distinct null/PAD sentinels, single-threaded scheduler,
+      one global block ID space, and a chained hash with extra-keys.
+      Most "obvious" alternatives produce <strong>silent corruption</strong>
+      &mdash; wrong numbers in valid tensor slots with no kernel-level
+      trip-wire. That's why the surrounding code reads like a contract.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#k1">Blocks, not per-token</a></li>
+      <li><a href="#k2"><code>block_size</code> isn't free</a></li>
+      <li><a href="#k3">Block-major, not token-major</a></li>
+      <li><a href="#k4">Null block vs PAD_SLOT_ID</a></li>
+      <li><a href="#k5">Hash <em>after</em> forward</a></li>
+      <li><a href="#k6">Only <em>full</em> blocks get cached</a></li>
+      <li><a href="#k7">Doubly-linked free queue</a></li>
+      <li><a href="#k8">Ref counting without atomics</a></li>
+      <li><a href="#k9">Per-process <code>NONE_HASH</code></a></li>
+      <li><a href="#k10">All groups share <code>num_blocks</code></a></li>
+      <li><a href="#k11">Min-clamp across ranks</a></li>
+      <li><a href="#k12">Preempt the latest</a></li>
+      <li><a href="#k13"><code>extra_keys</code> in the hash</a></li>
+      <li><a href="#k14">Strided group split</a></li>
+      <li><a href="#k15"><code>delay_free_blocks</code></a></li>
+      <li><a href="#patterns">Patterns across these</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="k1">1. Why allocate in fixed-size blocks at all (not per-token)</h2>
+
+  <p>The unit of allocation is a block of <code>block_size</code> tokens. The design makes three trades at once:</p>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>O(1) allocation</h3>
+      <p>
+        <code>FreeKVCacheBlockQueue</code> is a doubly-linked list of
+        <code>KVCacheBlock</code> objects because the scheduler needs O(1)
+        push/pop <em>and</em> O(1) middle-removal.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Kernel tiles</h3>
+      <p>
+        FlashAttention / FlashInfer issue one TMA / vector load per
+        <code>block_size</code>-tokens chunk. Per-token allocation would
+        force scatter-gather.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Hashable unit</h3>
+      <p>
+        Prefix caching keys content by block hash; you can only hash a
+        <em>fixed</em> unit and chain it. Token-level hashes would
+        multiply hash-table entries by 16&times;.
+      </p>
+    </div>
+  </div>
+
+  <p>The price: internal fragmentation in the last block, acceptable because the next decode step fills it.</p>
+
+  <div class="callout info">
+    <strong>Example: 33-token request, <code>block_size=16</code></strong>
+<pre><code>block 0: tokens 0..15
+block 1: tokens 16..31
+block 2: token 32 plus 15 empty future slots</code></pre>
+    The scheduler accounts for 3 fixed slots, not 33 independently managed token slots.
+  </div>
+
+  <h2 id="k2">2. Why <code>block_size</code> cannot be chosen freely</h2>
+
+  <p>Three layers each impose a constraint, and they don't agree:</p>
+
+  <table>
+    <thead><tr><th>Constraint</th><th>Who</th><th>What it wants</th></tr></thead>
+    <tbody>
+      <tr><td>Manager block size</td><td><code>cache_config.block_size</code> (typically 16)</td><td>What the scheduler hands out, what <code>find_longest_cache_hit</code> walks.</td></tr>
+      <tr><td>Hash block size</td><td><code>resolve_kv_cache_block_sizes</code></td><td>GCD of group block sizes when hybrid; allows finer prefix hits.</td></tr>
+      <tr><td>Kernel block size</td><td><code>select_common_block_size</code></td><td>Values the attention backend accepts (FlashInfer specific values, Mamba different entirely).</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    When manager &ne; kernel, <code>BlockTable</code> silently splits each
+    manager block into <code>block_size / kernel_block_size</code> kernel
+    blocks via <code>map_to_kernel_blocks</code>. The scheduler still
+    thinks in manager blocks; the kernel sees twice as many.
+  </p>
+
+  <div class="callout bad">
+    <strong>What breaks if you ignore this</strong>
+    Pick a manager block size the kernel doesn't accept &rarr; worker
+    raises <code>ValueError("kernel_block_size N must divide
+    kv_manager_block_size M")</code> on init. Subtler: choose a hash
+    block size that doesn't divide one group's block size and prefix-cache
+    lookup would silently return the wrong span &mdash; guarded by an
+    assertion in <code>kv_cache_coordinator.py</code>, so it crashes loudly.
+  </div>
+
+  <div class="callout info">
+    <strong>Example</strong>
+<pre><code>manager block B, offsets 0..31
+  -&gt; kernel block 2B,   offsets 0..15
+  -&gt; kernel block 2B+1, offsets 0..15</code></pre>
+    If the manager block were 24, that same backend could not split it into 16-token kernel blocks without a partial.
+  </div>
+
+  <p>See <a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT.html</a> for the CUTLASS MLA-specific 128-token tile assertion.</p>
+
+  <h2 id="k3">3. Why slot layout is block-major, not token-major</h2>
+
+  <p>The slot mapping kernel computes:</p>
+<pre><code>slot_ids = block_numbers * block_size + local_block_offsets</code></pre>
+
+  <p>Tokens within a block are contiguous in physical memory. Token-major would be natural if you only thought about "logical position &rarr; physical address." But:</p>
+
+  <ul>
+    <li>A FlashAttention tile at position <code>p</code> reads <code>K[block_table[p // block_size]][0 : block_size, :]</code> &mdash; one contiguous load. Token-major would force scattered gathers.</li>
+    <li>The per-layer K/V tensor view is <code>[num_blocks, 2, block_size, num_kv_heads, head_size]</code> &mdash; block-major is the only layout where <code>block_id</code> is a direct first-axis index.</li>
+    <li>Copying a block (preemption, swap-out, P/D transfer) is one contiguous memcpy of <code>page_size</code> bytes per layer.</li>
+  </ul>
+
+  <div class="callout info">
+    <strong>Example: <code>block_size=16</code>, group table <code>[42, 99]</code>, position 19</strong>
+<pre><code>block_numbers = 99
+local_block_offsets = 3
+slot_id = 99 * 16 + 3 = 1587</code></pre>
+    The 16 slots for block 99 are contiguous: 1584..1599.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Block-major: tokens in a block are contiguous in physical memory</div>
+    <div class="diagram-row">
+      <span class="cell label">block 99</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">1584</div>
+        <div class="cell xs cached">1585</div>
+        <div class="cell xs cached">1586</div>
+        <div class="cell xs cached" style="border-color:var(--red);border-width:2px">1587</div>
+        <div class="cell xs cached">1588</div>
+        <div class="cell xs cached">1589</div>
+        <div class="cell xs cached">1590</div>
+        <div class="cell xs cached">1591</div>
+        <div class="cell xs cached">1592</div>
+        <div class="cell xs cached">1593</div>
+        <div class="cell xs cached">1594</div>
+        <div class="cell xs cached">1595</div>
+        <div class="cell xs cached">1596</div>
+        <div class="cell xs cached">1597</div>
+        <div class="cell xs cached">1598</div>
+        <div class="cell xs cached">1599</div>
+      </div>
+      <span style="font-size:0.82em;color:var(--muted)">one tile load</span>
+    </div>
+    <div class="diagram-caption">
+      FlashAttention reads <code>K[block_table[p // block_size]]</code> as one contiguous load of 16 vectors. Token-major would scatter these 16 slots across the whole pool &mdash; gather instead of stride-1 load.
+    </div>
+  </div>
+
+  <h2 id="k4">4. Why the null block / <code>PAD_SLOT_ID = -1</code> exists</h2>
+
+  <p>Two distinct sentinels you might confuse:</p>
+
+  <div class="grid">
+    <div class="box">
+      <h3><code>is_null=True</code> on a <code>KVCacheBlock</code></h3>
+      <p>
+        Appears in block tables for SWA / Mamba groups when a request has
+        gaps (out-of-window positions). Has <code>ref_cnt</code>
+        permanently zero, never enters free queue, never gets cached.
+      </p>
+    </div>
+    <div class="box">
+      <h3><code>PAD_SLOT_ID = -1</code></h3>
+      <p>
+        Written into <code>slot_mapping</code> for tokens that exist in
+        the batched tensor but aren't real (CUDA-graph padding, positions
+        past the request end). Writes to slot -1 go into a no-op address.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    Why distinct? Block 0 is a real allocatable block; "block id == 0"
+    can't be a sentinel. Slot 0 belongs to block 0 token 0; same problem.
+    Hence -1, out of range for both block IDs (uint) and slot IDs.
+  </p>
+
+  <div class="callout bad">
+    <strong>What breaks if <code>PAD_SLOT_ID</code> were 0</strong>
+    Every CUDA-graph-padded decode token would write its phantom K/V over
+    the real K/V at block 0 token 0 of the first request. Silent corruption.
+  </div>
+
+  <h2 id="k5">5. Why blocks are hashed <em>after</em> the forward pass, not before</h2>
+
+  <p>
+    <code>BlockPool.cache_full_blocks()</code> runs in
+    <code>KVCacheManager.cache_blocks</code> only <em>after</em> the
+    scheduler step has executed. The naive design would hash up-front
+    &mdash; you know the tokens before you run the model.
+  </p>
+
+  <div class="callout warn">
+    <strong>The hash isn't a key into the block, it's a key into KV content</strong>
+    Two requests with identical token prefixes have identical KV
+    <em>only if computation actually happened</em> on those tokens with
+    the same weights/dtype/config. Hashing before the forward would let
+    a request share KV that another request hasn't actually computed yet
+    &mdash; a write-write race in the GPU buffer.
+  </div>
+
+  <p>
+    The two-phase split: <em>lookup hash</em> computed eagerly on CPU
+    (via <code>update_block_hashes</code>), <em>insertion</em> deferred
+    until after the GPU writes. Lookup is cheap, insertion is safe.
+  </p>
+
+  <div class="callout info">
+    <strong>Example</strong>
+    Requests A and B have the same first 16 tokens and are scheduled in
+    the same prefill wave. B may compute the same hash as A on CPU, but
+    B cannot hit A's block yet because A's worker has not written the K/V
+    contents. The <code>(hash -&gt; block_id)</code> entry becomes valid
+    only after A's forward finishes and <code>cache_blocks</code> inserts it.
+  </div>
+
+  <h2 id="k6">6. Why only <em>full</em> blocks get cached</h2>
+
+  <p>
+    Partial blocks are never inserted into <code>BlockHashToBlockMap</code>.
+    The hash input is <code>(parent_hash, block_tokens, extra_keys)</code>
+    &mdash; if you hashed a partial block, the next decode token would
+    land in that block, the hash would change, and the prior insertion
+    would be a stale orphan.
+  </p>
+
+  <p>The fix would be deletion-on-extend, but that needs a back-reference plus a write on every decode step. Easier to wait for the block to fill.</p>
+
+  <p>
+    <strong>Side effect</strong>: prefix cache hit granularity is
+    <code>block_size</code> tokens &mdash; a 3-token shared suffix in a
+    16-token block is invisible to the cache.
+  </p>
+
+  <div class="callout info">
+    <strong>Example: <code>block_size=16</code></strong>
+<pre><code>request length 15 -&gt; 0 cacheable blocks
+request length 16 -&gt; 1 cacheable block
+request length 31 -&gt; 1 cacheable block
+request length 32 -&gt; 2 cacheable blocks</code></pre>
+  </div>
+
+  <h2 id="k7">7. Why the free queue is doubly-linked, not a deque</h2>
+
+  <p>
+    <code>FreeKVCacheBlockQueue</code> is a hand-rolled doubly-linked
+    list with sentinel head/tail. The docstring says it's for O(1)
+    middle-removal &mdash; <em>why</em>?
+  </p>
+
+  <p>
+    When a request hits the prefix cache, the cached blocks already exist
+    in the free queue (freed but not yet evicted).
+    <code>BlockPool.touch</code> has to pull them <em>out of the middle</em>.
+    A <code>collections.deque</code> only supports O(1) ends &mdash; this
+    would be O(N) over tens of thousands of blocks.
+  </p>
+
+  <h3>The eviction tiebreak</h3>
+
+  <p>
+    Within blocks freed at the same time, blocks with <em>more hash tokens</em>
+    (the tail of a chain) are at the front. <code>BlockPool</code> achieves
+    this by <strong>reversing the block order</strong> when freeing a
+    request's blocks. Tail blocks evict first because they only help one
+    specific request continuation. Head-of-chain blocks (system prompts,
+    shared prefixes) survive longer because more requests will hash-hit them.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: the fake sentinels reduce branching</strong>
+<pre><code># kv_cache_utils.py: FreeKVCacheBlockQueue
+self.fake_free_list_head = KVCacheBlock(block_id=-1)
+self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+# Implementation guarantees fake head and tail are NEVER popped,
+# so each real block in the queue has prev and next blocks.</code></pre>
+    The class is hand-rolled in pure Python because every cache hit
+    touches it &mdash; closing the perf gap to <code>deque</code> (C) by
+    not allocating Python objects during list ops.
+  </div>
+
+  <div class="callout info">
+    <strong>Example: freed blocks <code>[10, 11, 12]</code></strong>
+<pre><code>front of eviction queue -&gt; 12, 11, 10 -&gt; back</code></pre>
+    If a new request later hits block 11 as the second block of a shared
+    system prompt, <code>touch(11)</code> removes it from the middle in
+    O(1), while block 12 remains easier to evict.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Middle removal: why <code>collections.deque</code> doesn't work</div>
+    <div class="linked-list">
+      <div class="ll-node sentinel">HEAD</div>
+      <div class="ll-node">b12<br><span class="lo">tail of chain</span></div>
+      <div class="ll-node" style="background:#fff7d6;border-color:#e6c97a;border-width:2px">b11<br><span class="lo">touched!</span></div>
+      <div class="ll-node">b10<br><span class="lo">head of chain</span></div>
+      <div class="ll-node">b7</div>
+      <div class="ll-node">b3</div>
+      <div class="ll-node sentinel">TAIL</div>
+    </div>
+    <div style="text-align:center;margin-top:8px;font-size:1.2em;color:var(--muted)">&darr;</div>
+    <div class="linked-list">
+      <div class="ll-node sentinel">HEAD</div>
+      <div class="ll-node">b12</div>
+      <div class="ll-node">b10</div>
+      <div class="ll-node">b7</div>
+      <div class="ll-node">b3</div>
+      <div class="ll-node sentinel">TAIL</div>
+      <span style="font-size:0.85em;color:var(--green);margin-left:10px">b11 spliced out in O(1)</span>
+    </div>
+    <div class="diagram-caption">
+      A new request hashes to block 11 (a cached but freed block). <code>touch(11)</code> follows <code>b11.prev</code> and <code>b11.next</code> pointers and re-links neighbors &mdash; no scan. With <code>deque</code>, this would be O(N) over potentially tens of thousands of blocks. Insertion is reversed so chain-tail blocks (b12) evict first, chain-head blocks (b10, shared system prompts) survive.
+    </div>
+  </div>
+
+  <h2 id="k8">8. Why ref counting has no atomics</h2>
+
+  <p>
+    <code>block.ref_cnt += 1</code> and the matching decrement in
+    <code>free_blocks</code> are plain Python attribute writes. No lock,
+    no atomic, no compare-and-swap. This works because the scheduler is
+    single-threaded and is the only writer.
+  </p>
+
+  <div class="callout warn">
+    <strong>Load-bearing for performance</strong>
+    The scheduler runs once per step on the critical path. Acquiring even
+    a <code>threading.Lock</code> per block touch would be a measurable
+    hit at thousands of blocks per step.
+  </div>
+
+  <div class="callout bad">
+    <strong>What breaks if you parallelize the scheduler</strong>
+    ref_cnt double-decrement &rarr; still-referenced block to free queue
+    &rarr; next allocation hands out a slot another request is reading
+    &rarr; silent corruption. Any future multi-threaded scheduler design
+    needs to either shard by request id or atomicize the block pool.
+  </div>
+
+  <div class="callout info">
+    <strong>Example: shared block 20</strong>
+    Touch for B: <code>1 -&gt; 2</code>. A finishes: <code>2 -&gt; 1</code>.
+    Block 20 must not enter the free queue until B finishes. A lost or
+    double decrement puts a live block back into circulation.
+  </div>
+
+  <h2 id="k9">9. Why <code>NONE_HASH</code> is randomized per process by default</h2>
+
+  <p>
+    <code>init_none_hash</code> seeds the hash chain with
+    <code>os.urandom(32)</code> unless <code>PYTHONHASHSEED</code> is set.
+    Why not just use a fixed sentinel?
+  </p>
+
+  <div class="callout warn">
+    <strong>Same reason CPython randomizes <code>hash()</code></strong>
+    Prevent adversarial cache poisoning. With a fixed seed, a request
+    prefix that produces a known collision with a sensitive cached prefix
+    would let one tenant read another's cached KV. Per-process randomization
+    makes the chain values unpredictable across runs.
+  </div>
+
+  <p>
+    The cost: cache cannot be reused across process restarts (e.g., a
+    connector that persisted hashes to disk would see all-misses after
+    restart). Set <code>PYTHONHASHSEED</code> if you want cross-process
+    reuse &mdash; explicit opt-in for the security tradeoff.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: <code>init_none_hash</code></strong>
+<pre><code># kv_cache_utils.py
+def init_none_hash(hash_fn):
+    global NONE_HASH
+    hash_seed = os.getenv("PYTHONHASHSEED")
+    if hash_seed is None:
+        NONE_HASH = BlockHash(os.urandom(32))
+    else:
+        NONE_HASH = BlockHash(hash_fn(hash_seed))</code></pre>
+  </div>
+
+  <h2 id="k10">10. Why all groups use the <em>same</em> <code>num_blocks</code>, even when SWA doesn't need them</h2>
+
+  <p>
+    <code>num_blocks</code> from <code>get_num_blocks</code> is global.
+    An SWA group provably never holds more than
+    <code>ceil(W / block_size)</code> live blocks per request, so
+    allocating <code>num_blocks</code> slots for it looks wasteful.
+  </p>
+
+  <div class="callout good">
+    <strong>It isn't waste, it's the column-packing invariant</strong>
+    Block ID <code>B</code> means "slot <code>B</code> in <em>every</em>
+    column tensor." If groups had different block counts, the scheduler
+    couldn't hand any block ID to any group without per-group offset
+    arithmetic. The "wasted" SWA slots are shared by full-attention layers
+    in the same column tensor. Total memory is still
+    <code>available_memory</code>.
+  </div>
+
+  <p>
+    The genuine waste is <em>peak per-request blocks held</em>:
+    <code>HybridKVCacheCoordinator</code> allocates
+    <code>ceil(num_tokens / block_size)</code> blocks in lock-step across
+    all groups, even though SWA groups only need W's worth. See
+    <a href="KV_CACHE.html#wins">KV_CACHE.html "Sparser SWA block allocation"</a>.
+  </p>
+
+  <h2 id="k11">11. Why workers get clamped to the <em>minimum</em> <code>num_blocks</code> across ranks</h2>
+
+<pre><code># unify_kv_cache_configs
+min_num_blocks = min(c.num_blocks for c in kv_cache_configs)
+for c in kv_cache_configs:
+    c.num_blocks = min_num_blocks</code></pre>
+
+  <p>
+    Workers profile their own GPU memory; ranks may differ. The scheduler,
+    however, hands out <strong>one global block ID space</strong> every
+    worker must honor. If worker A has 10000 blocks and worker B has 9800,
+    block 9900 would address valid memory on A and out-of-bounds on B.
+  </p>
+
+  <div class="callout info">
+    <strong>Pessimistic clamping</strong>
+    The only safe choice without per-worker block ID namespaces. Cost:
+    throwing away 200 blocks on A &mdash; small vs the alternative
+    (per-worker tables, ID translation on cross-worker transfers).
+  </div>
+
+  <h2 id="k12">12. Why preempt the <em>latest</em> request, not the oldest</h2>
+
+  <p>When <code>allocate_slots</code> returns <code>None</code> (out of blocks), the scheduler preempts:</p>
+<pre><code>if self.policy == SchedulingPolicy.PRIORITY:
+    preempted_req = max(self.running, key=lambda r: (r.priority, r.arrival_time))
+else:
+    preempted_req = self.running.pop()  # last appended</code></pre>
+
+  <p>
+    FCFS preempts the <em>most recently arrived</em> running request.
+    Counterintuitive &mdash; the oldest has the most computed KV
+    (longest context, most blocks). Preempting it means re-running prefill
+    on tens of thousands of tokens. Preempting the youngest is cheaper to
+    recover from.
+  </p>
+
+  <p>
+    Preempted requests go back to <code>WAITING</code>, not killed: their
+    cache entries may be hit by the very requests that bumped them.
+    Preemption is conservative; eviction is aggressive; they're separate
+    mechanisms acting on the same blocks.
+  </p>
+
+  <div class="callout info">
+    <strong>Example</strong>
+<pre><code>old request:   12000 computed tokens, hundreds of blocks
+young request:   128 computed tokens, a few blocks</code></pre>
+    Preempting the old frees more blocks immediately, but resuming may
+    cost a long prefill replay. Preempting the young usually costs much
+    less work.
+  </div>
+
+  <h2 id="k13">13. Why <code>extra_keys</code> exists and what gets in it</h2>
+
+  <p>
+    <code>hash_block_tokens</code> takes <code>extra_keys</code> alongside
+    the parent hash and tokens. Without <code>extra_keys</code>, two
+    requests with identical token sequences but different conditioning
+    would alias:
+  </p>
+
+  <table>
+    <thead><tr><th>Source of aliasing</th><th>Where it's added</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LoRA</strong> &mdash; different adapters &rarr; different K/V from same tokens</td><td>LoRA name appended to first block's extra_keys</td></tr>
+      <tr><td><strong>Multi-modal</strong> &mdash; image embeddings vary by input</td><td>MM hash + per-block-offset</td></tr>
+      <tr><td><strong><code>cache_salt</code></strong> &mdash; opaque request-supplied string</td><td>First block only</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>cache_salt</code> exists not for correctness but for
+    <strong>experimental isolation</strong>: when benchmarking two prompt
+    variants on the same prefix, you don't want one to warm the cache for
+    the other.
+  </p>
+
+  <div class="callout bad">
+    <strong>What breaks if <code>extra_keys</code> were dropped</strong>
+    A request switching LoRA adapters mid-prefix would hit cached blocks
+    computed with the previous adapter's weights. Quietly wrong outputs.
+  </div>
+
+  <div class="callout info">
+    <strong>Example</strong>
+<pre><code>tokens: [128000, 791, 3931, ...]
+request A: LoRA adapter = sql
+request B: LoRA adapter = python</code></pre>
+    Without LoRA in the key, B could reuse K/V produced with A's adapter weights.
+  </div>
+
+  <h2 id="k14">14. Why the strided group split (<code>layers[i::num_groups]</code>) instead of contiguous slicing</h2>
+
+  <p>
+    <code>_get_kv_cache_groups_uniform_page_size</code> splits a same-type
+    layer list as <code>layers[i::num_groups]</code> (every Nth layer)
+    rather than <code>layers[i*g:(i+1)*g]</code>. Both yield equal-sized
+    groups; only one survives pipeline parallelism.
+  </p>
+
+  <p>
+    Pipeline parallelism partitions layers into contiguous stage ranges.
+    If a group held a contiguous slice, it could land entirely on one PP
+    stage &mdash; other stages would have an empty group, padded to keep
+    the per-stage layer count equal.
+  </p>
+
+  <div class="callout info">
+    <strong>Example: 12 SWA layers, 3 groups, PP stages <code>[0..5]</code> and <code>[6..11]</code></strong>
+    <p>Contiguous slicing:</p>
+<pre><code>group 0: layers 0, 1, 2, 3     &lt;- entirely on stage 0
+group 1: layers 4, 5, 6, 7     &lt;- split
+group 2: layers 8, 9, 10, 11   &lt;- entirely on stage 1</code></pre>
+    Group 0 is absent from stage 1, group 2 is absent from stage 0.
+    Strided splitting:
+<pre><code>group 0: layers 0, 3, 6, 9
+group 1: layers 1, 4, 7, 10
+group 2: layers 2, 5, 8, 11</code></pre>
+    Both stages see every group.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Strided vs contiguous group split &mdash; only one survives PP</div>
+    <div class="compare">
+      <div class="side left">
+        <h4 style="margin-top:0;color:var(--red)">Contiguous: <code>layers[i*g:(i+1)*g]</code></h4>
+        <div style="display:grid;grid-template-columns:repeat(12,1fr);gap:3px;margin-top:8px">
+          <div class="cell xs full-grp">L0</div><div class="cell xs full-grp">L1</div><div class="cell xs full-grp">L2</div><div class="cell xs full-grp">L3</div>
+          <div class="cell xs swa-grp">L4</div><div class="cell xs swa-grp">L5</div><div class="cell xs swa-grp">L6</div><div class="cell xs swa-grp">L7</div>
+          <div class="cell xs mamba-grp">L8</div><div class="cell xs mamba-grp">L9</div><div class="cell xs mamba-grp">L10</div><div class="cell xs mamba-grp">L11</div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px">
+          <div style="text-align:center;font-size:0.82em;background:#f6f9ff;border:1px solid #cdd9e8;border-radius:6px;padding:6px">
+            <strong>PP stage 0</strong><br>
+            <span style="color:var(--full,#4671b8)">G0 &#10003;</span> &nbsp;
+            <span style="color:var(--swa,#5da57a)">G1 (half)</span> &nbsp;
+            <span style="color:var(--mamba,#b88b30)">G2 &#10007;</span>
+          </div>
+          <div style="text-align:center;font-size:0.82em;background:#f6f9ff;border:1px solid #cdd9e8;border-radius:6px;padding:6px">
+            <strong>PP stage 1</strong><br>
+            <span style="color:var(--full,#4671b8)">G0 &#10007;</span> &nbsp;
+            <span style="color:var(--swa,#5da57a)">G1 (half)</span> &nbsp;
+            <span style="color:var(--mamba,#b88b30)">G2 &#10003;</span>
+          </div>
+        </div>
+        <p style="font-size:0.82em;color:var(--red);margin-top:8px"><strong>Broken:</strong> each stage missing one group &rarr; padded empty groups, asymmetric memory.</p>
+      </div>
+      <div class="vs">vs</div>
+      <div class="side right">
+        <h4 style="margin-top:0;color:var(--green)">Strided: <code>layers[i::num_groups]</code></h4>
+        <div style="display:grid;grid-template-columns:repeat(12,1fr);gap:3px;margin-top:8px">
+          <div class="cell xs full-grp">L0</div><div class="cell xs swa-grp">L1</div><div class="cell xs mamba-grp">L2</div>
+          <div class="cell xs full-grp">L3</div><div class="cell xs swa-grp">L4</div><div class="cell xs mamba-grp">L5</div>
+          <div class="cell xs full-grp">L6</div><div class="cell xs swa-grp">L7</div><div class="cell xs mamba-grp">L8</div>
+          <div class="cell xs full-grp">L9</div><div class="cell xs swa-grp">L10</div><div class="cell xs mamba-grp">L11</div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px">
+          <div style="text-align:center;font-size:0.82em;background:#f6f9ff;border:1px solid #cdd9e8;border-radius:6px;padding:6px">
+            <strong>PP stage 0</strong><br>
+            <span style="color:var(--full,#4671b8)">G0 &#10003;</span> &nbsp;
+            <span style="color:var(--swa,#5da57a)">G1 &#10003;</span> &nbsp;
+            <span style="color:var(--mamba,#b88b30)">G2 &#10003;</span>
+          </div>
+          <div style="text-align:center;font-size:0.82em;background:#f6f9ff;border:1px solid #cdd9e8;border-radius:6px;padding:6px">
+            <strong>PP stage 1</strong><br>
+            <span style="color:var(--full,#4671b8)">G0 &#10003;</span> &nbsp;
+            <span style="color:var(--swa,#5da57a)">G1 &#10003;</span> &nbsp;
+            <span style="color:var(--mamba,#b88b30)">G2 &#10003;</span>
+          </div>
+        </div>
+        <p style="font-size:0.82em;color:var(--green);margin-top:8px"><strong>Survives PP:</strong> every stage sees every group, balanced memory.</p>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      G0/G1/G2 here are pretend layer-type tags. The real point: strided assignment guarantees every PP partition (any contiguous slice of layer indices) covers all groups. Contiguous group slicing concentrates a group onto one stage &mdash; making the across-stage memory profile lumpy and the per-stage cache sizing inconsistent.
+    </div>
+  </div>
+
+  <h2 id="k15">15. Why <code>delay_free_blocks</code> exists for connector finishes</h2>
+
+  <p>
+    When a request completes, its blocks normally go straight back to the
+    free queue. But if a connector is still pushing those blocks somewhere
+    (LMCache write, P/D send to a decode peer), the underlying KV memory
+    must not be reused yet.
+  </p>
+
+  <p>
+    <code>request_finished</code> returns <code>(delay_free_blocks,
+    kv_transfer_params)</code>; if true, the scheduler holds the blocks
+    until the connector reports <code>get_finished</code> is done.
+  </p>
+
+  <div class="callout warn">
+    <strong>Use-after-free guard, not optimization</strong>
+    Without it, the connector races against <code>BlockPool.free_blocks
+    &rarr; get_new_blocks &rarr; worker writes new K/V</code> for the same
+    physical slot. The receiver would see a torn block &mdash; half old
+    request, half new.
+  </div>
+
+  <p>
+    The flag is per-block and decided by the connector. Synchronous
+    connectors finish before <code>request_finished</code> returns, so
+    they answer false.
+  </p>
+
+  <div class="callout info">
+    <strong>Example</strong>
+    A producer request finishes with blocks <code>[200, 201]</code>, and
+    a connector is still sending those blocks to a decode worker. If vLLM
+    freed them immediately, the next request could allocate block 200 and
+    overwrite it while the connector DMA is still reading.
+    <code>delay_free_blocks=True</code> keeps block 200 owned until the
+    connector reports completion.
+  </div>
+
+  <h2 id="patterns">Patterns that show up across these</h2>
+
+  <p>A few of these aren't independent &mdash; they're applications of the same underlying constraint.</p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Single-threaded scheduler</h3>
+      <p>
+        Load-bearing for ref-count integrity (<a href="#k8">&sect;8</a>),
+        the doubly-linked free queue (<a href="#k7">&sect;7</a>), and the
+        lack of locking around <code>BlockHashToBlockMap</code>. Any plan
+        to parallelize the scheduler hits all three at once.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Global block ID space</h3>
+      <p>
+        Load-bearing for column-packed tensors
+        (<a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION</a>),
+        the <code>min_num_blocks</code> clamp (<a href="#k11">&sect;11</a>),
+        and the choice not to split block IDs by group. Makes preemption
+        (<a href="#k12">&sect;12</a>) and connector transfers
+        (<a href="#k15">&sect;15</a>) a single global problem.
+      </p>
+    </div>
+    <div class="box">
+      <h3>The chained hash</h3>
+      <p>
+        Load-bearing for prefix cache correctness across divergent prefixes
+        (<a href="KV_CACHE.html">KV_CACHE</a>), <code>extra_keys</code>
+        semantics (<a href="#k13">&sect;13</a>), <code>cache_salt</code>,
+        and <code>NONE_HASH</code> randomization (<a href="#k9">&sect;9</a>).
+        All flavors of "scope the cache key correctly."
+      </p>
+    </div>
+    <div class="box">
+      <h3>Block-as-unit-of-everything</h3>
+      <p>
+        Ties hash granularity (<a href="#k6">&sect;6</a>), allocation
+        granularity (<a href="#k1">&sect;1</a>), kernel tile size
+        (<a href="#k2">&sect;2</a>), slot layout
+        (<a href="#k3">&sect;3</a>), and eviction order
+        (<a href="#k7">&sect;7</a>). Block size is not a tunable; it's
+        the joint where four kernels meet.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>The recurring failure mode if any of these were violated</strong>
+    <strong>Silent KV corruption</strong> &mdash; wrong numbers in the
+    right tensor slots. There is no kernel trip-wire; the model produces
+    slightly worse outputs, possibly only on specific prompts, possibly
+    indistinguishable from normal sampling noise. That is why the
+    surrounding code is dense with assertions and the comments read like
+    contracts.
+  </div>
+
+  <p class="subtitle">
+    See also: <a href="BEGINNER_GUIDE.html">BEGINNER_GUIDE.html</a> for
+    the gentle introduction, <a href="KV_CACHE.html">KV_CACHE.html</a> for
+    the receptive-field argument, and
+    <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a> for
+    column packing.
+  </p>
+</main>
+</body>
+</html>

@@ -1,0 +1,2413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CUDA Graph and hash_block_size</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    related:
+    <a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT</a>,
+    <a href="KV_CACHE.html">KV_CACHE</a>,
+    <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION</a>
+  </div>
+
+  <h1>CUDA Graph and hash_block_size</h1>
+  <p class="subtitle">
+    What CUDA Graph capture does, why it pads batches, and how that
+    interacts (or doesn&rsquo;t) with the prefix-cache hashing block size.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      CUDA Graph records a fixed-shape sequence of kernel launches and
+      replays it with near-zero CPU overhead. To keep shapes fixed, vLLM
+      captures graphs at a discrete set of token counts (e.g. 1, 2, 4,
+      &hellip;, 256, 272&hellip;) and pads every real batch up to the next
+      captured size at runtime. Padded tokens are routed to
+      <code>PAD_SLOT_ID = -1</code>, an invalid slot that kernels skip, so
+      padding never touches the real KV cache.
+    </p>
+    <p>
+      CUDA Graph is a GPU shape concern; <code>hash_block_size</code> is a
+      CPU scheduler / prefix-cache concern. They are orthogonal: CUDA Graph
+      capture sizes do not need to align with <code>hash_block_size</code>,
+      and a partial block below <code>hash_block_size</code> is simply not
+      hashed &mdash; its KV is written to real slots but the block is never
+      registered in the prefix cache and therefore can never be reused.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#what">What CUDA Graph is, and why vLLM uses it</a></li>
+      <li><a href="#modes">CUDA graph modes: FULL, PIECEWISE, NONE, and the combos</a></li>
+      <li><a href="#breakable">Breakable graphs: how PIECEWISE splits the model</a></li>
+      <li><a href="#layer-io">Inside a transformer layer: what attention does, what the rest does</a>
+        <ul>
+          <li><a href="#layer-walkthrough">Walk-through 1: two decodes</a></li>
+          <li><a href="#prefill-decode-walkthrough">Walk-through 2: one prefill + one decode</a></li>
+        </ul>
+      </li>
+      <li><a href="#dispatch">Runtime dispatch and fallback</a></li>
+      <li><a href="#capture">Capture sizes and padding</a></li>
+      <li><a href="#pad-slot">Where do padded tokens go?</a></li>
+      <li><a href="#hash-block">What is <code>hash_block_size</code>?</a></li>
+      <li><a href="#kv-groups">What is <code>num_kv_cache_groups</code>?</a></li>
+      <li><a href="#orthogonal">Why CUDA Graph does not affect <code>hash_block_size</code></a></li>
+      <li><a href="#partial">Partial blocks below <code>hash_block_size</code></a></li>
+      <li><a href="#worked">Worked example end-to-end</a></li>
+      <li><a href="#multi-req">Multi-request batches: one graph, many requests</a>
+        <ul>
+          <li><a href="#query-start-loc">Aside: what is <code>query_start_loc</code>?</a></li>
+          <li><a href="#multi-req-block-tables">Where the KV cache is read &mdash; <code>block_tables</code></a></li>
+          <li><a href="#what-graph-captures">What the graph captures about <code>block_tables</code> (and every input)</a></li>
+          <li><a href="#piecewise-shape-nuance">Why request-dim shapes differ between FULL and PIECEWISE</a></li>
+        </ul>
+      </li>
+      <li><a href="#scenario">Scenario: 20 tokens with <code>hash_block_size = 32</code></a></li>
+      <li><a href="#takeaways">Takeaways</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="what">What CUDA Graph is, and why vLLM uses it</h2>
+
+  <p>
+    A CUDA Graph is a recorded DAG of GPU operations (kernel launches,
+    memcopies, stream events) that can be <em>replayed</em> as a single
+    submission. The big win is CPU overhead: launching hundreds of small
+    kernels per decode step from Python costs more than the kernels
+    themselves on modern GPUs. Replaying a captured graph collapses that
+    to one launch.
+  </p>
+
+  <div class="callout info">
+    <strong>The constraint</strong>
+    A captured graph is <em>shape-frozen</em>. Tensor sizes, strides, and
+    device pointers used during capture must match exactly on replay.
+    Per-step <code>batch_size</code> and <code>num_tokens</code> are part
+    of those shapes, so vLLM cannot capture &ldquo;one graph for all
+    batches&rdquo;.
+  </div>
+
+  <p>
+    vLLM&rsquo;s answer is to capture a <strong>menu</strong> of graphs at
+    selected token counts and pad each runtime batch up to the nearest
+    captured size. The padded tokens are dummies; the trick is making sure
+    they do not corrupt state &mdash; especially the KV cache.
+  </p>
+
+  <h2 id="modes">CUDA graph modes: FULL, PIECEWISE, NONE, and the combos</h2>
+
+  <p>
+    Not every kernel in the model is graph-safe. Attention in particular
+    consumes per-step CPU-computed metadata (cumulative sequence lengths,
+    FA3 <code>scheduler_metadata</code>, paged KV pointers&hellip;) whose
+    contents change every step. CUDA Graph records pointer values, not
+    pointer dereferences &mdash; if attention&rsquo;s metadata is captured
+    once and replayed unchanged on every later step, the model produces
+    garbage. vLLM gives you three primitive runtime modes plus two combos
+    to navigate that trade-off:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/config/compilation.py:53&ndash;63</span></strong>
+<pre><code>class CUDAGraphMode(enum.Enum):
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
+    FULL_DECODE_ONLY = (FULL, NONE)
+    FULL_AND_PIECEWISE = (FULL, PIECEWISE)</code></pre>
+  </div>
+
+  <table>
+    <thead><tr><th>Mode</th><th>What gets captured</th><th>Best for</th><th>Limitation</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>NONE</strong></td>
+        <td>Nothing &mdash; pure eager.</td>
+        <td>Debugging, backends without graph support.</td>
+        <td>Full per-step Python launch overhead.</td>
+      </tr>
+      <tr>
+        <td><strong>PIECEWISE</strong></td>
+        <td>One small graph per inter-attention segment. Attention runs eagerly between graph replays.</td>
+        <td>Any batch shape &mdash; prefill, chunked prefill, mixed.</td>
+        <td>Attention launches still cost CPU overhead.</td>
+      </tr>
+      <tr>
+        <td><strong>FULL</strong></td>
+        <td>A single graph wrapping the whole model including attention.</td>
+        <td>Uniform decode (every request has the same query length).</td>
+        <td>Attention metadata must be stable for the captured <code>(num_tokens, num_reqs)</code>; not all backends support it; fails on cascade attention etc.</td>
+      </tr>
+      <tr>
+        <td><strong>FULL_DECODE_ONLY</strong></td>
+        <td>FULL graphs for uniform-decode steps; mixed steps run as NONE.</td>
+        <td>Decode-heavy serving (e.g. the decode side of a P/D split).</td>
+        <td>Mixed batches lose graph benefit; prefill is slower.</td>
+      </tr>
+      <tr>
+        <td><strong>FULL_AND_PIECEWISE</strong> <em>(v1 default)</em></td>
+        <td>FULL for uniform decode, PIECEWISE for everything else.</td>
+        <td>General serving &mdash; best blended throughput.</td>
+        <td>Highest capture-time + graph-memory cost (two graph menus).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The mode is one config knob; the dispatcher picks which captured graph
+    to replay each step based on the runtime batch shape.
+  </p>
+
+  <h2 id="breakable">Breakable graphs: how PIECEWISE splits the model</h2>
+
+  <p>
+    PIECEWISE works by <em>cutting</em> the model graph at ops that are
+    unsafe to capture. Cuts produce <strong>partitions</strong>; each
+    partition is a separately captured CUDA graph; the unsafe ops run as
+    plain kernel launches between graph replays. This is the
+    &ldquo;breakable graph&rdquo; mechanism.
+  </p>
+
+  <h3>Which ops are unsafe?</h3>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/config/compilation.py:747&ndash;758</span></strong>
+<pre><code>_attention_ops: ClassVar[list[str]] = [
+    "vllm::unified_attention_with_output",
+    "vllm::unified_mla_attention_with_output",
+    "vllm::mamba_mixer2",
+    "vllm::mamba_mixer",
+    "vllm::short_conv",
+    "vllm::linear_attention",
+    "vllm::plamo2_mamba_mixer",
+    "vllm::gdn_attention_core",
+    ...
+]</code></pre>
+  </div>
+
+  <p>
+    By default <code>splitting_ops</code> is initialized to
+    <code>_attention_ops</code> for PIECEWISE (and to <code>[]</code> for
+    FULL). Custom ops can also opt themselves out by registering with
+    <code>tags=(torch._C.Tag.cudagraph_unsafe,)</code>.
+  </p>
+
+  <h3>The two partition paths</h3>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Dynamo split (<code>use_inductor_graph_partition = False</code>, default)</h3>
+      <ul>
+        <li>Splits the FX graph at <code>splitting_ops</code> <em>before</em> Inductor sees it.</li>
+        <li>Each subgraph is independently compiled by Inductor and wrapped in vLLM&rsquo;s CUDAGraph wrapper.</li>
+        <li>Inductor fusions only see one subgraph at a time, so cross-attention fusions are lost.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Inductor partition (<code>use_inductor_graph_partition = True</code>)</h3>
+      <ul>
+        <li>Inductor compiles the full graph, runs all passes/fusions, <em>then</em> partitions at codegen time.</li>
+        <li>Emits a single <code>call</code> function that wraps cudagraph-safe ops into N+1 partition functions, leaving the N unsafe ops outside.</li>
+        <li>Preserves whole-model fusions; supports FULL and PIECEWISE without compiling twice.</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    Either way, a model with <code>N</code> attention layers ends up with
+    <code>N+1</code> captured graph segments per capture size (the
+    pre-first-attention chunk, each inter-attention chunk, and the
+    post-last-attention chunk). With 40 attention layers and 50 capture
+    sizes that&rsquo;s ~2050 small graphs &mdash; cheap individually but
+    they add up in startup time.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">PIECEWISE vs FULL on a 3-layer model</div>
+    <div class="flow">
+      <div class="flow-step b">
+        <div class="num">PIECEWISE</div>
+        <span class="cell used wide">embed</span>
+        &rarr;
+        <span class="cell used wide">mlp</span>
+        &rarr;
+        <span class="cell dirty wide">attn0 (eager)</span>
+        &rarr;
+        <span class="cell used wide">mlp</span>
+        &rarr;
+        <span class="cell dirty wide">attn1 (eager)</span>
+        &rarr;
+        <span class="cell used wide">mlp</span>
+        &rarr;
+        <span class="cell dirty wide">attn2 (eager)</span>
+        &rarr;
+        <span class="cell used wide">lm_head</span>
+      </div>
+    </div>
+    <div class="flow">
+      <div class="flow-step g">
+        <div class="num">FULL</div>
+        <span class="cell used wide">embed &rarr; mlp &rarr; attn0 &rarr; mlp &rarr; attn1 &rarr; mlp &rarr; attn2 &rarr; lm_head (one captured graph)</span>
+      </div>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background: var(--blue-soft); border-color:#a6c8df;"></span>Inside a captured graph</span>
+      <span class="legend-item"><span class="legend-sw" style="background: var(--amber-soft); border-color:#e3c88a;"></span>Eager (PIECEWISE only)</span>
+    </div>
+    <div class="diagram-caption">
+      PIECEWISE: 4 small graphs per capture size (3 attentions &rarr; 4
+      partitions). Attention runs eagerly so it can adapt to any
+      <code>(num_tokens, num_reqs, seq_lens)</code>. FULL: 1 graph per
+      capture size that locks in attention metadata too &mdash; only safe
+      when that metadata is stable for the captured shape.
+    </div>
+  </div>
+
+  <h3>Why FULL needs <code>num_reqs</code> in the key</h3>
+
+  <p>
+    FA3&rsquo;s scheduler-metadata buffer is sized by <code>num_reqs</code>,
+    not just total <code>num_tokens</code>. Capture a FULL graph at
+    <code>num_tokens = 64</code>, <code>num_reqs = 8</code> and the buffer
+    layout assumes 8 sequences; replay it with <code>num_reqs = 16</code>
+    and the metadata addresses point at half-sized records. PIECEWISE
+    sidesteps this entirely because attention is outside the graph and
+    rebuilds its metadata fresh each step:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/cudagraph_dispatcher.py:204&ndash;207</span></strong>
+<pre><code># Only relax for PIECEWISE mode. FULL mode needs exact num_reqs
+# because FA3's scheduler_metadata computation depends on it.
+if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
+    batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
+self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)</code></pre>
+  </div>
+
+  <p>
+    This is why <code>FULL_AND_PIECEWISE</code> reserves FULL for
+    <em>uniform decode</em> only: when every request contributes the same
+    query length, <code>num_reqs</code> can be derived from
+    <code>num_tokens</code> (<code>num_reqs = num_tokens /
+    uniform_decode_query_len</code>), so a single
+    <code>num_tokens</code> key is enough.
+  </p>
+
+  <h2 id="layer-io">Inside a transformer layer: what attention does, what the rest does</h2>
+
+  <p>
+    The reason PIECEWISE can leave attention out of the graph without
+    breaking anything is structural: in a transformer, attention is the
+    only op that mixes information <em>across</em> tokens or knows about
+    request boundaries. Every other op is point-wise per-token. Pinning
+    that distinction down makes the request-dim shape variance fall out
+    naturally.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One transformer layer, with partition boundaries</div>
+    <div class="flow">
+      <div class="flow-step b">
+        <div class="num">non-attention<br/>(captured)</div>
+        x [num_tokens, H]<br/>
+        &darr;<br/>
+        RMSNorm<br/>
+        &darr;<br/>
+        <code>QKV_proj</code>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a">
+        <div class="num">attention<br/>(eager in PIECEWISE)</div>
+        Q,K,V [num_tokens, &hellip;]<br/>
+        + block_tables<br/>
+        + slot_mapping<br/>
+        + seq_lens<br/>
+        + query_start_loc<br/>
+        &darr;<br/>
+        attn_out [num_tokens, &hellip;]
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b">
+        <div class="num">non-attention<br/>(captured)</div>
+        <code>O_proj</code><br/>
+        &darr;<br/>
+        residual + RMSNorm<br/>
+        &darr;<br/>
+        MLP (gate / up / down)<br/>
+        &darr;<br/>
+        residual<br/>
+        &darr;<br/>
+        x' [num_tokens, H]
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Each transformer layer has exactly one attention call. With
+      <em>N</em> layers and PIECEWISE mode, this pattern repeats <em>N</em>
+      times, producing <em>N&nbsp;+&nbsp;1</em> captured partitions per
+      capture size (the leading embedding partition, the
+      <em>N&nbsp;&minus;&nbsp;1</em> &ldquo;O_proj &rarr; MLP &rarr;
+      next-layer QKV_proj&rdquo; partitions, and the trailing
+      &ldquo;O_proj &rarr; MLP &rarr; lm_head&rdquo; partition).
+    </div>
+  </div>
+
+  <h3>Non-attention partition: pure per-token compute</h3>
+
+  <table>
+    <thead><tr><th>Op</th><th>Input</th><th>Output</th><th>Touches request boundaries?</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>RMSNorm</td>
+        <td><code>x [num_tokens, H]</code></td>
+        <td><code>x [num_tokens, H]</code></td>
+        <td>No &mdash; normalizes each row independently.</td>
+      </tr>
+      <tr>
+        <td>QKV_proj / O_proj / MLP gemms</td>
+        <td><code>[num_tokens, H_in]</code> &times; weight</td>
+        <td><code>[num_tokens, H_out]</code></td>
+        <td>No &mdash; matmul along hidden dim only.</td>
+      </tr>
+      <tr>
+        <td>SiluMul / activation</td>
+        <td><code>[num_tokens, H_int]</code></td>
+        <td><code>[num_tokens, H_int]</code></td>
+        <td>No &mdash; element-wise.</td>
+      </tr>
+      <tr>
+        <td>Residual add</td>
+        <td>two <code>[num_tokens, H]</code></td>
+        <td><code>[num_tokens, H]</code></td>
+        <td>No.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    None of these ops know &mdash; or need to know &mdash; that
+    token&nbsp;0 belongs to request A and token&nbsp;50 to request B.
+    They&rsquo;re GEMMs and element-wise kernels that walk the leading
+    <code>num_tokens</code> axis. Their kernel-launch parameters
+    (grid sizes, tile shapes) depend on <code>num_tokens_padded</code>,
+    which is why padding makes them captureable but request-dim shapes
+    are irrelevant to them. <em>This is the entire content of every
+    captured PIECEWISE partition.</em>
+  </p>
+
+  <h3>Attention partition: the one op that joins tokens to requests</h3>
+
+  <p>
+    Attention is doing four things at once:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Write the new <code>(K, V)</code></strong> for each of this
+      step&rsquo;s tokens into the global KV cache, using
+      <code>slot_mapping[batch_pos]</code> as the destination index.
+    </li>
+    <li>
+      <strong>For each query token</strong>, figure out which request it
+      belongs to using <code>query_start_loc</code> &mdash; req&nbsp;<em>i</em>
+      owns batch positions <code>[query_start_loc[i],
+      query_start_loc[i+1])</code>.
+    </li>
+    <li>
+      <strong>Walk back through history</strong>: read
+      <code>seq_lens[i]</code> historical positions for the owning
+      request, looking up each position&rsquo;s physical block via
+      <code>block_tables[i, pos // block_size]</code>.
+    </li>
+    <li>
+      <strong>Reduce</strong>: softmax(QK<sup>T</sup>)&middot;V over those
+      historical positions, producing one output vector per query token.
+    </li>
+  </ol>
+
+  <table>
+    <thead><tr><th>Input</th><th>Shape</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>Q, K, V</code></td>
+        <td><code>[num_tokens, num_heads, head_dim]</code></td>
+        <td>This step&rsquo;s new query/key/value, output of <code>QKV_proj</code>.</td>
+      </tr>
+      <tr>
+        <td><code>K_cache, V_cache</code></td>
+        <td><code>[num_blocks, block_size, num_kv_heads, head_dim]</code></td>
+        <td>Global pool. Read for historical context, written for the new step.</td>
+      </tr>
+      <tr>
+        <td><code>slot_mapping</code></td>
+        <td><code>[num_tokens_padded]</code> (token-dim)</td>
+        <td>Where to write new (K, V) for each token. <code>-1</code> for padded tokens.</td>
+      </tr>
+      <tr>
+        <td><code>block_tables</code></td>
+        <td><code>[num_reqs, max_blocks]</code> in PIECEWISE; <code>[num_reqs_padded, max_blocks]</code> in FULL</td>
+        <td>Per-request list of physical block IDs for historical KV.</td>
+      </tr>
+      <tr>
+        <td><code>seq_lens</code></td>
+        <td><code>[num_reqs]</code> in PIECEWISE; <code>[num_reqs_padded]</code> in FULL</td>
+        <td>Per-request history length to read.</td>
+      </tr>
+      <tr>
+        <td><code>query_start_loc</code></td>
+        <td><code>[num_reqs + 1]</code> in PIECEWISE; <code>[num_reqs_padded + 1]</code> in FULL</td>
+        <td>Maps each batch position to its owning request.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The output is again token-dim &mdash; <code>attn_out [num_tokens,
+    num_heads, head_dim]</code> &mdash; which flows into the next
+    captured non-attention partition (starting at <code>O_proj</code>).
+    Attention is the <em>only</em> place where request-dim metadata
+    enters the layer. That&rsquo;s precisely why the request-dim padding
+    matters only when attention is captured (FULL) and is dropped when
+    attention runs eagerly (PIECEWISE).
+  </p>
+
+  <div class="callout good">
+    <strong>The boundary, restated</strong>
+    Captured non-attention partitions: <em>per-token</em> compute over
+    token-dim tensors. Eager (or captured-in-FULL) attention call:
+    <em>per-request</em> lookups into block-paged storage, then a
+    per-token reduction over each request&rsquo;s history. The partition
+    boundary at attention is also the boundary between &ldquo;sees only
+    <code>num_tokens</code>&rdquo; and &ldquo;sees only
+    <code>num_reqs</code>-shaped metadata.&rdquo;
+  </div>
+
+  <h3 id="layer-walkthrough">Concrete walk-through: one decoder layer, two requests</h3>
+
+  <p>
+    Tiny model so the numbers fit:
+    <code>H = 4</code> (hidden),
+    <code>num_heads = num_kv_heads = 1</code>,
+    <code>head_dim = 4</code>,
+    <code>block_size = 4</code>,
+    PIECEWISE mode, mixed (non-uniform) batch.
+  </p>
+
+  <p>
+    Two requests, each generating one new token this step (so this looks
+    like decode, but the mode is still PIECEWISE because we want to
+    illustrate the non-padded request dim):
+  </p>
+
+  <table>
+    <thead><tr><th>Req</th><th>History so far</th><th>Block table</th><th>New position</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>5 tokens (positions 0&ndash;4)</td><td><code>[12, 47]</code></td><td>5</td></tr>
+      <tr><td>1</td><td>3 tokens (positions 0&ndash;2)</td><td><code>[88]</code></td><td>3</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Capture sizes are <code>[1, 2, 4, 8, &hellip;]</code>, so 2 real
+    tokens round up to <strong>num_tokens_padded = 2</strong> (no padding
+    needed). Packed inputs:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Packed buffers handed to the layer</div>
+    <div class="cell-row">
+      <span class="cell label">input_ids [2]:</span>
+      <span class="cell used sm">101</span>
+      <span class="cell used sm">47</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">positions [2]:</span>
+      <span class="cell used sm">5</span>
+      <span class="cell used sm">3</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">slot_mapping [2]:</span>
+      <span class="cell used sm">189</span>
+      <span class="cell used sm">355</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">query_start_loc [3]:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">1</span>
+      <span class="cell used sm">2</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">seq_lens [2]:</span>
+      <span class="cell used sm">6</span>
+      <span class="cell used sm">4</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block_tables [2, 2]:</span>
+      <span class="cell cached sm">12</span>
+      <span class="cell cached sm">47</span>
+      <span class="cell sm">|</span>
+      <span class="cell cached sm">88</span>
+      <span class="cell null sm">&mdash;</span>
+    </div>
+    <div class="diagram-caption">
+      Slot 189 = block&nbsp;47 &times; 4 + offset&nbsp;1 (position 5 lands
+      in block 47 at offset 5 % 4 = 1). Slot 355 = block&nbsp;88 &times;
+      4 + offset 3.
+    </div>
+  </div>
+
+  <p>
+    Now walk a single transformer layer top-to-bottom:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Embedding lookup &mdash; captured, per-token</strong>.
+      <code>input_ids [2] &rarr; x [2, 4]</code>. Say
+      <code>x = [[0.5, &minus;0.2, 0.1, 0.3],
+              [&minus;0.4, 0.6, 0.0, 0.2]]</code>.
+      Two independent table lookups; the kernel walks
+      <code>num_tokens = 2</code> rows and has no idea row 0 is req 0 and
+      row 1 is req 1. Same kernel would work for one row, ten rows, or
+      256.
+    </li>
+
+    <li>
+      <strong>RMSNorm &mdash; captured, per-token</strong>.
+      Each row normalized by its own RMS:
+      <code>x_norm[i] = x[i] / sqrt(mean(x[i]&sup2;)) * &gamma;</code>.
+      Still <code>[2, 4]</code>. Row 0 and row 1 do not interact.
+    </li>
+
+    <li>
+      <strong>QKV_proj &mdash; captured, per-token</strong>.
+      One GEMM: <code>x_norm [2, 4] &times; W_qkv [4, 12] = qkv [2, 12]</code>.
+      Split: <code>Q [2, 4]</code>, <code>K [2, 4]</code>, <code>V [2, 4]</code>.
+      Pretend the result is
+      <code>Q = [[q0_a, q0_b, q0_c, q0_d], [q1_a, q1_b, q1_c, q1_d]]</code>
+      and similarly for K and V.
+      <em>The graph partition ends here.</em>
+    </li>
+
+    <li>
+      <strong>Attention &mdash; eager (PIECEWISE), per-request</strong>.
+      This is the only op that touches <code>block_tables</code>,
+      <code>seq_lens</code>, and <code>query_start_loc</code>. Four
+      sub-steps:
+
+      <p style="margin-top:6px;"><strong>(a) Write new (K, V) to cache.</strong></p>
+      <pre><code>K_cache.flat[189] = K[0]   # token at position 5 of req 0 &rarr; block 47, offset 1
+V_cache.flat[189] = V[0]
+K_cache.flat[355] = K[1]   # token at position 3 of req 1 &rarr; block 88, offset 3
+V_cache.flat[355] = V[1]</code></pre>
+
+      <p><strong>(b) Resolve each query&rsquo;s owning request via
+      <code>query_start_loc</code>.</strong>
+      Position 0 falls in <code>[0, 1)</code> &rarr; req 0. Position 1
+      falls in <code>[1, 2)</code> &rarr; req 1.</p>
+
+      <p><strong>(c) For query 0 (req 0, seq_len = 6), read 6 historical
+      keys/values.</strong></p>
+      <pre><code># Block lookups:
+# pos 0..3 &rarr; block_tables[0, 0] = 12, offsets 0..3
+# pos 4    &rarr; block_tables[0, 1] = 47, offset 0
+# pos 5    &rarr; block_tables[0, 1] = 47, offset 1   (just-written)
+
+K_ctx_0 = stack(K_cache[12, 0..3], K_cache[47, 0..1])   # shape [6, 4]
+V_ctx_0 = stack(V_cache[12, 0..3], V_cache[47, 0..1])   # shape [6, 4]
+
+scores_0 = softmax(Q[0] @ K_ctx_0.T / sqrt(4))          # shape [6]
+attn_out[0] = scores_0 @ V_ctx_0                         # shape [4]</code></pre>
+
+      <p><strong>(d) For query 1 (req 1, seq_len = 4), read 4 historical
+      keys/values.</strong></p>
+      <pre><code># All four positions are in block_tables[1, 0] = 88, offsets 0..3
+K_ctx_1 = K_cache[88, 0..3]                              # shape [4, 4]
+V_ctx_1 = V_cache[88, 0..3]                              # shape [4, 4]
+
+scores_1 = softmax(Q[1] @ K_ctx_1.T / sqrt(4))           # shape [4]
+attn_out[1] = scores_1 @ V_ctx_1                         # shape [4]</code></pre>
+
+      <p>Output: <code>attn_out [2, 4]</code>. Notice that
+      req 0 attends over 6 positions, req 1 attends over 4. The
+      <em>same Python call</em> handled both by reading
+      <code>seq_lens</code> and walking each request&rsquo;s
+      <code>block_tables</code> row independently. Nothing in the eager
+      attention launch is fixed-shape with respect to
+      <code>num_reqs</code> &mdash; if a third request showed up next
+      step, the call accepts <code>seq_lens [3]</code> /
+      <code>block_tables [3, &hellip;]</code> without re-capture.</p>
+    </li>
+
+    <li>
+      <strong>O_proj &mdash; captured, per-token</strong>.
+      <code>attn_out [2, 4] &times; W_O [4, 4] = out [2, 4]</code>. Yet
+      another per-row GEMM. <em>The next graph partition begins here.</em>
+    </li>
+
+    <li>
+      <strong>Residual + RMSNorm &mdash; captured, per-token</strong>.
+      <code>h = x + out</code>, then <code>RMSNorm(h)</code>. Still
+      <code>[2, 4]</code>.
+    </li>
+
+    <li>
+      <strong>MLP &mdash; captured, per-token</strong>.
+      <code>gate = h @ W_gate</code> and <code>up = h @ W_up</code>,
+      <code>act = SiLU(gate) * up</code>, <code>down = act @ W_down</code>.
+      All operate on the <code>num_tokens = 2</code> rows independently.
+    </li>
+
+    <li>
+      <strong>Final residual &mdash; captured</strong>.
+      <code>h_out = h + down</code>. Layer output:
+      <code>[2, 4]</code>. Feeds into the next layer&rsquo;s RMSNorm.
+    </li>
+  </ol>
+
+  <p>
+    Three captured partitions surround the one eager attention call for
+    this layer:
+  </p>
+
+  <div class="flow">
+    <div class="flow-step b">
+      <div class="num">partition (i)</div>
+      RMSNorm &rarr; QKV_proj<br/>
+      <code>[2, 4] &rarr; Q,K,V [2, 4]</code><br/>
+      kernel grid: f(<code>num_tokens=2</code>)
+    </div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step a">
+      <div class="num">eager attention</div>
+      reads <code>block_tables</code>,<br/>
+      <code>seq_lens</code>,
+      <code>slot_mapping</code><br/>
+      kernel grid: f(<code>num_reqs=2</code>, <code>num_tokens=2</code>)
+    </div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step b">
+      <div class="num">partition (i+1)</div>
+      O_proj &rarr; residual &rarr; RMSNorm &rarr; MLP &rarr; residual<br/>
+      <code>[2, 4] &rarr; [2, 4]</code><br/>
+      kernel grid: f(<code>num_tokens=2</code>)
+    </div>
+  </div>
+
+  <p>
+    If next step there are 3 requests at different positions, the
+    captured partitions don&rsquo;t need to change &mdash; same
+    <code>num_tokens</code> (assuming it&rsquo;s still 2 or pads to 2),
+    same captured kernel grid. But the eager attention call now receives
+    <code>seq_lens [3]</code>, <code>block_tables [3, &hellip;]</code>,
+    <code>query_start_loc [4]</code>, and rebuilds its scheduler metadata
+    fresh for 3 requests. That&rsquo;s the whole reason PIECEWISE works.
+  </p>
+
+  <h3 id="prefill-decode-walkthrough">Concrete walk-through: one prefill + one decode in the same batch</h3>
+
+  <p>
+    Same tiny model (<code>H = 4</code>, 1 head, <code>head_dim = 4</code>,
+    <code>block_size = 4</code>, PIECEWISE). Two requests, but now with
+    very different shapes &mdash; the kind of mix that makes PIECEWISE
+    earn its keep:
+  </p>
+
+  <table>
+    <thead><tr><th>Req</th><th>State</th><th>This step</th><th>Position range</th><th>Blocks (allocated this step)</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>fresh prefill</td><td><strong>5 query tokens</strong></td><td>0&ndash;4</td><td><code>[21, 34]</code></td></tr>
+      <tr><td>1</td><td>decode (3 tokens of history)</td><td><strong>1 query token</strong></td><td>3</td><td><code>[88]</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Total <code>num_tokens = 5 + 1 = 6</code>. With capture sizes
+    <code>[1, 2, 4, 8, &hellip;]</code>, the dispatcher rounds 6 up to
+    <strong>num_tokens_padded = 8</strong> &mdash; <em>two trailing
+    padding slots</em>. The packed buffers:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Packed batch &mdash; prefill (5) + decode (1) + 2 padding = size-8 graph</div>
+    <div class="cell-row">
+      <span class="cell label">slot in batch:</span>
+      <span class="cell head sm">0</span>
+      <span class="cell head sm">1</span>
+      <span class="cell head sm">2</span>
+      <span class="cell head sm">3</span>
+      <span class="cell head sm">4</span>
+      <span class="cell head sm">5</span>
+      <span class="cell head sm">6</span>
+      <span class="cell head sm">7</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">owning req:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell cached sm">1</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">positions [8]:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">1</span>
+      <span class="cell used sm">2</span>
+      <span class="cell used sm">3</span>
+      <span class="cell used sm">4</span>
+      <span class="cell cached sm">3</span>
+      <span class="cell null sm">0</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">slot_mapping [8]:</span>
+      <span class="cell used sm">84</span>
+      <span class="cell used sm">85</span>
+      <span class="cell used sm">86</span>
+      <span class="cell used sm">87</span>
+      <span class="cell used sm">136</span>
+      <span class="cell cached sm">355</span>
+      <span class="cell null sm">&minus;1</span>
+      <span class="cell null sm">&minus;1</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">query_start_loc [3]:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">5</span>
+      <span class="cell used sm">6</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">seq_lens [2]:</span>
+      <span class="cell used sm">5</span>
+      <span class="cell cached sm">4</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block_tables [2, 2]:</span>
+      <span class="cell used sm">21</span>
+      <span class="cell used sm">34</span>
+      <span class="cell sm">|</span>
+      <span class="cell cached sm">88</span>
+      <span class="cell null sm">&mdash;</span>
+    </div>
+    <div class="diagram-caption">
+      <strong>Token-dim tensors</strong>
+      (<code>positions</code>, <code>slot_mapping</code>, hidden states)
+      are padded to 8: padding slots use <code>position = 0</code> and
+      <code>slot = &minus;1</code>.
+      <strong>Request-dim tensors</strong>
+      (<code>query_start_loc</code>, <code>seq_lens</code>,
+      <code>block_tables</code>) keep the real <code>num_reqs = 2</code>
+      &mdash; PIECEWISE doesn&rsquo;t pad those (see
+      <a href="#piecewise-shape-nuance">why</a>). The final entry of
+      <code>query_start_loc</code> is 6, not 8, so attention won&rsquo;t
+      walk into the padded slots.
+    </div>
+  </div>
+
+  <p>
+    Walk the layer:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Embedding + RMSNorm + QKV_proj &mdash; captured, per-token</strong>.
+      <code>input_ids [8] &rarr; x [8, 4] &rarr; Q, K, V [8, 4]</code>.
+      The kernels iterate all <code>num_tokens_padded = 8</code> rows;
+      they do not know that the first 5 are one request&rsquo;s prefill,
+      the 6th is a different request&rsquo;s decode, and the last 2 are
+      dummy padding. They compute hidden states for the padded rows too
+      &mdash; that compute is wasted, but it doesn&rsquo;t corrupt
+      anything because the padded outputs never reach the KV cache.
+      <em>Graph partition ends here.</em>
+    </li>
+
+    <li>
+      <strong>Attention &mdash; eager</strong>. Four sub-steps:
+
+      <p style="margin-top:6px;"><strong>(a) Write new (K, V) into the cache &mdash; padded slots are skipped.</strong></p>
+<pre><code>for batch_slot in 0..7:
+    slot = slot_mapping[batch_slot]
+    if slot == -1:
+        continue                       # &larr; padded slots 6 and 7
+    K_cache.flat[slot] = K[batch_slot]
+    V_cache.flat[slot] = V[batch_slot]
+# Actual writes: 6 of them.
+#   slots 84..87, 136  (req 0's positions 0..4 land in blocks 21, 34)
+#   slot 355           (req 1's position 3 lands at offset 3 of block 88)
+# K[6..7], V[6..7] are computed but discarded.</code></pre>
+
+      <p><strong>(b) Resolve query &rarr; request via
+      <code>query_start_loc = [0, 5, 6]</code>.</strong>
+      Batch slots <code>[0, 5)</code> &rarr; req 0; batch slot 5 &rarr;
+      req 1. <strong>Batch slots 6 and 7 are past
+      <code>query_start_loc[-1] = 6</code>, so the kernel never visits
+      them &mdash; this is how attention &ldquo;skips&rdquo; padded
+      queries without needing a separate mask.</strong></p>
+
+      <p><strong>(c) Req 0 (prefill): causal self-attention over 5
+      positions.</strong>
+      Each of the 5 query tokens attends to positions
+      <code>[0, query_pos]</code> of req 0 only &mdash; standard causal
+      mask:</p>
+<pre><code># Build req 0's full KV context from block_tables[0] = [21, 34], seq_len = 5:
+K_ctx_0 = stack(K_cache[21, 0..3], K_cache[34, 0..0])   # shape [5, 4]
+V_ctx_0 = stack(V_cache[21, 0..3], V_cache[34, 0..0])   # shape [5, 4]
+
+# All 5 of req 0's queries attend over K_ctx_0 / V_ctx_0
+# with a [5, 5] causal mask:
+Q_0 = Q[0..4]                                            # shape [5, 4]
+scores = (Q_0 @ K_ctx_0.T / sqrt(4)).masked_fill(mask, -inf)
+scores = softmax(scores)                                 # shape [5, 5]
+attn_out[0..4] = scores @ V_ctx_0                        # shape [5, 4]</code></pre>
+
+      <p><strong>(d) Req 1 (decode): single-query attention over 4
+      positions.</strong></p>
+<pre><code># Req 1's KV context from block_tables[1] = [88, _], seq_len = 4:
+K_ctx_1 = K_cache[88, 0..3]                              # shape [4, 4]
+V_ctx_1 = V_cache[88, 0..3]                              # shape [4, 4]
+
+Q_1 = Q[5]                                               # shape [4]
+scores_1 = softmax(Q_1 @ K_ctx_1.T / sqrt(4))            # shape [4]
+attn_out[5] = scores_1 @ V_ctx_1                         # shape [4]
+
+# attn_out[6..7] are never written &mdash; left as whatever garbage
+# was in the persistent buffer. The next graph partition will run
+# GEMMs on those rows but the final logits gather drops them.</code></pre>
+
+      <p>
+        Output is <code>attn_out [8, 4]</code> &mdash; same token-dim
+        shape as captured, even though only the first 6 rows hold
+        meaningful values. <em>The same eager attention call handled 5
+        prefill queries with a causal mask AND 1 decode query with no
+        mask in one launch</em>: the kernel reads
+        <code>query_start_loc</code> to know where each request&rsquo;s
+        queries start, reads <code>seq_lens</code> to know how far back
+        each one reaches, and applies the causal mask only where
+        <code>query_len &gt; 1</code> (i.e., when more than one row of
+        Q belongs to the same request).
+      </p>
+    </li>
+
+    <li>
+      <strong>O_proj &rarr; residual &rarr; RMSNorm &rarr; MLP &rarr;
+      residual &mdash; captured, per-token</strong>.
+      <code>[8, 4] &rarr; [8, 4]</code> throughout, including the 2
+      padded rows whose values are garbage. The MLP processes the
+      prefill tokens, the decode token, and the padded rows row-by-row
+      with the same GEMMs &mdash; no special case. Only the final
+      logits gather (driven by <code>cu_num_logits</code>) drops the
+      padded rows, so the wasted compute never affects output.
+    </li>
+  </ol>
+
+  <p>
+    The captured partitions used here are <em>the same captured graph
+    objects</em> as in the previous walk-through, just replayed at the
+    size-8 graph instead of size-2. Different mix of requests, different
+    attention work &mdash; same compiled partitions wrapping it:
+  </p>
+
+  <div class="bar-stack">
+    <div class="bar-row">
+      <span class="bar-label">2-token decode batch</span>
+      <div class="bar-track"><div class="bar-fill" style="width: 20%;">size-2 captured graph</div></div>
+      <span class="bar-num">2 reqs &times; 1</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">6&rarr;8 prefill+decode</span>
+      <div class="bar-track"><div class="bar-fill" style="width: 80%;">size-8 captured graph &mdash; 6 real + 2 padded tokens</div></div>
+      <span class="bar-num">5 + 1 + 2pad</span>
+    </div>
+    <div class="bar-row">
+      <span class="bar-label">8-token 4-way decode</span>
+      <div class="bar-track"><div class="bar-fill" style="width: 80%;">size-8 captured graph (same one!)</div></div>
+      <span class="bar-num">4 reqs &times; 2</span>
+    </div>
+  </div>
+
+  <p>
+    The captured non-attention partitions only care about
+    <code>num_tokens_padded = 8</code>. Whether those 8 tokens are 7
+    prefill + 1 decode, 4 reqs &times; 2 tokens (spec decode), or any
+    other shape that sums to 8 &mdash; the partitions execute the same
+    GEMMs. Eager attention picks up the rest, reading
+    <code>block_tables</code>, <code>seq_lens</code>, and
+    <code>query_start_loc</code> fresh each call.
+  </p>
+
+  <div class="callout info">
+    <strong>Why this matters in production</strong>
+    Real serving traffic is overwhelmingly mixed: continuous batching
+    schedules new prefills alongside running decodes every step. Without
+    PIECEWISE, every such step would dispatch to <code>NONE</code>
+    (eager everywhere) because no FULL graph matches the exact
+    <code>(num_tokens, num_reqs, query-length-distribution)</code>
+    combination. PIECEWISE recovers the captured-launch speedup for the
+    ~90% of compute that is per-token (norms, gemms, MLP) while letting
+    attention&rsquo;s per-step metadata stay flexible.
+  </div>
+
+  <h2 id="dispatch">Runtime dispatch and fallback</h2>
+
+  <p>
+    Each step the dispatcher looks up the best graph for the current
+    batch, preferring FULL over PIECEWISE over NONE:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/cudagraph_dispatcher.py:311&ndash;328</span></strong>
+<pre><code>if CUDAGraphMode.FULL in allowed_modes:
+    batch_desc_to_check = batch_desc
+    if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
+        return CUDAGraphMode.FULL, batch_desc_to_check
+
+if CUDAGraphMode.PIECEWISE in allowed_modes:
+    # also check if the relaxed key exists for more "general"
+    # piecewise cudagraph
+    batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
+    if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+        return CUDAGraphMode.PIECEWISE, batch_desc_to_check
+
+assert CUDAGraphMode.NONE in allowed_modes
+return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)</code></pre>
+  </div>
+
+  <p>
+    Common dispatch paths in <code>FULL_AND_PIECEWISE</code>:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Uniform decode step</strong> (e.g. 8 requests &times; 1
+      token = 8 tokens, no spec decode): rounds to next capture size,
+      matches a FULL key with both <code>num_tokens</code> and
+      <code>num_reqs</code> derivable &rarr; <strong>FULL</strong>.
+    </li>
+    <li>
+      <strong>Mixed prefill + decode</strong> (e.g. 50-token chunked
+      prefill + 7 decodes = 57 tokens): not uniform &rarr; FULL lookup
+      misses &rarr; falls back to <strong>PIECEWISE</strong> with the
+      relaxed key (<code>num_reqs = None</code>).
+    </li>
+    <li>
+      <strong>Cascade attention</strong> (passed in
+      <code>invalid_modes={FULL}</code> by the runner): FULL is
+      forbidden, so PIECEWISE is used even for uniform decode.
+    </li>
+    <li>
+      <strong>Batch over <code>max_cudagraph_capture_size</code></strong>
+      (e.g. a huge prefill): no captured graph &rarr;
+      <strong>NONE</strong>, eager execution.
+    </li>
+  </ul>
+
+  <div class="callout warn">
+    <strong>Capture-time cost trade</strong>
+    Each captured graph holds its own pinned input buffers and workspace.
+    <code>FULL_AND_PIECEWISE</code> captures both menus, plus LoRA
+    specializations and decode-vs-mixed variants. For a 40-layer model
+    with the default ~50 capture sizes, that&rsquo;s easily a couple of GB
+    of graph memory and tens of seconds of warmup. <code>NONE</code>
+    skips all of it but pays per-step launch overhead forever after.
+  </div>
+
+  <h2 id="capture">Capture sizes and padding</h2>
+
+  <p>
+    The capture menu lives in <code>CompilationConfig.cudagraph_capture_sizes</code>.
+    By default it&rsquo;s generated automatically:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/config/compilation.py:680&ndash;684</span></strong>
+<pre><code>[1, 2, 4] + list(range(8, 256, 8)) + list(
+    range(256, max_cudagraph_capture_size + 1, 16))</code></pre>
+  </div>
+
+  <p>
+    At runtime, the dispatcher builds a lookup table that maps any
+    incoming token count to its padded graph size:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/cudagraph_dispatcher.py:86&ndash;95</span></strong>
+<pre><code>self._bs_to_padded_graph_size: list[int] = [0] * (max_size + 1)
+for end, start in zip(
+    capture_sizes + [max_size + 1],
+    [0] + capture_sizes,
+):
+    for bs in range(start, end):
+        if bs == start:
+            self._bs_to_padded_graph_size[bs] = start
+        else:
+            self._bs_to_padded_graph_size[bs] = end</code></pre>
+  </div>
+
+  <p>
+    The pattern is: any batch size in the half-open interval
+    <code>(start, end]</code> rounds up to <code>end</code>, while exact
+    captured sizes map to themselves.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Padding 100 actual tokens to a captured size of 104</div>
+    <div class="cell-row wrap">
+      <span class="cell label">real:</span>
+      <span class="cell used sm">t0</span>
+      <span class="cell used sm">t1</span>
+      <span class="cell used sm">&hellip;</span>
+      <span class="cell used sm">t98</span>
+      <span class="cell used sm">t99</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background: var(--blue-soft); border-color:#a6c8df;"></span>Real token (slot &ge; 0)</span>
+      <span class="legend-item"><span class="legend-sw" style="background:#f5f5f3; border-style:dashed;"></span>Padding (slot = &minus;1)</span>
+    </div>
+    <div class="diagram-caption">
+      With capture sizes [&hellip;, 96, 104, 112, &hellip;], a batch of 100 tokens
+      replays the size-104 graph; the trailing 4 tokens are padding.
+    </div>
+  </div>
+
+  <h2 id="pad-slot">Where do padded tokens go? &mdash; <code>PAD_SLOT_ID = &minus;1</code></h2>
+
+  <p>
+    Every token position in the forward pass has a <em>slot mapping</em>
+    that tells the attention kernel where to write its computed
+    <code>(K, V)</code>. For padded positions, that slot is set to a
+    sentinel value:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/attention/backends/utils.py:44</span></strong>
+<pre><code>PAD_SLOT_ID = -1</code></pre>
+  </div>
+
+  <p>
+    The model runner sizes the slot-mapping tensor by
+    <code>num_tokens_after_padding</code>, and the kernel that fills it
+    writes <code>PAD_SLOT_ID</code> into any position past the real
+    <code>num_tokens</code>:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/worker/gpu/model_runner.py:918&ndash;925</span></strong>
+<pre><code># Slot mappings: [num_kv_cache_groups, num_tokens_padded].
+# Kernel pads beyond num_tokens with PAD_SLOT_ID.
+slot_mappings = self.block_tables.compute_slot_mappings(
+    input_batch.idx_mapping,
+    input_batch.query_start_loc,
+    input_batch.positions,
+    num_tokens_padded=input_batch.num_tokens_after_padding,
+)</code></pre>
+  </div>
+
+  <p>
+    For dummy (warmup / capture) forward passes the whole tensor is filled
+    with the sentinel up-front:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/worker/gpu/block_table.py:174&ndash;183</span></strong>
+<pre><code>def get_dummy_slot_mappings(self, num_tokens: int) -&gt; torch.Tensor:
+    # Fill the entire slot_mappings tensor, not just the first `num_tokens` entries.
+    # This is because the padding logic is complex and kernels may access beyond
+    # the requested range.
+    self.slot_mappings.fill_(PAD_SLOT_ID)</code></pre>
+  </div>
+
+  <div class="callout good">
+    <strong>Result</strong>
+    Attention kernels treat <code>slot_id = &minus;1</code> as a skip:
+    they do not read or write the KV cache for that token. So padding
+    inflates compute work modestly, but leaves the cache untouched.
+    <em>Padded tokens never write to a real cache block, never shift the
+    last partial block, never trigger a hash.</em>
+  </div>
+
+  <h2 id="hash-block">What is <code>hash_block_size</code>?</h2>
+
+  <p>
+    <code>hash_block_size</code> is the granularity at which a request&rsquo;s
+    token sequence is chunked into <em>hash blocks</em> for the prefix
+    cache. Each hash block&rsquo;s tokens are fed into a hash function whose
+    output is the cache key. Two requests with the same prefix produce
+    identical block hashes, so the second request can reuse the
+    already-computed KV.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/config/cache.py:54&ndash;65</span></strong>
+<pre><code>hash_block_size: SkipValidation[int] | None = None  # type: ignore
+"""Block size (in tokens) used for computing Request's block_hashes.
+
+This can be set to a finer granularity than the physical KV cache block
+sizes (e.g. 8) as long as every KV cache group's `block_size` is divisible
+by it. This enables prefix-caching keys to be computed at the finest common
+granularity and then merged for larger physical block sizes."""</code></pre>
+  </div>
+
+  <p>
+    The resolution rules:
+  </p>
+
+  <table>
+    <thead><tr><th>Case</th><th><code>hash_block_size</code></th><th>Source</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Single KV cache group</td>
+        <td><code>block_size &times; dcp &times; pcp</code> (equals scheduler block size)</td>
+        <td><span class="fileref">kv_cache_utils.py:594&ndash;596</span></td>
+      </tr>
+      <tr>
+        <td>Hybrid, prefix caching off and no connector</td>
+        <td>scheduler block size (i.e. LCM &mdash; disables finer hashing)</td>
+        <td><span class="fileref">kv_cache_utils.py:611&ndash;612</span></td>
+      </tr>
+      <tr>
+        <td>Hybrid, prefix caching on</td>
+        <td>user override if set, else <code>gcd(group_block_sizes)</code></td>
+        <td><span class="fileref">kv_cache_utils.py:624&ndash;627</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Hashing happens entirely on the CPU/scheduler side, working from
+    <code>request.all_token_ids</code> &mdash; it never inspects the GPU
+    KV-cache tensor or the CUDA-graph runtime state:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/core/kv_cache_utils.py:645&ndash;686</span></strong>
+<pre><code>def request_block_hasher(request: Request) -&gt; list[BlockHash]:
+    start_token_idx = len(request.block_hashes) * block_size
+    num_tokens = request.num_tokens
+
+    if start_token_idx + block_size &gt; num_tokens:
+        # Early stop when there no new full blocks created.
+        return []
+    ...
+    while True:
+        end_token_idx = start_token_idx + block_size
+        if end_token_idx &gt; num_tokens:
+            # We only hash full blocks
+            break
+        ...
+        block_hash = hash_block_tokens(
+            caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys
+        )</code></pre>
+  </div>
+
+  <h2 id="kv-groups">What is <code>num_kv_cache_groups</code>?</h2>
+
+  <p>
+    The slot-mapping shape above is <code>[num_kv_cache_groups, num_tokens_padded]</code>.
+    A <em>KV cache group</em> is a set of model layers that share the same
+    block table because they share the same attention spec (block size,
+    head dim, dtype, sliding-window length, etc.). The KV cache manager
+    allocates blocks once per group; the runner reuses that block table
+    for every layer in the group.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/kv_cache_interface.py:822&ndash;834</span></strong>
+<pre><code>@dataclass
+class KVCacheGroupSpec:
+    """Represents a group of model layers that share the same KV cache block table.
+    These layers are regarded as one layer in the KV cache manager."""
+    layer_names: list[str]
+    kv_cache_spec: KVCacheSpec
+    is_eagle_group: bool = False</code></pre>
+  </div>
+
+  <table>
+    <thead><tr><th>Model</th><th>Layer pattern</th><th>Groups</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Llama, Qwen, Mistral dense</td>
+        <td><code>N &times; full</code></td>
+        <td><strong>1</strong></td>
+      </tr>
+      <tr>
+        <td>Gemma 2, Mistral sliding hybrids</td>
+        <td>full + sliding-window interleaved</td>
+        <td><strong>2</strong> (<code>FullAttentionSpec</code>, <code>SlidingWindowSpec</code>)</td>
+      </tr>
+      <tr>
+        <td>Jamba, Bamba</td>
+        <td>full + Mamba</td>
+        <td><strong>2</strong> (<code>FullAttentionSpec</code>, <code>MambaSpec</code>)</td>
+      </tr>
+      <tr>
+        <td>Llama 4</td>
+        <td>full + chunked local</td>
+        <td><strong>2</strong> (<code>FullAttentionSpec</code>, <code>ChunkedLocalAttentionSpec</code>)</td>
+      </tr>
+      <tr>
+        <td>Any model with <code>--disable-hybrid-kv-cache-manager</code></td>
+        <td>collapses all attention types into one block table</td>
+        <td><strong>1</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The construction docstring at
+    <span class="fileref">vllm/v1/core/kv_cache_utils.py:1059</span> uses the
+    canonical example: a model with 10 full-attention and 20 sliding-window
+    layers can be viewed as the pattern
+    <code>(1 &times; full, 2 &times; sw)</code> repeated 10 times. That
+    pattern has 3 distinct layers, so the model has 3 KV cache groups, each
+    standing in for 10 real layers.
+  </p>
+
+  <p>
+    Where it shows up in tensor shapes:
+  </p>
+
+  <ul>
+    <li>
+      <code>slot_mappings</code>:
+      <code>[num_kv_cache_groups, num_tokens_padded]</code> &mdash; each
+      token needs a destination slot in <em>every</em> group&rsquo;s block
+      table.
+    </li>
+    <li>
+      <code>block_tables</code>: a list of <code>num_kv_cache_groups</code>
+      tensors, each <code>[num_reqs_padded, max_num_blocks_for_this_group]</code>.
+    </li>
+  </ul>
+
+  <div class="callout info">
+    <strong>Tie-in to <code>hash_block_size</code></strong>
+    When <code>num_kv_cache_groups &gt; 1</code>, groups may have different
+    physical <code>block_size</code> values. That is exactly why the hybrid
+    path picks <code>hash_block_size = gcd(group_block_sizes)</code>
+    (<span class="fileref">kv_cache_utils.py:624</span>) &mdash; a single
+    hashing granularity that divides every group&rsquo;s block, so the same
+    block hashes are valid across all groups.
+  </div>
+
+  <h2 id="orthogonal">Why CUDA Graph does not affect <code>hash_block_size</code></h2>
+
+  <p>
+    The two concepts use the word &ldquo;block&rdquo; but live in different
+    layers:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>CUDA Graph capture size</h3>
+      <ul>
+        <li>Unit: <strong>tokens in this step&rsquo;s batch</strong></li>
+        <li>Layer: <strong>GPU shape / launch overhead</strong></li>
+        <li>Set by: <code>cudagraph_capture_sizes</code> in compilation config</li>
+        <li>Visible to: model forward pass on GPU</li>
+        <li>Mechanism: pad up, route extras to <code>PAD_SLOT_ID</code></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3><code>hash_block_size</code></h3>
+      <ul>
+        <li>Unit: <strong>tokens in a single prefix-cache key</strong></li>
+        <li>Layer: <strong>CPU scheduler / prefix-cache lookup</strong></li>
+        <li>Set by: <code>cache_config.hash_block_size</code> or derived</li>
+        <li>Visible to: scheduler when computing <code>request.block_hashes</code></li>
+        <li>Mechanism: <code>num_tokens // hash_block_size</code> hashes</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    There is no code path where the CUDA Graph dispatcher reads
+    <code>hash_block_size</code>, and no code path where the block hasher
+    reads the CUDA Graph capture menu. The two systems share no shape
+    constraint. Capture sizes do not need to be multiples of
+    <code>hash_block_size</code>; conversely
+    <code>hash_block_size</code> can be 8 or 16 while capture sizes go
+    <code>&hellip;, 240, 256, 272, &hellip;</code>.
+  </p>
+
+  <div class="callout warn">
+    <strong>Don&rsquo;t confuse this with the kernel block alignment constraint</strong>
+    A <em>different</em> constraint &mdash; the CUTLASS MLA kernel&rsquo;s
+    requirement that <code>block_num % (128 / PAGE_SIZE) == 0</code>
+    &mdash; <em>does</em> couple the physical block size to a kernel-internal
+    tile, and that one can force inflation of the KV block size. See
+    <a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT</a> for that
+    story. CUDA Graph capture is unrelated to it.
+  </div>
+
+  <h2 id="partial">Partial blocks below <code>hash_block_size</code></h2>
+
+  <p>
+    The question &ldquo;what happens when we compute a partial block below
+    <code>hash_block_size</code>&rdquo; has two valid readings; both end at
+    the same place.
+  </p>
+
+  <h3>Reading 1: the request only has fewer tokens than a full hash block</h3>
+
+  <p>
+    The hasher early-exits before producing any hash:
+  </p>
+
+<pre><code>start_token_idx = len(request.block_hashes) * block_size
+num_tokens = request.num_tokens
+if start_token_idx + block_size &gt; num_tokens:
+    return []          # &larr; no new full block to hash</code></pre>
+
+  <p>
+    The single-type KV-cache manager registers the same thing on the
+    caching side &mdash; only the floor of complete blocks is committed:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/core/single_type_kv_cache_manager.py:298&ndash;302</span></strong>
+<pre><code>num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+num_full_blocks = num_tokens // self.block_size
+if num_cached_blocks &gt;= num_full_blocks:
+    return</code></pre>
+  </div>
+
+  <h3>Reading 2: chunked-prefill / decode is writing into a still-partial block</h3>
+
+  <p>
+    Same logic applies: each scheduling step recomputes
+    <code>num_full_blocks = num_tokens // hash_block_size</code>. The
+    current trailing partial block <em>physically</em> has its KV written
+    into real cache slots (the slot mapping for those positions is a real,
+    non-sentinel slot id, because the block was allocated for this
+    request), but it is not yet hashed and therefore not yet visible to
+    the prefix cache.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Trailing partial block &mdash; hashed on completion, not before</div>
+    <div class="cell-row">
+      <span class="cell label">tokens:</span>
+      <span class="cell sm">0</span><span class="cell sm">1</span><span class="cell sm">2</span><span class="cell sm">3</span>
+      <span class="cell sm">4</span><span class="cell sm">5</span><span class="cell sm">6</span><span class="cell sm">7</span>
+      <span class="cell sm">8</span><span class="cell sm">9</span><span class="cell sm">10</span><span class="cell sm">11</span>
+      <span class="cell sm">12</span><span class="cell sm">13</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block#:</span>
+      <span class="cell cached" style="min-width:120px;">block 0 (hashed)</span>
+      <span class="cell cached" style="min-width:120px;">block 1 (hashed)</span>
+      <span class="cell cached" style="min-width:120px;">block 2 (hashed)</span>
+      <span class="cell dirty" style="min-width:60px;">block 3 (partial)</span>
+    </div>
+    <div class="diagram-caption">
+      <code>hash_block_size = 4</code>, <code>num_tokens = 14</code> &rarr;
+      <code>num_full_blocks = 14 // 4 = 3</code>. Blocks 0&ndash;2 (positions
+      0&ndash;11) are full and hashed. Block 3 holds only positions
+      12&ndash;13; its KV is written into real cache slots but the block is
+      <strong>not hashed</strong> &mdash; not until two more tokens arrive
+      to complete it. If the request ends here, block 3&rsquo;s KV is
+      discarded with the block when it is freed.
+    </div>
+  </div>
+
+  <p>
+    Concretely, the trailing partial block:
+  </p>
+
+  <ul>
+    <li><strong>Has KV written</strong> to real, valid cache slots
+      (the block was already allocated for this request).</li>
+    <li><strong>Has no hash entry</strong> in the prefix cache &mdash;
+      no other request can match it.</li>
+    <li><strong>Will be hashed</strong> on the first scheduler step
+      after enough new tokens land to complete it.</li>
+    <li><strong>Will be lost</strong> if the request finishes before
+      the block fills: the block is freed back to the pool, its slots
+      reused, and the partial KV is gone.</li>
+  </ul>
+
+  <div class="callout good">
+    <strong>Why this is fine</strong>
+    Hashing a partial block would either need padding to a fixed length
+    (changing the hash and breaking prefix matching) or a variable-length
+    hash key (more work per lookup, larger key table). The current design
+    trades a small reuse miss at the tail of every request for a simple
+    fixed-size hash key.
+  </div>
+
+  <h2 id="worked">Worked example end-to-end</h2>
+
+  <p>
+    Configuration: <code>block_size = 16</code> (single KV-cache group,
+    so <code>hash_block_size = 16</code>),
+    <code>cudagraph_capture_sizes = [&hellip;, 88, 96, 104, &hellip;]</code>.
+    Suppose 100 actual tokens are scheduled this step across a few
+    requests.
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Dispatcher pads</strong> <code>num_tokens = 100</code> up
+      to the next captured size, <code>104</code>. The forward pass will
+      run the size-104 graph.
+    </li>
+    <li>
+      <strong>Slot mapping is built</strong> with shape
+      <code>[num_kv_groups, 104]</code>: the first 100 entries are real
+      slots; the trailing 4 are <code>PAD_SLOT_ID = &minus;1</code>.
+    </li>
+    <li>
+      <strong>Attention writes KV</strong> for positions 0&ndash;99 into
+      their real slots and skips positions 100&ndash;103.
+    </li>
+    <li>
+      <strong>Scheduler hashes new full blocks</strong> on the CPU side
+      using <code>request.all_token_ids</code> and
+      <code>hash_block_size = 16</code>. For a request whose total tokens
+      jumped from 30 to 46 this step:
+      <code>30 // 16 = 1</code> already hashed, <code>46 // 16 = 2</code>
+      total full blocks &rarr; one new hash is registered for the block
+      spanning tokens 16&ndash;31. Tokens 32&ndash;45 sit in a partial
+      block; the request has real KV in those slots but the block has no
+      hash yet.
+    </li>
+    <li>
+      <strong>Next step</strong> the request adds 5 more tokens
+      (total = 51). Now <code>51 // 16 = 3</code> full blocks: the block
+      spanning 32&ndash;47 becomes the new third hash. Tokens 48&ndash;50
+      become the new partial tail.
+    </li>
+  </ol>
+
+  <h2 id="multi-req">Multi-request batches: one graph, many requests</h2>
+
+  <p>
+    A scheduler step almost never runs a single request. The runner
+    <em>packs</em> every scheduled request&rsquo;s tokens into one flat
+    1-D buffer, picks the graph (FULL or PIECEWISE, per
+    <a href="#modes">the mode rules above</a>) that matches the batch
+    shape, and replays it. Recap of the two keying rules:
+  </p>
+
+  <table>
+    <thead><tr><th>Batch type</th><th>Per-step shape</th><th>Capture key</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Uniform decode &rarr; FULL graph</strong></td>
+        <td>Every request contributes exactly <code>uniform_decode_query_len</code> tokens (1 without spec decode; <em>k</em>+1 with <em>k</em> draft tokens).</td>
+        <td><code>(num_tokens, num_reqs)</code> &mdash; <code>num_reqs</code> is fixed by <code>num_tokens / uniform_decode_query_len</code></td>
+      </tr>
+      <tr>
+        <td><strong>Mixed batch &rarr; PIECEWISE graph</strong></td>
+        <td>Per-request token counts vary &mdash; prefill, chunked prefill, and decode all in one step.</td>
+        <td><code>num_tokens</code> only; <code>num_reqs</code> is relaxed to <code>None</code> in the key because attention runs eagerly</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/cudagraph_dispatcher.py:147&ndash;152</span></strong>
+<pre><code>if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+    num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
+    assert num_tokens_padded % uniform_decode_query_len == 0
+else:
+    uniform_decode = False
+    num_reqs = min(num_tokens_padded, max_num_seqs)</code></pre>
+  </div>
+
+  <h3 id="query-start-loc">Aside: what is <code>query_start_loc</code>?</h3>
+
+  <p>
+    The examples below lean on <code>query_start_loc</code> heavily, so a
+    quick primer. It is a cumulative prefix-sum tensor that marks where
+    each request&rsquo;s query tokens begin in the packed 1-D batch
+    buffer &mdash; same idea as FlashAttention&rsquo;s
+    <code>cu_seqlens_q</code>.
+  </p>
+
+  <table>
+    <thead><tr><th>Property</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Shape</td><td><code>[num_reqs + 1]</code> in PIECEWISE; <code>[num_reqs_padded + 1]</code> in FULL</td></tr>
+      <tr><td>Contents</td><td><code>[0, q&#x2080;, q&#x2080;+q&#x2081;, &hellip;, num_tokens]</code> where <code>q&#x1d62;</code> is request <em>i</em>&rsquo;s query length this step</td></tr>
+      <tr><td>First entry</td><td>always <code>0</code></td></tr>
+      <tr><td>Last real entry</td><td>always equal to <code>num_tokens</code> (sum of all <code>q&#x1d62;</code>)</td></tr>
+      <tr><td>Property</td><td>strictly non-decreasing (FA3 requires it)</td></tr>
+      <tr><td>Per-request query length</td><td><code>q&#x1d62; = query_start_loc[i+1] &minus; query_start_loc[i]</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Example with three requests of query lengths
+    <code>[7, 1, 1]</code>:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">query_start_loc for query lengths [7, 1, 1]</div>
+    <div class="cell-row">
+      <span class="cell label">batch position:</span>
+      <span class="cell head sm">0</span>
+      <span class="cell head sm">1</span>
+      <span class="cell head sm">2</span>
+      <span class="cell head sm">3</span>
+      <span class="cell head sm">4</span>
+      <span class="cell head sm">5</span>
+      <span class="cell head sm">6</span>
+      <span class="cell head sm">7</span>
+      <span class="cell head sm">8</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">owning req:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">0</span>
+      <span class="cell cached sm">1</span>
+      <span class="cell cached sm" style="background: var(--amber-soft);">2</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">query_start_loc:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell sm">&nbsp;</span>
+      <span class="cell sm">&nbsp;</span>
+      <span class="cell sm">&nbsp;</span>
+      <span class="cell sm">&nbsp;</span>
+      <span class="cell sm">&nbsp;</span>
+      <span class="cell sm">&nbsp;</span>
+      <span class="cell used sm">7</span>
+      <span class="cell used sm">8</span>
+      <span class="cell used sm">9</span>
+    </div>
+    <div class="diagram-caption">
+      4 entries for 3 reqs. Boundaries: req&nbsp;0 owns positions
+      <code>[0, 7)</code>, req&nbsp;1 owns <code>[7, 8)</code>, req&nbsp;2
+      owns <code>[8, 9)</code>. <code>num_tokens = 9</code>.
+    </div>
+  </div>
+
+  <p>
+    Three things the attention kernel does with it:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Locate each query&rsquo;s owning request</strong>: for batch
+      position <code>b</code>, find <em>i</em> such that
+      <code>query_start_loc[i] &le; b &lt; query_start_loc[i+1]</code>.
+    </li>
+    <li>
+      <strong>Apply causal masking per-request</strong>: within a single
+      request&rsquo;s range, queries are causally masked against earlier
+      query positions of that same request (only matters when
+      <code>q&#x1d62; &gt; 1</code>). Across request boundaries no
+      masking is needed because requests share no KV.
+    </li>
+    <li>
+      <strong>Branch on per-request query length</strong>: pure decode
+      (<code>q&#x1d62; = 1</code>) takes a different code path than
+      prefill (<code>q&#x1d62; &gt; 1</code>).
+    </li>
+  </ol>
+
+  <p>
+    In FULL mode the padded request slots past <code>num_reqs</code> hold
+    a <em>repeat of the last value</em> (=&nbsp;<code>num_tokens</code>)
+    so the array stays non-decreasing. With 3 real reqs and
+    <code>num_reqs_padded = 4</code>, <code>num_tokens = 100</code>,
+    you get <code>[0, q&#x2080;, q&#x2080;+q&#x2081;, 100, 100]</code>
+    &mdash; the trailing 100 makes padded slot 3&rsquo;s query length
+    zero, so attention does no work for it. In PIECEWISE there are no
+    padded entries; the array is exactly <code>num_reqs + 1</code>
+    elements.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/worker/gpu/model_runner.py:815&ndash;823</span></strong>
+<pre><code>query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+query_start_loc_np[0] = 0
+np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
+# Pad for full CUDA graph mode.
+# Some attention backends like FA3 require query_start_loc to be non-decreasing.
+query_start_loc_np[num_reqs + 1 :] = num_tokens
+async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]</code></pre>
+  </div>
+
+  <h3>Example A &mdash; uniform decode, 3 requests</h3>
+
+  <p>
+    Three requests, each adding one new decoded token this step:
+  </p>
+
+  <table>
+    <thead><tr><th>Request</th><th>Already computed</th><th>This step</th><th>New position</th></tr></thead>
+    <tbody>
+      <tr><td>req A</td><td>100 tokens</td><td>1 token</td><td>100</td></tr>
+      <tr><td>req B</td><td>47 tokens</td><td>1 token</td><td>47</td></tr>
+      <tr><td>req C</td><td>200 tokens</td><td>1 token</td><td>200</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>num_tokens = 3</code>. With capture sizes
+    <code>[1, 2, 4, 8, &hellip;]</code>, the dispatcher rounds 3 up to
+    <strong>4</strong>. The size-4 decode graph is replayed:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Packed buffers for the size-4 decode graph (3 real reqs + 1 padded)</div>
+
+    <div class="cell-row">
+      <span class="cell label">slot in batch:</span>
+      <span class="cell head sm">0</span>
+      <span class="cell head sm">1</span>
+      <span class="cell head sm">2</span>
+      <span class="cell head sm">3</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">input_ids:</span>
+      <span class="cell used sm">tok_A</span>
+      <span class="cell used sm">tok_B</span>
+      <span class="cell used sm">tok_C</span>
+      <span class="cell null sm">pad</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">positions:</span>
+      <span class="cell used sm">100</span>
+      <span class="cell used sm">47</span>
+      <span class="cell used sm">200</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">slot_mapping:</span>
+      <span class="cell used sm">812</span>
+      <span class="cell used sm">317</span>
+      <span class="cell used sm">1504</span>
+      <span class="cell null sm">&minus;1</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">seq_lens:</span>
+      <span class="cell used sm">101</span>
+      <span class="cell used sm">48</span>
+      <span class="cell used sm">201</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">query_start_loc:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">1</span>
+      <span class="cell used sm">2</span>
+      <span class="cell used sm">3</span>
+      <span class="cell null sm">3</span>
+    </div>
+    <div class="diagram-caption">
+      One real slot per request; the padded fourth slot uses
+      <code>PAD_SLOT_ID = -1</code> and <code>seq_lens = 0</code>.
+      <code>query_start_loc</code> has <code>num_reqs_padded + 1</code>
+      entries; padded reqs repeat the last value to keep it non-decreasing
+      (required by FA3).
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/worker/gpu/model_runner.py:818&ndash;823</span></strong>
+<pre><code># Pad for full CUDA graph mode.
+# Some attention backends like FA3 require query_start_loc to be non-decreasing.
+query_start_loc_np[num_reqs + 1 :] = num_tokens</code></pre>
+  </div>
+
+  <h4 id="multi-req-block-tables">Where is the KV cache read from? &mdash; <code>block_tables</code></h4>
+
+  <p>
+    The <code>slot_mapping</code> tensor above tells attention <em>where
+    to write</em> the new <code>(K, V)</code> for each of this step&rsquo;s
+    queries &mdash; one slot per query. The <em>read</em> side &mdash; the
+    historical KV the kernel attends over &mdash; is a separate tensor:
+    <code>block_tables</code>, shape
+    <code>[num_kv_cache_groups, num_reqs_padded, max_num_blocks]</code>.
+    Each row is the per-request list of physical block IDs that hold this
+    request&rsquo;s context.
+  </p>
+
+  <p>
+    Continuing example A, suppose <code>physical block_size = 16</code>.
+    Each request needs <code>ceil(seq_len / 16)</code> blocks of context:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">block_tables[0] for the size-4 decode graph (one KV cache group)</div>
+    <div class="cell-row">
+      <span class="cell label">batch slot:</span>
+      <span class="cell head sm">0 (req A)</span>
+      <span class="cell head sm">1 (req B)</span>
+      <span class="cell head sm">2 (req C)</span>
+      <span class="cell head sm">3 (pad)</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 0:</span>
+      <span class="cell cached sm">12</span>
+      <span class="cell cached sm">88</span>
+      <span class="cell cached sm">301</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 1:</span>
+      <span class="cell cached sm">47</span>
+      <span class="cell cached sm">52</span>
+      <span class="cell cached sm">442</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 2:</span>
+      <span class="cell cached sm">99</span>
+      <span class="cell cached sm">7</span>
+      <span class="cell cached sm">501</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 3:</span>
+      <span class="cell cached sm">14</span>
+      <span class="cell null sm">&mdash;</span>
+      <span class="cell cached sm">678</span>
+      <span class="cell null sm">0</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">&hellip;</span>
+      <span class="cell sm">&hellip;</span>
+      <span class="cell sm">&hellip;</span>
+      <span class="cell sm">&hellip;</span>
+      <span class="cell null sm">&hellip;</span>
+    </div>
+    <div class="diagram-caption">
+      Each column is a request&rsquo;s ordered list of physical block IDs.
+      Block IDs are pool indices into the KV cache tensor &mdash; they
+      have no relationship to batch position. Padded batch slot 3 has its
+      row zeroed by <code>gather_block_tables</code>.
+    </div>
+  </div>
+
+  <p>
+    Inside the attention kernel, each captured query in batch slot
+    <code>i</code> reads its context like this (pseudo-code per layer,
+    per KV cache group):
+  </p>
+
+<pre><code>q = query[i]                              # newly computed Q for this token
+seq_len = seq_lens[i]                     # e.g. 48 for req B
+for pos in 0 .. seq_len - 1:              # historical positions
+    block_idx   = pos // block_size       # which logical block
+    block_offset = pos %  block_size      # offset within that block
+    phys_block  = block_tables[group, i, block_idx]   # &larr; READ
+    k = K_cache[group, phys_block, block_offset]
+    v = V_cache[group, phys_block, block_offset]
+    accumulate(q, k, v)
+
+# write this step's new KV
+slot = slot_mapping[group, query_start_loc[i]]        # &larr; WRITE
+K_cache.flat[slot] = new_k
+V_cache.flat[slot] = new_v</code></pre>
+
+  <p>
+    Concrete reads for example A:
+  </p>
+
+  <table>
+    <thead><tr><th>Batch slot</th><th>seq_lens</th><th>Blocks read</th><th>Last position read</th><th>Slot written</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>0 &mdash; req A</td>
+        <td>101</td>
+        <td>physical blocks 12, 47, 99, 14, &hellip; (the first <code>ceil(101/16) = 7</code> entries)</td>
+        <td>position 100 in block <code>100 // 16 = 6</code></td>
+        <td>slot 812 (this step&rsquo;s new token at position 100)</td>
+      </tr>
+      <tr>
+        <td>1 &mdash; req B</td>
+        <td>48</td>
+        <td>blocks 88, 52, 7 (<code>ceil(48/16) = 3</code> blocks)</td>
+        <td>position 47 in block 2</td>
+        <td>slot 317</td>
+      </tr>
+      <tr>
+        <td>2 &mdash; req C</td>
+        <td>201</td>
+        <td>blocks 301, 442, 501, 678, &hellip; (<code>ceil(201/16) = 13</code> blocks)</td>
+        <td>position 200 in block 12</td>
+        <td>slot 1504</td>
+      </tr>
+      <tr>
+        <td>3 &mdash; pad</td>
+        <td>0</td>
+        <td>nothing &mdash; the inner loop&rsquo;s upper bound is 0</td>
+        <td>n/a</td>
+        <td>slot &minus;1 (no write)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>Two tensors, two jobs</strong>
+    <ul>
+      <li><code>block_tables[group, req_idx, :]</code> &mdash; READ
+      addresses. Resolves <em>logical position</em> &rarr; <em>physical
+      block</em>. Built/refreshed by the scheduler when blocks are
+      allocated; gathered onto a per-batch slice each step.</li>
+      <li><code>slot_mapping[group, batch_pos]</code> &mdash; WRITE
+      addresses. One slot per <em>new query token</em> in this step.
+      Computed each step from <code>positions</code> and
+      <code>block_tables</code>.</li>
+    </ul>
+    The CUDA graph captures <em>pointer values</em> for both tensors; on
+    each replay the runner writes new contents into the same persistent
+    buffers, so the captured graph reads up-to-date routing without
+    being re-captured.
+  </div>
+
+  <p>
+    Same story for the padded slot 3: <code>seq_lens[3] = 0</code> makes
+    the read loop iterate zero times, <code>slot_mapping[0, 3] = -1</code>
+    makes the write a no-op, and the resulting fake logit is dropped by
+    the gather (it has no entry in <code>cu_num_logits</code>).
+  </p>
+
+  <h4 id="what-graph-captures">What the CUDA graph actually captures about <code>block_tables</code> (and every other input)</h4>
+
+  <p>
+    A common mental model gotcha: &ldquo;If <code>block_tables</code>
+    contents change every step, surely the graph captures them and we
+    re-capture every step? Or is <code>block_tables</code> excluded from
+    the graph?&rdquo; Neither &mdash; <code>block_tables</code> is captured
+    in exactly the same way as <code>input_ids</code>, <code>positions</code>,
+    <code>slot_mapping</code>, <code>seq_lens</code>, and
+    <code>query_start_loc</code>. What CUDA graphs record about an input
+    tensor argument is a <strong>device pointer + tensor shape</strong>,
+    not the underlying bytes.
+  </p>
+
+  <table>
+    <thead><tr><th>Aspect</th><th>Captured into the graph?</th><th>How it stays correct on replay</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Tensor <strong>memory address</strong></td>
+        <td>Yes &mdash; baked in at capture time, for every tensor passed to a captured kernel.</td>
+        <td>The runner always uses the same persistent buffer object; new contents are written <em>into</em> that buffer.</td>
+      </tr>
+      <tr>
+        <td>Tensor <strong>shape &amp; stride</strong></td>
+        <td>Yes &mdash; baked in, but only for tensors that actually flow through captured kernels.</td>
+        <td>Padding rounds the runtime batch up to a captured size so the shape matches. <em>(See <a href="#piecewise-shape-nuance">below</a> for why some tensors aren&rsquo;t padded in PIECEWISE.)</em></td>
+      </tr>
+      <tr>
+        <td>Tensor <strong>contents (bytes)</strong></td>
+        <td><strong>No</strong> &mdash; not part of the recording.</td>
+        <td>The runner overwrites the buffer each step <em>before</em> calling replay; the captured kernels then read whatever is there <em>now</em>.</td>
+      </tr>
+      <tr>
+        <td>Kernel <strong>launch params</strong> (grid size, block size, shared-mem size, scalar args)</td>
+        <td>Yes &mdash; baked in.</td>
+        <td>These derive from tensor shapes &amp; the captured config, so padding makes them invariant.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    So &ldquo;the graph includes <code>block_tables</code>&rdquo; just
+    means a pointer to a fixed-shape buffer is encoded in the captured
+    kernel calls. The block IDs themselves are read from that buffer at
+    replay time:
+  </p>
+
+  <div class="flow">
+    <div class="flow-step b"><div class="num">capture</div>kernel call records <em>address</em> of <code>block_tables</code> tensor and its shape</div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step a"><div class="num">each step</div>runner writes fresh block IDs into the <em>same</em> buffer via <code>gather_block_tables</code></div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step g"><div class="num">replay</div>captured kernel dereferences the recorded address and sees the new IDs</div>
+  </div>
+
+  <p>
+    The mechanism is identical for every input. The reason
+    <code>gather_block_tables</code> writes <em>into</em>
+    <code>self.input_block_tables</code> rather than allocating a new
+    tensor each step is precisely to preserve the captured address:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/worker/gpu/block_table.py:140&ndash;145</span></strong>
+<pre><code>def get_dummy_block_tables(self, num_reqs: int) -&gt; tuple[torch.Tensor, ...]:
+    # NOTE(woosuk): The output may be used for CUDA graph capture.
+    # Therefore, this method must return the persistent tensor
+    # with the same memory address as that used during the model's forward pass,
+    # rather than allocating a new tensor.
+    return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)</code></pre>
+  </div>
+
+  <div class="callout info">
+    <strong>So what <em>is</em> excluded from FULL graphs?</strong>
+    Not <code>block_tables</code> &mdash; that&rsquo;s fine because it
+    fits the persistent-buffer pattern. What can&rsquo;t be captured in
+    FULL safely is anything whose <em>shape</em>, <em>kernel-launch
+    parameters</em>, or <em>internal pointer arrays</em> are derived
+    from per-step CPU computation that varies between (num_tokens,
+    num_reqs) configurations. FA3&rsquo;s <code>scheduler_metadata</code>
+    is the canonical example: its layout depends on
+    <code>num_reqs</code>, so different <code>num_reqs</code> values need
+    different captured graphs. PIECEWISE solves this by leaving attention
+    out of the graph entirely &mdash; the attention kernel rebuilds its
+    metadata fresh in eager mode each step, while the rest of the model
+    enjoys captured launches.
+  </div>
+
+  <p>
+    The same logic explains the seemingly redundant
+    <code>query_start_loc</code> padding (entries past
+    <code>num_reqs</code> repeat the last value) and the
+    <code>seq_lens = 0</code> for padded slots: the captured kernel reads
+    a fixed-shape <code>[num_reqs_padded + 1]</code> array, and the
+    runner must populate it with values that make the padded queries
+    no-ops. The kernel cannot &ldquo;skip&rdquo; padded slots based on a
+    dynamic count &mdash; it reads what the buffer says, every replay.
+  </p>
+
+  <h4 id="piecewise-shape-nuance">Wait &mdash; doesn&rsquo;t <code>block_tables</code> change shape in PIECEWISE?</h4>
+
+  <p>
+    Good catch. The previous section was a simplification: it&rsquo;s true
+    that <em>token-dimension</em> tensors are always padded to
+    <code>num_tokens_padded</code> regardless of mode, but
+    <em>request-dimension</em> tensors (including
+    <code>block_tables</code>) behave differently between FULL and
+    PIECEWISE.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Tensor</th>
+        <th>Dim</th>
+        <th>Shape in FULL</th>
+        <th>Shape in PIECEWISE</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>input_ids</code></td>
+        <td>token</td>
+        <td><code>[num_tokens_padded]</code></td>
+        <td><code>[num_tokens_padded]</code></td>
+      </tr>
+      <tr>
+        <td><code>positions</code></td>
+        <td>token</td>
+        <td><code>[num_tokens_padded]</code></td>
+        <td><code>[num_tokens_padded]</code></td>
+      </tr>
+      <tr>
+        <td><code>slot_mapping</code></td>
+        <td>token</td>
+        <td><code>[num_kv_groups, num_tokens_padded]</code></td>
+        <td><code>[num_kv_groups, num_tokens_padded]</code></td>
+      </tr>
+      <tr>
+        <td><strong><code>block_tables</code></strong></td>
+        <td>request</td>
+        <td><code>[num_reqs_padded, max_num_blocks]</code></td>
+        <td><strong><code>[num_reqs, max_num_blocks]</code></strong> &mdash; actual <code>num_reqs</code>, no padding</td>
+      </tr>
+      <tr>
+        <td><strong><code>seq_lens</code></strong></td>
+        <td>request</td>
+        <td><code>[num_reqs_padded]</code></td>
+        <td><strong><code>[num_reqs]</code></strong></td>
+      </tr>
+      <tr>
+        <td><strong><code>query_start_loc</code></strong></td>
+        <td>request</td>
+        <td><code>[num_reqs_padded + 1]</code></td>
+        <td><strong><code>[num_reqs + 1]</code></strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The dispatcher signals this by setting <code>num_reqs = None</code>
+    on the BatchDescriptor it returns for PIECEWISE matches, and the
+    runner falls back to the real count:
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/cudagraph_dispatcher.py:317&ndash;322</span></strong>
+<pre><code>if CUDAGraphMode.PIECEWISE in allowed_modes:
+    # also check if the relaxed key exists for more "general"
+    # piecewise cudagraph
+    batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
+    if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+        return CUDAGraphMode.PIECEWISE, batch_desc_to_check</code></pre>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/worker/gpu/model_runner.py:813&ndash;814</span></strong>
+<pre><code># num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+num_reqs_padded = batch_desc.num_reqs or num_reqs</code></pre>
+  </div>
+
+  <h3>Why this is consistent with how graphs work</h3>
+
+  <p>
+    PIECEWISE captures only the <em>non-attention</em> partitions of the
+    model. Those partitions touch the token-dimension tensors
+    (<code>input_ids</code>, hidden states of shape
+    <code>[num_tokens_padded, hidden_dim]</code>, etc.) but never the
+    request-dimension tensors. The captured kernels in those partitions
+    encode <code>num_tokens_padded</code> in their launch params, so that
+    dimension <strong>must</strong> stay fixed across replays.
+  </p>
+
+  <p>
+    The request-dimension tensors are only consumed by attention. In
+    PIECEWISE, attention runs <em>eagerly</em> between graph segments
+    &mdash; a regular kernel launch whose launch params are recomputed on
+    the host every step. Eager launches happily accept different shapes
+    every call, so the runner is free to skip padding on those tensors.
+    Skipping the padding has two practical benefits:
+  </p>
+
+  <ul>
+    <li>Smaller copies and lookups every step (a 64-row block table
+      instead of a 256-row one when only 64 reqs are live).</li>
+    <li>No need to populate dummy padded rows with
+      <code>seq_lens = 0</code> and zeroed block IDs.</li>
+  </ul>
+
+  <p>
+    FULL captures attention <em>inside</em> the graph, so the request
+    dimension also gets baked in &mdash; that dimension must match the
+    captured shape on replay, which is exactly why
+    <code>num_reqs</code> is part of the FULL graph key but not the
+    PIECEWISE key.
+  </p>
+
+  <div class="callout good">
+    <strong>The sharpened rule</strong>
+    What CUDA Graph requires fixed across replays is the
+    <em>shape of every tensor that appears as an argument to a captured
+    kernel</em>. In PIECEWISE the captured kernels are non-attention
+    only, so they never see <code>block_tables</code> /
+    <code>seq_lens</code> / <code>query_start_loc</code> &mdash; those
+    tensors are free to vary. In FULL the captured kernels include
+    attention, so every input tensor&rsquo;s shape is locked in by the
+    capture key.
+  </div>
+
+  <h3>Example B &mdash; mixed prefill + decode</h3>
+
+  <p>
+    Same step, but now one request is in the middle of a chunked prefill:
+  </p>
+
+  <table>
+    <thead><tr><th>Request</th><th>State</th><th>Tokens this step</th></tr></thead>
+    <tbody>
+      <tr><td>req A</td><td>chunked prefill (positions 0&ndash;49 of 1024)</td><td><strong>50</strong></td></tr>
+      <tr><td>req B</td><td>decode</td><td>1</td></tr>
+      <tr><td>req C</td><td>decode</td><td>1</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>num_tokens = 52</code>. The dispatcher rounds 52 to
+    <strong>56</strong> (next capture size). The mixed PIECEWISE graph is
+    used. Layout:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Mixed batch packed into a size-56 PIECEWISE graph</div>
+    <div class="cell-row wrap">
+      <span class="cell label">input_ids [56]:</span>
+      <span class="cell used wide" style="min-width:170px;">req A &mdash; 50 prefill tokens (positions 0&ndash;49)</span>
+      <span class="cell used sm">B</span>
+      <span class="cell used sm">C</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+      <span class="cell null sm">pad</span>
+    </div>
+    <div class="cell-row wrap">
+      <span class="cell label">slot_mapping [56]:</span>
+      <span class="cell used wide" style="min-width:170px;">req A &mdash; 50 real slot ids</span>
+      <span class="cell used sm">s_B</span>
+      <span class="cell used sm">s_C</span>
+      <span class="cell null sm">&minus;1</span>
+      <span class="cell null sm">&minus;1</span>
+      <span class="cell null sm">&minus;1</span>
+      <span class="cell null sm">&minus;1</span>
+    </div>
+    <div class="cell-row wrap">
+      <span class="cell label">query_start_loc [4]:</span>
+      <span class="cell used sm">0</span>
+      <span class="cell used sm">50</span>
+      <span class="cell used sm">51</span>
+      <span class="cell used sm">52</span>
+    </div>
+    <div class="cell-row wrap">
+      <span class="cell label">seq_lens [3]:</span>
+      <span class="cell used sm">50</span>
+      <span class="cell used sm">48</span>
+      <span class="cell used sm">201</span>
+    </div>
+    <div class="cell-row wrap">
+      <span class="cell label">block_tables [3, &hellip;]:</span>
+      <span class="cell cached sm">req A blocks</span>
+      <span class="cell cached sm">req B blocks</span>
+      <span class="cell cached sm">req C blocks</span>
+    </div>
+    <div class="diagram-caption">
+      Token-dimension tensors (<code>input_ids</code>,
+      <code>slot_mapping</code>) are padded to the captured size 56 because
+      they flow through captured non-attention partitions.
+      Request-dimension tensors (<code>query_start_loc</code>,
+      <code>seq_lens</code>, <code>block_tables</code>) keep the real
+      <code>num_reqs = 3</code> &mdash; they&rsquo;re consumed only by
+      eager attention, which doesn&rsquo;t care about shape variance. See
+      <a href="#piecewise-shape-nuance">Why request-dim shapes differ</a>.
+    </div>
+  </div>
+
+  <p>
+    Because PIECEWISE keys only on <code>num_tokens</code>, the size-56
+    graph works for <em>any</em> mix that sums to a token count in the
+    range (48, 56] &mdash; one big prefill + zero decodes, ten small
+    requests, etc. The same captured graph is replayed for all of them,
+    and the eager attention call between segments re-reads
+    <code>seq_lens</code> / <code>block_tables</code> at whatever request
+    count the step actually has.
+  </p>
+
+  <div class="callout info">
+    <strong>Compare with Example A</strong>
+    Example A used a FULL graph (uniform decode), so <em>both</em>
+    dimensions are padded: <code>seq_lens [4]</code>,
+    <code>block_tables [4, &hellip;]</code>,
+    <code>query_start_loc [5]</code> with a trailing dummy request slot.
+    Example B uses PIECEWISE for the same reason no other mode could
+    handle a non-uniform mix &mdash; and PIECEWISE drops the request-dim
+    padding entirely.
+  </div>
+
+  <h3>Per-request prefix-cache hashing is still independent</h3>
+
+  <p>
+    Even though all three requests share one graph, the hasher runs
+    <em>per request</em> on the CPU after the step. Continuing example A:
+  </p>
+
+  <ul>
+    <li>
+      <strong>req A (101 tokens, <code>hash_block_size = 16</code>)</strong>:
+      <code>101 // 16 = 6</code> full blocks. If 6 were hashed already, no
+      new hash; otherwise the new ones are registered.
+    </li>
+    <li>
+      <strong>req B (48 tokens, <code>hash_block_size = 16</code>)</strong>:
+      <code>48 // 16 = 3</code> full blocks &mdash; a new hash on
+      <em>this</em> step because position 47 just completed the third
+      block.
+    </li>
+    <li>
+      <strong>req C (201 tokens, <code>hash_block_size = 16</code>)</strong>:
+      <code>201 // 16 = 12</code> full blocks, plus a 9-token partial tail
+      that is not hashed.
+    </li>
+  </ul>
+
+  <p>
+    Three separate calls to <code>request_block_hasher</code>; the dummy
+    fourth slot has no <code>Request</code> object and contributes
+    nothing. The fact that CUDA Graph rounded the batch up to four queries
+    is invisible to the hasher.
+  </p>
+
+  <div class="callout info">
+    <strong>The capture-cost trade</strong>
+    Each captured graph holds onto its own pinned input buffers and
+    workspace. With ~40 default capture sizes plus separate FULL and
+    PIECEWISE menus and optional LoRA specializations, capture can use
+    several GB and add startup time. That is the reason the dispatcher
+    uses a <em>discrete menu</em> with rounding rather than capturing
+    every integer batch size: the runtime cost of one padded forward pass
+    is much smaller than the static cost of carrying 256 graphs in memory.
+  </div>
+
+  <h2 id="scenario">Scenario: 20 tokens with <code>hash_block_size = 32</code></h2>
+
+  <p>
+    A common worry: if a request only has 20 tokens but
+    <code>hash_block_size = 32</code>, does CUDA Graph still work?
+    <strong>Yes &mdash; the two systems do not interact.</strong>
+  </p>
+
+  <table>
+    <thead><tr><th>Concern</th><th>What it sees</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>CUDA Graph dispatcher</td>
+        <td><code>num_tokens_after_padding</code> &mdash; rounds 20 up to the next captured size (e.g. 24)</td>
+        <td><strong>24</strong></td>
+      </tr>
+      <tr>
+        <td>Slot mapping</td>
+        <td>20 real slot ids + 4 &times; <code>PAD_SLOT_ID</code></td>
+        <td><strong>kernel writes 20, skips 4</strong></td>
+      </tr>
+      <tr>
+        <td>Block hasher</td>
+        <td><code>request.num_tokens // hash_block_size = 20 // 32</code></td>
+        <td><strong>0 full hash blocks</strong></td>
+      </tr>
+      <tr>
+        <td>Prefix cache reuse</td>
+        <td>no hashes registered yet</td>
+        <td><strong>none until 32+ tokens</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Concretely:
+  </p>
+
+  <ul>
+    <li>
+      The forward pass runs the captured graph closest above 20 &mdash; for
+      the default capture menu, size 24. Positions 0&ndash;19 write real
+      <code>(K, V)</code> into allocated cache slots; positions 20&ndash;23
+      route to <code>PAD_SLOT_ID = -1</code> and are skipped by attention.
+    </li>
+    <li>
+      The scheduler computes <code>20 // 32 = 0</code> full hash blocks, so
+      <code>request.block_hashes</code> stays empty and nothing is
+      registered in the prefix cache.
+    </li>
+    <li>
+      The 20 tokens of KV are physically present in the GPU cache &mdash;
+      they participate in this request&rsquo;s own future attention &mdash;
+      but no other request can match them, because no hash key exists.
+    </li>
+    <li>
+      If decode continues and crosses position 32, the first full hash
+      block (positions 0&ndash;31) gets hashed on that step. The block then
+      becomes reusable for future requests sharing the same 32-token prefix.
+    </li>
+    <li>
+      If the request finishes at 20 tokens, the block is freed back to the
+      pool and the KV is discarded. The CUDA Graph layer is entirely
+      unaffected by this.
+    </li>
+  </ul>
+
+  <div class="callout good">
+    <strong>The general rule</strong>
+    The CUDA Graph dispatcher rounds up by <em>token count</em>, never by
+    hash block. The hasher rounds down by <em>hash block</em>, never by
+    captured graph size. <code>num_tokens &lt; hash_block_size</code> is a
+    perfectly valid runtime state: nothing breaks, you just don&rsquo;t get
+    a prefix-cache entry until the request grows past the threshold.
+  </div>
+
+  <h2 id="takeaways">Takeaways</h2>
+
+  <ul>
+    <li>
+      <strong>CUDA Graph is a GPU-shape optimization</strong>, not a
+      cache-management one. It pads runtime batches to one of a discrete
+      set of captured token counts.
+    </li>
+    <li>
+      <strong>PIECEWISE breaks the graph at attention</strong> so that
+      attention metadata stays dynamic; <strong>FULL</strong> captures
+      everything in one graph but requires stable metadata, which is why
+      it&rsquo;s reserved for uniform-decode batches. The default
+      <code>FULL_AND_PIECEWISE</code> uses FULL for uniform decode and
+      PIECEWISE for mixed batches.
+    </li>
+    <li>
+      <strong>Captured non-attention partitions see only
+      <code>num_tokens</code></strong>; <strong>attention sees both
+      <code>num_tokens</code> and the request-dim metadata
+      (<code>block_tables</code> / <code>seq_lens</code> /
+      <code>query_start_loc</code>).</strong> Attention is the one op
+      that joins tokens to requests &mdash; that&rsquo;s why it&rsquo;s
+      graph-unsafe and why PIECEWISE can drop request-dim padding.
+    </li>
+    <li>
+      <strong>Padding is safe for the KV cache</strong> because padded
+      positions are routed to <code>PAD_SLOT_ID = &minus;1</code> and
+      attention kernels skip that sentinel.
+    </li>
+    <li>
+      <strong><code>hash_block_size</code> is a scheduler-side concept</strong>
+      for prefix-cache hashing. It is not derived from, nor constrained
+      by, CUDA Graph capture sizes.
+    </li>
+    <li>
+      <strong><code>num_kv_cache_groups</code> reflects the model&rsquo;s
+      attention-type pattern</strong>: 1 for dense full-attention models,
+      &gt;1 for hybrids (full + SWA, full + Mamba, full + chunked local).
+      It is the leading axis of <code>slot_mappings</code> and the list
+      length of <code>block_tables</code>; it is also what motivates the
+      GCD rule for <code>hash_block_size</code> in hybrid models.
+    </li>
+    <li>
+      <strong>Partial blocks below <code>hash_block_size</code> are
+      &ldquo;materialized but invisible&rdquo;</strong>: their KV occupies
+      real slots in the GPU tensor but they have no hash entry, cannot be
+      reused by other requests, and are discarded if the request ends
+      before the block fills.
+    </li>
+    <li>
+      <strong>Don&rsquo;t conflate this with kernel block alignment.</strong>
+      The CUTLASS MLA constraint
+      (<a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT</a>)
+      does couple physical block size to a kernel tile, but it is a
+      separate mechanism with separate consequences.
+    </li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <p class="subtitle">
+    Files referenced:
+    <span class="fileref">vllm/v1/cudagraph_dispatcher.py</span>,
+    <span class="fileref">vllm/v1/worker/gpu/model_runner.py</span>,
+    <span class="fileref">vllm/v1/worker/gpu/block_table.py</span>,
+    <span class="fileref">vllm/v1/attention/backends/utils.py</span>,
+    <span class="fileref">vllm/v1/core/kv_cache_utils.py</span>,
+    <span class="fileref">vllm/v1/core/single_type_kv_cache_manager.py</span>,
+    <span class="fileref">vllm/v1/kv_cache_interface.py</span>,
+    <span class="fileref">vllm/config/cache.py</span>,
+    <span class="fileref">vllm/config/compilation.py</span>.
+  </p>
+
+</main>
+</body>
+</html>

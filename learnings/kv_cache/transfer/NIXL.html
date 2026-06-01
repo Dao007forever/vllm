@@ -1,0 +1,1992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NIXL KV Connector &mdash; vLLM Learning Notes</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">KV Cache</a> &middot;
+    <a href="index.html">Transfer</a> &middot;
+    <span>NIXL</span>
+  </div>
+
+  <h1>NIXL &mdash; D Pulls KV From P</h1>
+  <p class="subtitle">
+    The decode worker initiates a NIXL <code>READ</code> directly against
+    the prefill worker's registered KV memory. ZMQ-based side-channel
+    handshake, lazy per-engine agent registration, lease-with-heartbeat
+    so P knows when to free.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      NIXL is the pull-model transport. D's worker registers all local KV
+      memory with NIXL <em>eagerly</em> at startup, then on each new
+      remote engine it (1) ZMQ-handshakes to fetch P's agent metadata,
+      (2) registers P as a remote NIXL agent, and (3) issues a single
+      async <code>READ</code> xfer that copies P's KV blocks directly
+      into D's blocks. P doesn't push &mdash; P just keeps the blocks
+      alive on a 30-second lease that D's heartbeat refreshes. When D's
+      transfer completes, NIXL delivers a notification to P which lets
+      P free the lease early.
+    </p>
+  </section>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why-pull">1. Why pull, not push</a></li>
+      <li><a href="#wire">2. The wire-level flow</a></li>
+      <li><a href="#handshake">3. The ZMQ side-channel handshake</a></li>
+      <li><a href="#registration">4. Memory registration: eager local, lazy remote</a></li>
+      <li><a href="#blockids">5. Where the block IDs come from</a></li>
+      <li><a href="#xfer">6. The <code>READ</code> transfer</a></li>
+      <li><a href="#completion">7. Completion: polling + NIXL notifs</a></li>
+      <li><a href="#lease">8. The lease + heartbeat lifetime contract</a></li>
+      <li><a href="#failures">9. Failure modes</a></li>
+      <li><a href="#cheat">10. Cheat sheet</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why-pull">1. Why pull, not push</h2>
+
+  <p>
+    NIXL was designed to look like RDMA <code>READ</code>: the initiator
+    knows both ends of the copy and just performs it. That's a tidy fit
+    for P/D disaggregation because D is the one being unblocked &mdash;
+    D wants the KV, D knows where to put it, so D is the natural caller.
+  </p>
+
+  <p>
+    Concretely, the only entrypoint into the wire transfer is in
+    <span class="fileref">vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:2220</span>:
+  </p>
+
+<pre><code>handle = self.nixl_wrapper.make_prepped_xfer(
+    "READ",
+    local_xfer_side_handle,        # D's destination descriptors
+    local_block_descs_ids,
+    remote_xfer_side_handle,       # P's source descriptors
+    remote_block_descs_ids,
+    notif_msg=notif_id,            # piggy-back notif to P on completion
+)
+self.nixl_wrapper.transfer(handle)
+</code></pre>
+
+  <p>
+    The <code>"READ"</code> string is the entire commitment: P never calls
+    transfer. P just holds memory and answers ZMQ handshakes.
+  </p>
+
+  <h2 id="wire">2. The wire-level flow</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">NIXL end-to-end &mdash; sequence</div>
+    <svg class="diagram-svg" viewBox="0 0 840 472" role="img"
+         aria-label="NIXL sequence diagram across D scheduler, D worker, P worker, and P scheduler">
+      <defs>
+        <marker id="ah-muted" markerWidth="9" markerHeight="9" refX="7.5" refY="3"
+                 orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L8,3 L0,6 Z" fill="var(--muted)"/>
+        </marker>
+        <marker id="ah-violet" markerWidth="9" markerHeight="9" refX="7.5" refY="3"
+                 orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L8,3 L0,6 Z" fill="var(--violet)"/>
+        </marker>
+        <marker id="ah-blue" markerWidth="11" markerHeight="11" refX="8.5" refY="3.5"
+                 orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L9,3.5 L0,7 Z" fill="var(--blue)"/>
+        </marker>
+        <marker id="ah-green" markerWidth="9" markerHeight="9" refX="7.5" refY="3"
+                 orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L8,3 L0,6 Z" fill="var(--green)"/>
+        </marker>
+      </defs>
+
+      <!-- phase bands -->
+      <rect x="22" y="56" width="796" height="58" rx="6"
+            fill="var(--code)" opacity="0.55"/>
+      <rect x="22" y="120" width="796" height="338" rx="6"
+            fill="var(--blue-soft)" opacity="0.45"/>
+      <text x="32" y="72" font-size="9.5" fill="var(--muted)"
+            font-family="SF Mono, Monaco, monospace" letter-spacing="0.5">SETUP · AT STARTUP</text>
+      <text x="32" y="136" font-size="9.5" fill="var(--muted)"
+            font-family="SF Mono, Monaco, monospace" letter-spacing="0.5">PER REQUEST</text>
+
+      <!-- lifelines -->
+      <g stroke="var(--border)" stroke-width="1.5" stroke-dasharray="3 4">
+        <line x1="100" y1="48" x2="100" y2="452"/>
+        <line x1="300" y1="48" x2="300" y2="452"/>
+        <line x1="540" y1="48" x2="540" y2="452"/>
+        <line x1="740" y1="48" x2="740" y2="452"/>
+      </g>
+
+      <!-- actor headers -->
+      <g font-family="-apple-system, BlinkMacSystemFont, sans-serif"
+         font-size="12" font-weight="650" text-anchor="middle">
+        <g>
+          <rect x="40"  y="14" width="120" height="30" rx="6" fill="var(--panel)" stroke="var(--border)"/>
+          <text x="100" y="33" fill="var(--fg)">D scheduler</text>
+        </g>
+        <g>
+          <rect x="240" y="14" width="120" height="30" rx="6" fill="var(--panel)" stroke="var(--blue)" stroke-width="1.5"/>
+          <text x="300" y="33" fill="var(--blue)">D worker</text>
+        </g>
+        <g>
+          <rect x="480" y="14" width="120" height="30" rx="6" fill="var(--panel)" stroke="var(--blue)" stroke-width="1.5"/>
+          <text x="540" y="33" fill="var(--blue)">P worker</text>
+        </g>
+        <g>
+          <rect x="680" y="14" width="120" height="30" rx="6" fill="var(--panel)" stroke="var(--border)"/>
+          <text x="740" y="33" fill="var(--fg)">P scheduler</text>
+        </g>
+      </g>
+
+      <!-- setup self-notes -->
+      <g font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="9.5"
+         text-anchor="middle">
+        <g>
+          <rect x="242" y="72" width="116" height="34" rx="5" fill="var(--blue-soft)" stroke="#a6c8df"/>
+          <text x="300" y="86" fill="var(--blue)">register local KV</text>
+          <text x="300" y="99" fill="var(--muted)">with NIXL (eager)</text>
+        </g>
+        <g>
+          <rect x="482" y="72" width="116" height="34" rx="5" fill="var(--blue-soft)" stroke="#a6c8df"/>
+          <text x="540" y="86" fill="var(--blue)">register local KV</text>
+          <text x="540" y="99" fill="var(--muted)">with NIXL (eager)</text>
+        </g>
+        <g>
+          <rect x="682" y="72" width="116" height="34" rx="5" fill="var(--violet-soft)" stroke="#c9b8dc"/>
+          <text x="740" y="86" fill="var(--violet)">bind ZMQ ROUTER</text>
+          <text x="740" y="99" fill="var(--muted)">side-channel port</text>
+        </g>
+      </g>
+
+      <!-- request-phase messages -->
+      <g font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10.5">
+        <!-- (1) request arrives at D worker -->
+        <line x1="100" y1="170" x2="294" y2="170" stroke="var(--muted)" stroke-width="1.5"
+              marker-end="url(#ah-muted)"/>
+        <text x="197" y="164" text-anchor="middle" fill="var(--fg)">① request + kv_transfer_params</text>
+
+        <!-- (2) ZMQ REQ to P scheduler (control plane) -->
+        <line x1="300" y1="214" x2="734" y2="214" stroke="var(--violet)" stroke-width="1.5"
+              stroke-dasharray="5 4" marker-end="url(#ah-violet)"/>
+        <text x="520" y="208" text-anchor="middle" fill="var(--violet)">② ZMQ REQ · GET_META_MSG &nbsp;(first contact)</text>
+
+        <!-- (3) metadata reply (control plane) -->
+        <line x1="740" y1="250" x2="306" y2="250" stroke="var(--violet)" stroke-width="1.5"
+              stroke-dasharray="5 4" marker-end="url(#ah-violet)"/>
+        <text x="520" y="244" text-anchor="middle" fill="var(--violet)">③ NixlAgentMetadata (base addrs, layout, compat-hash)</text>
+
+        <!-- (3b) D worker self: add remote agent -->
+        <g text-anchor="middle">
+          <rect x="218" y="266" width="164" height="30" rx="5" fill="var(--panel)" stroke="var(--blue)"/>
+          <text x="300" y="285" font-size="9.5" fill="var(--blue)">add_remote_agent → prep dlist (cached/engine)</text>
+        </g>
+
+        <!-- (4) RDMA READ: data flows P -> D -->
+        <line x1="540" y1="342" x2="306" y2="342" stroke="var(--blue)" stroke-width="2.5"
+              marker-end="url(#ah-blue)"/>
+        <text x="423" y="336" text-anchor="middle" fill="var(--blue)" font-weight="650">④ NIXL READ via RDMA · P's KV → D's blocks</text>
+
+        <!-- (5) completion notif: D -> P -->
+        <line x1="300" y1="384" x2="534" y2="384" stroke="var(--green)" stroke-width="1.5"
+              marker-end="url(#ah-green)"/>
+        <text x="423" y="378" text-anchor="middle" fill="var(--green)">⑤ notif "{req_id}:{D_world_size}"</text>
+
+        <!-- (6) end-state self-notes -->
+        <g text-anchor="middle" font-size="9.5">
+          <rect x="222" y="406" width="156" height="30" rx="5" fill="var(--green-soft)" stroke="#abd1bb"/>
+          <text x="300" y="425" fill="var(--green)">⑥ xfer DONE → done_recving</text>
+          <rect x="462" y="406" width="156" height="30" rx="5" fill="var(--amber-soft)" stroke="#e3c88a"/>
+          <text x="540" y="425" fill="var(--amber)">⑥ count notifs → free lease</text>
+        </g>
+      </g>
+    </svg>
+
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--muted)"></span>intra-engine call</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--violet)"></span>control plane (ZMQ side channel)</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue)"></span>data plane (NIXL RDMA)</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green)"></span>completion notif</span>
+    </div>
+    <div class="diagram-caption">
+      Setup is symmetric and eager (both workers pin all KV with NIXL; P also
+      binds its ZMQ listener). Per request, D drives everything: a one-time
+      control-plane handshake (②③) bootstraps the remote agent, then a single
+      data-plane <code>READ</code> (④) pulls the blocks. P never initiates &mdash;
+      it only answers ② and reacts to ⑤.
+    </div>
+  </div>
+
+  <ol class="steps">
+    <li>
+      <strong>Request lands on D.</strong> D's scheduler hands the worker a
+      request carrying <code>kv_transfer_params</code> &mdash;
+      <code>remote_engine_id</code>, <code>remote_host</code>/<code>port</code>,
+      <code>remote_request_id</code>, and <code>remote_block_ids</code>. This is
+      the entry to <code>start_load_kv</code>
+      (<span class="fileref">nixl/worker.py:1956-1968</span>).
+    </li>
+    <li>
+      <strong>Handshake REQ (first contact only).</strong> If the engine_id is
+      new, D opens a ZMQ REQ socket to P's listener and sends
+      <code>(GET_META_MSG, tp_rank)</code> for each P rank it needs. Already-seen
+      engines skip straight to step&nbsp;4
+      (<span class="fileref">nixl/worker.py:720-742</span>).
+    </li>
+    <li>
+      <strong>Metadata reply.</strong> P's ROUTER answers with the encoded
+      <code>NixlAgentMetadata</code> for that rank &mdash; base addresses, block
+      lengths, KV layout, and the compatibility hash D validates before trusting
+      the layout (<span class="fileref">nixl/scheduler.py:303-321</span>). D then
+      calls <code>add_remote_agent</code> + <code>prep_xfer_dlist</code> and
+      caches the result per <code>(engine_id, rank)</code>
+      (<span class="fileref">nixl/worker.py:1309-1312</span>).
+    </li>
+    <li>
+      <strong>The READ.</strong> <code>_read_blocks_for_req</code> issues one
+      async <code>make_prepped_xfer("READ", …)</code> per source rank. Data
+      moves P&rarr;D over RDMA in a single all-at-once transfer; the call returns
+      immediately (<span class="fileref">nixl/worker.py:2021-2095, 2220</span>).
+    </li>
+    <li>
+      <strong>Completion notif.</strong> The READ piggy-backs
+      <code>notif_msg="{req_id}:{D_world_size}"</code>, which NIXL delivers to P
+      once the transfer lands (<span class="fileref">nixl/worker.py:1792-1845</span>).
+    </li>
+    <li>
+      <strong>Both sides settle.</strong> D polls
+      <code>check_xfer_state</code>; once every handle is <code>DONE</code> the
+      request enters <code>done_recving</code>
+      (<span class="fileref">nixl/worker.py:1868-1913</span>). P counts notifs and,
+      once <code>consumers_per_producer</code> is reached, drops the request from
+      <code>_reqs_to_send</code> and releases the lease.
+    </li>
+  </ol>
+
+  <h2 id="handshake">3. The ZMQ side-channel handshake</h2>
+
+  <p>
+    The handshake exists out-of-band on a ZMQ socket per P engine. Its
+    job: <em>tell D enough about P that NIXL can READ from P</em>.
+  </p>
+
+  <h3>3.1 The listener (P side)</h3>
+
+  <p>
+    Each P engine starts a daemon thread that binds a ZMQ ROUTER on
+    <code>tcp://VLLM_NIXL_SIDE_CHANNEL_HOST:VLLM_NIXL_SIDE_CHANNEL_PORT</code>
+    (<span class="fileref">nixl/scheduler.py:271-286</span>):
+  </p>
+
+<pre><code>self._nixl_handshake_listener_t = threading.Thread(
+    target=self._nixl_handshake_listener,
+    args=(encoded_data, ready_event, self._stop_event,
+          self.side_channel_host, self.side_channel_port),
+    daemon=True,
+)
+self._nixl_handshake_listener_t.start()
+</code></pre>
+
+  <p>
+    The listener answers <code>(GET_META_MSG, target_tp_rank)</code>
+    requests with the encoded <code>NixlHandshakePayload</code>
+    corresponding to that rank
+    (<span class="fileref">nixl/scheduler.py:303-321</span>). One rank per
+    handshake response &mdash; D asks repeatedly for each P rank it
+    needs.
+  </p>
+
+  <h3>3.2 The initiator (D side)</h3>
+
+  <p>
+    D doesn't handshake at startup; it handshakes <em>per remote engine,
+    on first contact</em>. When <code>start_load_kv</code> sees a request
+    referring to an engine_id it hasn't seen before
+    (<span class="fileref">nixl/worker.py:1956-1968</span>):
+  </p>
+
+<pre><code>if remote_engine_id not in self._remote_agents:
+    with self._handshake_lock:
+        if remote_engine_id not in self._remote_agents:
+            self._background_nixl_handshake(req_id, remote_engine_id, meta)
+            continue
+self._read_blocks_for_req(req_id, meta)
+</code></pre>
+
+  <p>
+    The background handshake is just a job on a
+    <code>ThreadPoolExecutor</code>
+    (<span class="fileref">nixl/worker.py:720-742</span>). It opens a
+    ZMQ REQ socket to P's listener, queries every P rank it needs based
+    on the TP mapping, validates the
+    <code>compatibility_hash</code>, and adds each P rank as a NIXL remote
+    agent. Once done, queued requests are released to
+    <code>_read_blocks_for_req</code>.
+  </p>
+
+  <h3>3.3 What's exchanged</h3>
+
+  <p>
+    The <code>NixlAgentMetadata</code> dataclass
+    (<span class="fileref">nixl/metadata.py:42-54</span>) is the
+    contract:
+  </p>
+
+<pre><code>@dataclass
+class NixlAgentMetadata:
+    engine_id: str
+    agent_metadata: bytes               # opaque NIXL agent state
+    kv_caches_base_addr: list[int]      # P's GPU memory base pointers
+    device_id: int
+    num_blocks: int
+    block_lens: list[int]
+    kv_cache_layout: str                # "HND" or "NHD"
+    block_size: int
+    ssm_sizes: tuple[int, int]
+    attn_backend_name: str
+    physical_blocks_per_logical_kv_block: int
+</code></pre>
+
+  <p>
+    Two things to notice: (a) the metadata carries enough to validate
+    layout compatibility &mdash; backend name, block layout, KV layout
+    &mdash; so D fails fast on mismatch instead of silently corrupting;
+    (b) the actual <code>agent_metadata: bytes</code> blob is opaque to
+    vLLM and just passed verbatim to
+    <code>nixl_wrapper.add_remote_agent()</code>.
+  </p>
+
+  <h4>Example: Llama 3.1 8B, FlashAttention, TP = 1</h4>
+
+  <p>
+    A prefill worker serving Llama-3.1-8B (32 layers, 8 KV heads &times; 128
+    head-dim, bf16, <code>block_size = 16</code>) answers a
+    <code>GET_META_MSG</code> with roughly:
+  </p>
+
+<pre><code>NixlAgentMetadata(
+    engine_id   = <span class="s">"prefill-3f9c…"</span>,        <span class="c"># this P engine's id</span>
+    agent_metadata = <span class="s">b"\x00\x12…"</span>,        <span class="c"># opaque UCX agent state (~few KB)</span>
+    kv_caches_base_addr = [<span class="n">0x7f841a…</span>, …],  <span class="c"># 64 ptrs = 32 layers × (K, V)</span>
+    device_id   = <span class="n">0</span>,
+    num_blocks  = <span class="n">28000</span>,                  <span class="c"># whatever fits free HBM (illustrative)</span>
+    block_lens  = [<span class="n">32768</span>, <span class="n">32768</span>, …],     <span class="c"># 64 × 32 KiB = 16 tok × 1024 × 2 B</span>
+    kv_cache_layout = <span class="s">"HND"</span>,             <span class="c"># NIXL PD forces HND (faster head-split)</span>
+    block_size  = <span class="n">16</span>,
+    ssm_sizes   = (<span class="n">0</span>, <span class="n">0</span>),                 <span class="c"># no Mamba</span>
+    attn_backend_name = <span class="s">"FLASH_ATTN"</span>,
+    physical_blocks_per_logical_kv_block = <span class="n">1</span>,  <span class="c"># kernel block == logical</span>
+)</code></pre>
+
+  <p>Where each derived number comes from:</p>
+  <ul>
+    <li><strong>64 base addrs &amp; block_lens</strong> = 32 layers &times; 2,
+      because FlashAttention keeps K and V in <em>separate</em> regions
+      (<a href="#registration">4.2</a>). Every entry is equal &mdash; block
+      lengths vary across layers only for MLA.</li>
+    <li><strong>32768</strong> = <code>16 (tokens) &times; (8 KV heads &times;
+      128) &times; 2 (bf16 bytes)</code>. At TP = 2 each rank would instead
+      publish 16 KiB regions (4 KV heads/rank) and a <em>different</em>
+      <code>kv_caches_base_addr</code> &mdash; metadata is per worker
+      (<a href="#registration">4.3</a>).</li>
+    <li><strong><code>ssm_sizes = (0, 0)</code></strong> and
+      <strong><code>physical_blocks_per_logical = 1</code></strong>: pure
+      attention with kernel block == logical block, so the SSM descriptor
+      section is empty and FA strides over <code>num_blocks</code>
+      (<a href="#registration">4.3</a>, <a href="#registration">4.5</a>).</li>
+    <li><strong><code>kv_cache_layout = "HND"</code></strong>: NIXL overrides the
+      layout to <code>HND</code> for P/D so heads are the outer axis and a TP
+      rank's head-slice is contiguous.</li>
+  </ul>
+
+  <p>
+    D checks this against its own config: same <code>attn_backend_name</code>,
+    <code>kv_cache_layout</code>, and <code>block_size</code>, and each
+    <code>block_lens[i]</code> scaled by <code>tp_ratio</code> (the gate in
+    <a href="#registration">4.7</a>'s handshake). A mismatch &mdash; say D runs
+    FlashInfer, or a different block size &mdash; is a
+    <code>RuntimeError</code>, not silent corruption (<a href="#failures">9</a>).
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Why a side channel?</strong>
+    <p>
+      NIXL itself has a notification primitive
+      (<code>send_notif</code> / <code>get_new_notifs</code>), but you
+      can't send a notif to an agent you haven't registered &mdash; and
+      to register an agent you need its metadata. So bootstrap has to
+      ride on something else. ZMQ is the cheapest "control plane that's
+      already there" option.
+    </p>
+  </div>
+
+  <h2 id="registration">4. Memory registration: eager local, lazy remote</h2>
+
+  <p>
+    Two separate registrations, and they happen at very different times.
+  </p>
+
+  <h3>4.1 Local (eager, at worker startup)</h3>
+
+  <p>
+    Every worker, on both P and D, registers <em>all</em> its KV cache
+    memory with NIXL once at startup
+    (<span class="fileref">nixl/worker.py:960-964</span>):
+  </p>
+
+<pre><code>descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
+self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+self._registered_descs.append(descs)
+</code></pre>
+
+  <p>
+    This is what makes NIXL fast: by transfer time, the GPU memory is
+    already pinned and known to the NIXL backends. Registration is a
+    one-time cost; per-request transfer is just descriptor lookup +
+    DMA. The same memory is used for sending (when this rank is P) and
+    receiving (when this rank is D) &mdash; the registration is
+    symmetric.
+  </p>
+
+  <h3>4.2 What's a "region"? K/V split, per layer, per model</h3>
+
+  <p>
+    That one <code>register_memory</code> call hides structure. The
+    <code>caches_data</code> list it registers is a sequence of
+    <strong>regions</strong> &mdash; each region is one
+    <code>(base_addr, size, device_id)</code> tuple, i.e. one contiguous KV
+    tensor. The loop in
+    <code>register_kv_caches</code>
+    (<span class="fileref">nixl/worker.py:847-936</span>) walks the layers and
+    appends a region per distinct base address; the count lands in
+    <code>num_regions = len(caches_data)</code> and the per-region stride in
+    <code>block_len_per_layer</code>
+    (<span class="fileref">nixl/worker.py:943-944</span>).
+  </p>
+
+  <p>
+    How many regions a layer contributes is decided by the
+    <em>attention architecture</em>, not the model brand. The code comment is
+    explicit (<span class="fileref">nixl/worker.py:834-841</span>):
+  </p>
+
+<pre><code><span class="c"># K and V are now in different regions. Advantage is that we can</span>
+<span class="c"># elegantly support MLA and any cases where the K and V tensors</span>
+<span class="c"># are non-contiguous ... Disadvantage is that the encoded</span>
+<span class="c"># NixlAgentMetadata is now larger (roughly 8KB vs 5KB).</span></code></pre>
+
+  <ul>
+    <li>
+      <strong>Standard attention (MHA / GQA, FlashAttention)</strong> &rarr;
+      <em>kv-first</em> layout <code>[2, num_blocks, H, N, D]</code> (the
+      <code>2</code> is the outer axis), so K and V are two distinct tensors
+      &rArr; <strong>2 base-address regions per layer</strong>.
+    </li>
+    <li>
+      <strong>MLA</strong> &rarr; a single compressed latent cache per layer
+      &rArr; <strong>1 region per layer</strong> (no K/V to split).
+    </li>
+    <li>
+      <strong>FlashInfer</strong> &rarr; <em>blocks-first</em> layout
+      <code>[num_blocks, 2, H, N, D]</code>, so K and V are <em>interleaved
+      inside one</em> tensor &rArr; <strong>1 base-address region</strong>, then
+      <code>num_regions *= 2</code> to index K/V virtually
+      (<span class="fileref">nixl/worker.py:946-955</span>). The chooser is
+      <code>split_k_and_v</code>
+      (<span class="fileref">kv_connector/utils.py:496-501</span>); the joint
+      case is detailed at the end of this section.
+    </li>
+  </ul>
+
+  <div class="diagram">
+    <div class="diagram-title">One layer's KV regions, three architectures</div>
+    <div class="cell-row">
+      <span class="cell label">Llama 3.1 8B<br>GQA</span>
+      <span class="cell used" style="min-width:96px">K region<span class="lo">8&times;128 = 1024/tok</span></span>
+      <span class="cell used" style="min-width:96px">V region<span class="lo">8&times;128 = 1024/tok</span></span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">DeepSeek-V3<br>MLA</span>
+      <span class="cell cached" style="min-width:198px">latent KV region<span class="lo">512 + 64 = 576/tok &middot; 128 heads</span></span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">Kimi K2<br>MLA</span>
+      <span class="cell cached" style="min-width:198px">latent KV region<span class="lo">512 + 64 = 576/tok &middot; 64 heads</span></span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>separate K / V regions (2 per layer)</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>single latent region (1 per layer)</span>
+    </div>
+    <div class="diagram-caption">
+      Llama splits into two regions; both MLA models collapse to one. Note
+      Kimi K2 halved the attention head count (64 vs DeepSeek's 128) yet its KV
+      region is <em>identical</em> &mdash; the MLA latent is
+      <code>kv_lora_rank + qk_rope_head_dim</code>, shared across heads, so the
+      cache size doesn't track head count at all.
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th><th>Attention</th><th>KV / token / layer</th>
+        <th>Regions / layer</th><th>Layers</th><th>Total regions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Llama 3.1 8B</td>
+        <td>GQA, 8 KV heads &times; 128</td>
+        <td>K: 1024 &nbsp;+&nbsp; V: 1024 (separate)</td>
+        <td><strong>2</strong> (K, V)</td>
+        <td>32</td>
+        <td>64</td>
+      </tr>
+      <tr>
+        <td>DeepSeek-V3</td>
+        <td>MLA, 128 heads</td>
+        <td>576 (single latent)</td>
+        <td><strong>1</strong></td>
+        <td>61</td>
+        <td>61</td>
+      </tr>
+      <tr>
+        <td>Kimi K2</td>
+        <td>MLA, 64 heads</td>
+        <td>576 (single latent)</td>
+        <td><strong>1</strong></td>
+        <td>61</td>
+        <td>61</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    At <code>block_size = 16</code> tokens in bf16, each Llama region is a
+    <code>16 &times; 1024 &times; 2 = 32&nbsp;KiB</code> block stride (one
+    entry in <code>block_len_per_layer</code> for K, one for V), while each MLA
+    region is <code>16 &times; 576 &times; 2 = 18&nbsp;KiB</code>. Two
+    consequences flow from the region count:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Metadata + descriptor size.</strong> The exchanged
+      <code>NixlAgentMetadata.kv_caches_base_addr</code> /
+      <code>block_lens</code> lists carry one entry per region, and the total
+      descriptor space is <code>num_regions &times; num_blocks</code>. Llama's
+      K/V split doubles both versus an MLA model of the same depth &mdash; the
+      "~8KB vs ~5KB" the comment warns about.
+    </li>
+    <li>
+      <strong>It's still one handle.</strong> No matter how many regions, there
+      is one <code>register_memory</code> and one prepped xfer handle per remote
+      rank. A single <code>READ</code> addresses every layer&rsquo;s K and V via
+      descriptor ids (<code>region_id &times; num_blocks + block_id</code>,
+      <span class="fileref">nixl/worker.py:113-115</span>) &mdash; which is
+      exactly why the transfer in
+      <a href="#xfer">section&nbsp;6</a> is all-at-once with no per-layer
+      batching.
+    </li>
+  </ul>
+
+  <h4>Joint-KV (FlashInfer): how K and V share one region</h4>
+
+  <p>
+    The blocks-first case is the interesting one: only <em>one</em> base address
+    per layer, yet K and V still need independent addressing. They're separated
+    by <strong>byte offset inside each block's page</strong> &mdash; K is the
+    first half, V the second &mdash; and exposed as two <em>virtual</em> regions
+    so the rest of the connector's math is untouched.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One block's page (joint KV) &rarr; two virtual regions</div>
+    <div class="cell-row">
+      <span class="cell label">block<br>page</span>
+      <span class="cell used" style="min-width:160px">K half<span class="lo">offset 0 &middot; block_len / 2</span></span>
+      <span class="cell used" style="min-width:160px">V half<span class="lo">offset block_len/2 &middot; block_len / 2</span></span>
+    </div>
+    <div class="diagram-caption">
+      <code>get_backend_aware_kv_block_len</code> returns
+      <code>block_len // 2</code> per stream
+      (<span class="fileref">nixl/worker.py:2419-2423</span>);
+      <code>_build_fa_local</code> emits the K descriptor at <code>addr</code>
+      and the V descriptor at <code>addr + block_len/2</code>
+      (<span class="fileref">nixl/worker.py:1116-1132</span>).
+    </div>
+  </div>
+
+  <p>
+    Descriptors are emitted K-then-V per layer, so with
+    <code>num_regions</code> doubled the
+    <code>region_id &times; num_blocks + block</code> formula resolves cleanly:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Virtual region</th><th>Meaning</th><th>Descriptor-id band</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>2i</code></td>
+        <td>layer <em>i</em> &mdash; K (first half)</td>
+        <td><code>[2i &middot; num_blocks, (2i+1) &middot; num_blocks)</code></td>
+      </tr>
+      <tr>
+        <td><code>2i + 1</code></td>
+        <td>layer <em>i</em> &mdash; V (second half)</td>
+        <td><code>[(2i+1) &middot; num_blocks, (2i+2) &middot; num_blocks)</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    So "which half of the page" reduces to "which virtual-region band the
+    descriptor id lands in" &mdash; the same arithmetic separate-region
+    backends use, which is the whole point: a blocks-first FlashInfer layout
+    looks identical to FA's two regions everywhere downstream. It also composes
+    with HND (<a href="#registration">4.6</a>): within each half a TP rank's
+    heads are contiguous, so a head-split read takes the K half at
+    <code>rank_offset &times; per_head_len</code> and the V half at
+    <code>block_len/2 + rank_offset &times; per_head_len</code> &mdash; two clean
+    descriptors a single whole-page copy could never carve.
+  </p>
+
+  <div class="callout">
+    <strong>Not for cross-layer blocks.</strong>
+    <p>
+      The half-split is disabled when cross-layer blocks are used, because those
+      interleave <em>per layer</em>
+      (<code>L0_K, L0_V, L1_K, L1_V, …</code>), so a single
+      <code>block_len/2</code> cut wouldn't separate K from V
+      (<span class="fileref">kv_connector/utils.py:488-494</span>).
+    </p>
+  </div>
+
+  <h4>Column-packed (HMA) hybrid models</h4>
+
+  <p>
+    Hybrid models that interleave attention types &mdash; Gemma-3's
+    1&nbsp;full&nbsp;:&nbsp;5&nbsp;sliding-window pattern, say &mdash; share
+    tensors a third way. With <em>G</em> groups of <code>group_size</code>
+    layers each, the allocator lays them out <strong>column-packed</strong>:
+    it allocates <code>group_size</code> "column" tensors, and each column is
+    shared by <strong>one layer from every group</strong> (the layers at the
+    same slot within their group). The sharing axis is <em>across</em> groups,
+    kept collision-free by equal group sizes and a global block-ID pool (any
+    block id is owned by at most one group at a time).
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Column-packed: 2 groups &times; 2 slots &rarr; 2 column tensors</div>
+    <div class="cell-row">
+      <span class="cell label">Group 0 &middot; FULL</span>
+      <span class="cell used" style="min-width:90px">L0</span>
+      <span class="cell used" style="min-width:90px">L2</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">Group 1 &middot; SWA</span>
+      <span class="cell cached" style="min-width:90px">L1</span>
+      <span class="cell cached" style="min-width:90px">L3</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">&rarr; NIXL region</span>
+      <span class="cell head" style="min-width:90px">Tensor 0<span class="lo">L0, L1</span></span>
+      <span class="cell head" style="min-width:90px">Tensor 1<span class="lo">L2, L3</span></span>
+    </div>
+    <div class="diagram-caption">
+      Each column is one physical allocation shared by one layer per group.
+      NIXL registers each column <em>once</em> &mdash; 2 regions for 4 layers
+      &mdash; and reads it with both groups' (disjoint) block ids flattened
+      together.
+    </div>
+  </div>
+
+  <p>
+    NIXL calls this <strong>HMA</strong> (hybrid memory allocator):
+    <code>_is_hma_required</code> trips when the hybrid manager is on and some
+    group isn't full-attention
+    (<span class="fileref">nixl/worker.py:225-231</span>), and
+    <code>hma_group_size = len(kv_cache_tensors)</code> is the column count
+    (<span class="fileref">nixl/worker.py:238</span>). Two things follow:
+  </p>
+
+  <ul>
+    <li>
+      <strong>One region per column, not per layer.</strong> The registration
+      loop walks every layer, but layers aliasing an already-seen column tensor
+      share a <code>data_ptr()</code> and are skipped
+      (<span class="fileref">nixl/worker.py:888-896</span>): <em>"HMA employs
+      memory pooling to share tensors across groups … skipping all tensors but
+      the ones pointed to by group0 … fewer regions."</em> So the region count
+      collapses to <code>group_size</code> &mdash; a Gemma-3 with
+      <code>group_size = 10</code> registers ~10 column regions, not 60 layer
+      regions.
+    </li>
+    <li>
+      <strong>Per-group block ids are flattened at transfer.</strong> A
+      request's blocks arrive <em>per group</em> (e.g.
+      <code>[[10,11], [20,21]]</code>). Because the global pool hands out
+      disjoint ids, inside one column group&nbsp;0's layer sits at slots
+      10&ndash;11 and group&nbsp;1's at 20&ndash;21 &mdash; no overlap &mdash; so
+      <code>_compute_desc_ids</code> flattens across groups and runs
+      <code>region_id &times; num_blocks + block</code> over every column at once
+      (<span class="fileref">nixl/worker.py:106-115</span>). One READ per column,
+      addressed by the union of all groups' block ids, reconstructs every
+      layer's KV.
+    </li>
+  </ul>
+
+  <div class="callout warn">
+    <strong>Column-packing (HMA) &ne; cross-layer blocks.</strong>
+    <p>
+      Two tensor-sharing schemes that are easy to conflate:
+      <strong>HMA / column-packed</strong> is <em>multi-group</em> &mdash;
+      <code>group_size</code> separate column tensors, each shared by one layer
+      per group (this section); the registration dedups to
+      <code>group_size</code> regions and block ids are flattened across groups.
+      <strong>Cross-layer blocks</strong> (<code>_cross_layers_blocks</code>,
+      behind <code>use_uniform_kv_cache</code>) is <em>single-group</em> &mdash;
+      <em>one</em> tensor with an extra <code>num_layers</code> axis, so the page
+      becomes <code>page_size &times; num_layers</code> and a single block
+      carries every layer at once (<span class="fileref">nixl/worker.py:870-874</span>).
+      It requires exactly one uniform group, so it does <em>not</em> apply to
+      hybrid models like Gemma-3. Both share tensors, but along different axes
+      and for different model shapes.
+    </p>
+  </div>
+
+  <h4>Cross-layer blocks (<code>use_uniform_kv_cache</code>)</h4>
+
+  <p>
+    The other tensor-sharing scheme is an <em>opt-in</em> NIXL optimization for
+    <strong>single-group</strong> (uniform-attention) models &mdash; all-full
+    Llama, say. Instead of one region per layer, <em>all</em> the group's layers
+    are packed into <strong>one</strong> tensor with an extra
+    <code>num_layers</code> axis, so a single block carries every layer's KV.
+    It's gated tightly &mdash; <code>prefer_cross_layer_blocks</code> requires no
+    Mamba, an FA/FlashInfer/Triton backend, <code>HND</code> layout, and the
+    explicit <code>enable_cross_layers_blocks=true</code> flag
+    (<span class="fileref">nixl/connector.py:59-86</span>) &mdash; then
+    <code>use_uniform_kv_cache</code> additionally demands a single uniform group
+    and a backend whose layers axis isn't outermost
+    (<span class="fileref">kv_connector_model_runner_mixin.py:115-183</span>).
+  </p>
+
+  <p>
+    <code>allocate_uniform_kv_caches</code> allocates one contiguous buffer of
+    <code>tensor_size &times; num_layers</code>, prepends a
+    <code>num_layers</code> dim, and permutes by the backend's stride order
+    (<span class="fileref">kv_connector_model_runner_mixin.py:209-276</span>).
+    For FlashAttention under HND that order is <code>(1, 4, 0, 2, 3, 5)</code>
+    (<span class="fileref">flash_attn.py:163-165</span>), giving physical memory:
+  </p>
+
+<pre><code>(num_blocks, num_kv_heads, num_layers, 2, block_size, head_size)</code></pre>
+
+  <p>
+    The <code>num_layers</code> axis sits <em>inner</em> (after blocks and
+    heads), so for a given (block, head) <strong>all layers are
+    contiguous</strong> &mdash; that's the "column-packing inside one tensor."
+    Putting <code>num_kv_heads</code> ahead of <code>num_layers</code> keeps a TP
+    rank's head-slice contiguous, so head-split (<a href="#registration">4.6</a>)
+    still works. The <code>stride_order[0] != 0</code> gate just enforces that
+    layers aren't outermost &mdash; if they were, each layer would be a separate
+    slab and there'd be no benefit.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One block (one head shown) in a cross-layer tensor</div>
+    <div class="cell-row tight">
+      <span class="cell label">1 block<br>1 region</span>
+      <span class="cell used xs">L0 K</span><span class="cell used xs">L0 V</span>
+      <span class="cell used xs">L1 K</span><span class="cell used xs">L1 V</span>
+      <span class="cell used xs">L2 K</span><span class="cell used xs">L2 V</span>
+      <span class="cell free xs">…</span>
+      <span class="cell used xs">Ln K</span><span class="cell used xs">Ln V</span>
+    </div>
+    <div class="diagram-caption">
+      The page is <code>page_size &times; num_layers</code>
+      (<span class="fileref">nixl/worker.py:870-874</span>), so
+      <strong>one descriptor per block moves every layer's KV at once</strong>.
+    </div>
+  </div>
+
+  <p>
+    NIXL registers it via <code>register_cross_layers_kv_caches</code>
+    (<span class="fileref">nixl/worker.py:777-786</span>): one base address &rArr;
+    <strong>~1 region with <code>num_blocks</code> descriptors</strong>, each
+    moving all layers. (<code>virtually_split</code> is off here &mdash; the
+    per-layer <code>L0_K, L0_V, L1_K, …</code> interleave means a
+    <code>block_len/2</code> cut wouldn't isolate K from V.) This is the
+    all-at-once transfer of <a href="#xfer">section&nbsp;6</a> taken to its
+    extreme: fewest, largest descriptors, smallest
+    <code>NixlAgentMetadata</code> &mdash; at the cost of an opt-in flag and the
+    single-uniform-group requirement.
+  </p>
+
+  <h4>Cross-layer: one buffer &rarr; per-layer views</h4>
+
+  <p>
+    The allocation is a single buffer plus a chain of zero-copy
+    <em>views</em> &mdash; no per-layer tensors are ever allocated
+    (<span class="fileref">kv_connector_model_runner_mixin.py:257-274</span>):
+  </p>
+
+  <div class="flow">
+    <div class="flow-step b">
+      <span class="num">1 · ALLOCATE</span>
+      <code>torch.zeros(total_size, int8)</code>
+      <span class="lo" style="display:block;color:var(--muted);margin-top:4px">total = tensor_size &times; num_layers</span>
+    </div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step b">
+      <span class="num">2 · REINTERPRET</span>
+      <code>.view(dtype).view(phys_shape)</code>
+      <span class="lo" style="display:block;color:var(--muted);margin-top:4px">= <code>cross_layers_kv_cache</code> (what NIXL registers)</span>
+    </div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step v">
+      <span class="num">3 · UN-PERMUTE</span>
+      <code>.permute(inv_order)</code>
+      <span class="lo" style="display:block;color:var(--muted);margin-top:4px">= <code>permuted_kv_cache</code>, logical order, strided</span>
+    </div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step g">
+      <span class="num">4 · SLICE</span>
+      <code>permuted[i]</code> per layer
+      <span class="lo" style="display:block;color:var(--muted);margin-top:4px">&rarr; <code>kv_caches[name]</code></span>
+    </div>
+  </div>
+
+  <p>
+    Step&nbsp;1 grabs <code>total_size = tensor_size &times; num_layers</code>
+    bytes in one shot. Step&nbsp;2 reinterprets the bytes as the KV dtype and
+    views them in <em>physical</em> shape &mdash;
+    <code>(num_blocks, num_kv_heads, num_layers, 2, block_size, head_size)</code>
+    for FA+HND. That object, <code>cross_layers_kv_cache</code>, is the single
+    region NIXL registers. Step&nbsp;3 applies the <em>inverse</em> stride
+    permutation to get <code>permuted_kv_cache</code> back in logical order
+    <code>(num_layers, num_blocks, 2, block_size, num_kv_heads, head_size)</code>
+    &mdash; a strided view over the same bytes, no copy. Step&nbsp;4 indexes
+    <code>permuted_kv_cache[i]</code> to drop the layer axis, yielding the
+    ordinary per-layer KV tensor <code>(num_blocks, 2, block_size, num_kv_heads,
+    head_size)</code> that the attention kernel expects; every layer name in
+    that tensor's <code>shared_by</code> list maps to this same view.
+  </p>
+
+  <p>
+    The result is <strong>two aliases of one allocation, read along different
+    axes</strong>:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One buffer, two readings (num_layers = 3, num_blocks = 4)</div>
+    <div class="cell-row">
+      <span class="cell label">block 0</span>
+      <span class="cell used">L0</span><span class="cell cached">L1</span><span class="cell dirty">L2</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 1</span>
+      <span class="cell used">L0</span><span class="cell cached">L1</span><span class="cell dirty">L2</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 2</span>
+      <span class="cell used">L0</span><span class="cell cached">L1</span><span class="cell dirty">L2</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">block 3</span>
+      <span class="cell used">L0</span><span class="cell cached">L1</span><span class="cell dirty">L2</span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span><code>kv_caches[L0]</code> = the blue column</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span><code>kv_caches[L1]</code></span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--amber-soft);border-color:#e3c88a"></span><code>kv_caches[L2]</code></span>
+    </div>
+    <div class="diagram-caption">
+      Memory runs left-to-right, top-to-bottom (<code>num_blocks</code> outermost).
+      A <strong>per-layer view</strong> reads <em>down a column</em> &mdash;
+      <code>kv_caches[L0]</code> is every blue cell, a strided view with
+      block-stride = 3 cells. A <strong>NIXL block descriptor</strong> reads
+      <em>across a row</em> &mdash; block&nbsp;<em>b</em>'s whole
+      <code>[L0 L1 L2]</code> is contiguous (page_size&times;num_layers), so one
+      descriptor moves all 3 layers.
+    </div>
+  </div>
+
+  <p>
+    The two axes never fight: the attention kernel sees only its per-layer view
+    (PyTorch strides route each <code>slot_mapping</code> write to the right
+    interleaved offset &mdash; the packing is invisible to it), while NIXL sees
+    only the flat buffer where each block is one contiguous all-layers page.
+    Same bytes, two stride patterns &mdash; which is exactly why the
+    <code>num_layers</code>-not-outermost rule (<a href="#registration">above</a>)
+    matters: it's what makes the row contiguous and the column merely strided,
+    rather than the reverse.
+  </p>
+
+  <h3>4.3 Two descriptor families: full-attention vs SSM</h3>
+
+  <p>
+    That flat descriptor formula &mdash; <code>region_id &times; num_blocks +
+    block_id</code> &mdash; quietly assumes <em>every</em> region has the same
+    stride (<code>num_blocks</code>). For pure-attention models that holds. But
+    vLLM KV caches come in exactly <strong>two</strong> physical layouts, and
+    they stride differently &mdash; the one thing a single flat index space
+    cannot paper over. So <code>_compute_desc_ids</code> has two branches
+    (<span class="fileref">nixl/worker.py:89-150</span>), gated by a spec
+    classifier that recognizes only these two and <strong>raises on anything
+    else</strong> (<span class="fileref">nixl/tp_mapping.py:31-36</span>):
+  </p>
+
+<pre><code><span class="k">def</span> <span class="fn">_is_attention_spec</span>(t):  <span class="k">return</span> issubclass(t, AttentionSpec)  <span class="c"># Full / MLA / SWA / indexer</span>
+<span class="k">def</span> <span class="fn">_is_ssm_spec</span>(t):        <span class="k">return</span> issubclass(t, MambaSpec)      <span class="c"># conv + ssm state</span>
+<span class="c"># else: raise ValueError(f"Unknown spec type {t}")   # worker.py:146</span></code></pre>
+
+  <p>
+    Why the families must be kept apart:
+  </p>
+
+  <div class="grid">
+    <div class="box" style="border-left:4px solid var(--blue)">
+      <h3 style="color:var(--blue)">Attention (FA) &mdash; <em>block</em>-indexed</h3>
+      <ul>
+        <li><code>AttentionSpec</code>: Full, MLA, sliding-window, the M3
+          lightning-indexer &mdash; all attention.</li>
+        <li>One region per layer (K+V interleaved), virtually split into K and V
+          streams &mdash; see <a href="#registration">4.2</a>.</li>
+        <li>Desc stride = <strong><code>num_blocks</code></strong> (physical /
+          kernel granularity).</li>
+        <li><strong>Head-shardable</strong> across TP &mdash; a rank can read a
+          head-slice of a block.</li>
+      </ul>
+    </div>
+    <div class="box" style="border-left:4px solid var(--green)">
+      <h3 style="color:var(--green)">SSM (Mamba) &mdash; <em>state</em>-indexed</h3>
+      <ul>
+        <li><code>MambaSpec</code>: a convolution state + an SSM temporal
+          state, one set per layer.</li>
+        <li><strong>4 sub-regions per layer</strong> (<code>num_ssm_regions =
+          len(block_len_per_layer) &times; 4</code>) for the 3-read
+          DS-conv transfer
+          (<span class="fileref">nixl/worker.py:98</span>,
+          <span class="fileref">ssm_conv_transfer_utils.py</span>).</li>
+        <li>Desc stride = <strong><code>logical_blocks</code></strong> =
+          <code>num_blocks // physical_blocks_per_logical</code> &mdash; no
+          kernel splitting; state is one entry per <em>logical</em> block.</li>
+        <li><strong>Not</strong> head-split: the state is whole-per-layer, read
+          intact.</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    A hybrid model (e.g. a Mamba/attention stack, scheduled by the
+    <em>hybrid memory allocator</em>) carries both. The descriptor id space is
+    then laid out as two concatenated sections &mdash; all FA descriptors first,
+    then all SSM descriptors &mdash; with the SSM half shifted past the FA half:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Flat descriptor-id space (HMA hybrid)</div>
+    <div class="cell-row">
+      <span class="cell used" style="min-width:300px">FA section &mdash; <code>[0, num_fa_descs)</code><span class="lo">stride num_blocks · head-shardable</span></span>
+      <span class="cell cached" style="min-width:240px">SSM section &mdash; <code>[num_fa_descs, …)</code><span class="lo">stride logical_blocks · whole-state</span></span>
+    </div>
+    <div class="diagram-caption">
+      <code>num_fa_descs = num_fa_regions &times; num_blocks</code> is the
+      boundary &mdash; and it is recomputed <em>per engine</em>, because P and D
+      can have different <code>num_blocks</code> and therefore different FA desc
+      counts (<span class="fileref">nixl/worker.py:103, 134-136</span>).
+    </div>
+  </div>
+
+<pre><code><span class="c"># FA descriptors (per group):</span>
+desc_id = fa_region_id  * num_blocks     + block_id
+<span class="c"># SSM descriptors (per group), shifted past the FA section:</span>
+desc_id = ssm_region_id * logical_blocks + block_id + num_fa_descs</code></pre>
+
+  <p>
+    When there is no Mamba, <code>num_ssm_regions == 0</code> and the function
+    takes an all-attention fast path &mdash; a single vectorized broadcast
+    <code>region_ids * num_blocks + block_arr</code> over every region at once
+    (<span class="fileref">nixl/worker.py:106-115</span>).
+    <strong>Llama, DeepSeek-V3, and Kimi K2 are all pure-attention</strong>, so
+    they take that fast path and the SSM section is empty &mdash; the FA-vs-SSM
+    split only ever materializes for hybrid models.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>SPLIT vs REPLICATE lives <em>inside</em> the FA section.</strong>
+    <p>
+      A subtler distinction (used by mixed models like MiniMax-M3, which keep
+      full-attention and an MLA lightning-indexer in one KV group) is whether an
+      FA region is <em>head-split</em> across TP (GQA full-attention) or
+      <em>replicated</em> identically on every rank (the key-only,
+      <code>num_kv_heads=1</code> indexer). Both are <code>AttentionSpec</code>,
+      both sit in the FA section with the <em>same</em> <code>num_blocks</code>
+      stride &mdash; so the descriptor <em>math</em> is unchanged; only the
+      per-region transfer offset/length differs. That's a TP-mapping concern,
+      not a descriptor-family one &mdash; which is exactly why FA-vs-SSM is the
+      cut that <code>_compute_desc_ids</code> cares about, and head-split-vs-
+      replicate is not.
+    </p>
+  </div>
+
+  <div class="callout info">
+    <strong>Where a replicated FA region comes from: GQA with tp_size &gt; num_kv_heads.</strong>
+    <p>
+      Replication isn't unique to the M3 indexer &mdash; <em>any</em> GQA model
+      run with more TP ranks than KV heads produces it.
+      <code>QKVParallelLinear</code> decides per layer
+      (<span class="fileref">linear.py:1026-1031</span>):
+    </p>
+<pre><code><span class="k">if</span> tp_size &gt;= total_num_kv_heads:
+    num_kv_heads = 1
+    num_kv_head_replicas = divide(tp_size, total_num_kv_heads)   <span class="c"># ranks sharing a head</span>
+<span class="k">else</span>:
+    num_kv_heads = divide(total_num_kv_heads, tp_size)
+    num_kv_head_replicas = 1</code></pre>
+    <p>
+      When <code>tp_size &gt; num_kv_heads</code> each rank gets a single KV head
+      and <code>num_kv_head_replicas</code> ranks hold a <strong>byte-identical
+      copy</strong> of it &mdash; that duplicated KV is what an FA region marks
+      <a href="#registration">REPLICATE</a>; the indexer
+      (<code>num_kv_heads=1</code>) is just the extreme where every rank
+      replicates. It is legal only when the counts divide
+      (<code>divide()</code> asserts): <code>num_kv_heads | tp_size</code> or
+      <code>tp_size | num_kv_heads</code>. So for 8 KV heads, TP 4/8/16 work
+      (TP&nbsp;16 &rArr; 2&times; replicas); TP&nbsp;6 or 12 raise. Past
+      <code>tp = num_kv_heads</code> the KV cache stops shrinking &mdash; the
+      extra ranks store redundant copies, which is the memory cost REPLICATE
+      reflects.
+    </p>
+  </div>
+
+  <h3>4.4 Inside an SSM layer: the 4 sub-regions</h3>
+
+  <p>
+    An SSM layer caches no K and V. Its per-block page holds two tensors: a
+    short <strong>convolution state</strong> (the causal-conv window,
+    <code>conv_kernel&minus;1</code> rows &mdash; a kernel of width <em>K</em>
+    needs the current input plus the <em>K&minus;1</em> previous ones, and the
+    current input is computed live each step, so only those <em>K&minus;1</em>
+    priors are cached) and an <strong>SSM temporal state</strong> (the recurrent
+    hidden state). For NIXL transfer the connector
+    carves each page into <strong>4 sub-regions</strong> &mdash; the docstring of
+    <code>_build_mamba_local</code> is literally <em>"Build 4 desc regions (x,
+    B, C, ssm) per layer"</em>
+    (<span class="fileref">nixl/worker.py:1014-1052</span>).
+  </p>
+
+  <p>
+    The trick is the <strong>DS (dim-first) layout</strong> <code>(conv_dim,
+    conv_rows)</code>, which lays the conv state's three sub-projections out
+    <em>contiguously</em> (<span class="fileref">ssm_conv_transfer_utils.py</span>):
+  </p>
+
+  <p>
+    Read the shape as <em>columns &times; window</em>: <code>conv_dim</code> is
+    the channel axis (the depthwise conv runs per channel &mdash; the code calls
+    these positions "columns") and <code>conv_rows = conv_kernel&minus;1</code>
+    is the window length. The three sub-projections <strong>partition
+    <code>conv_dim</code></strong>, so each is <code>(its_columns,
+    conv_rows)</code> and they sum back to the whole &mdash; for Mamba2
+    <code>conv_dim = x_cols + B_cols + C_cols</code> (that's
+    <code>local_proj_dims</code>). The <code>conv_rows</code> axis is innermost,
+    so each channel's window is contiguous and therefore a contiguous range of
+    channels &mdash; one sub-projection &mdash; is a contiguous byte range
+    <code>cols &times; conv_rows &times; dtype</code>. That contiguity is what
+    makes the 3-read possible. (So <code>(conv_dim, conv_rows)</code> is the
+    whole conv state; <code>(x_cols, conv_rows)</code> etc. are its column-slices
+    &mdash; same axis, named <code>conv_dim</code> whole and "columns" when
+    subdivided.)
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One SSM block's page &rarr; 4 sub-regions</div>
+    <div class="cell-row">
+      <span class="cell label">Mamba2<br>page</span>
+      <span class="cell used" style="min-width:58px">x<span class="lo">proj0</span></span>
+      <span class="cell used" style="min-width:48px">B<span class="lo">proj1</span></span>
+      <span class="cell used" style="min-width:48px">C<span class="lo">proj2</span></span>
+      <span class="cell cached" style="min-width:150px">ssm temporal state<span class="lo">region 4</span></span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">GDN<br>page</span>
+      <span class="cell used" style="min-width:58px">Q<span class="lo">proj0</span></span>
+      <span class="cell used" style="min-width:48px">K<span class="lo">proj1</span></span>
+      <span class="cell used" style="min-width:48px">V<span class="lo">proj2</span></span>
+      <span class="cell cached" style="min-width:150px">ssm temporal state<span class="lo">region 4</span></span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>conv state — 3 contiguous sub-projections (the "3-read")</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>SSM temporal state — the 4th region</span>
+    </div>
+    <div class="diagram-caption">
+      Mamba2 splits conv into <code>[x, B, C]</code> (B and C equal-sized); GDN
+      splits it into <code>[Q, K, V]</code> (<code>dim(Q)=dim(K)</code>). Both
+      sit ahead of the ssm temporal state in one page.
+    </div>
+  </div>
+
+  <p>
+    Why 4 separate descriptors rather than one whole-page copy? Because the conv
+    state is <strong>TP-sharded along the column (dim) axis, sub-projection by
+    sub-projection</strong> &mdash; and that sharding does <em>not</em> line up
+    with the page's byte order. A rank's local page is
+    <code>[x-slice | B-slice | C-slice]</code>, but in the <em>global</em> page
+    those three slices live at three <strong>non-adjacent</strong> offsets
+    (inside the full <code>x</code> block, the full <code>B</code> block, and the
+    full <code>C</code> block respectively). So a contiguous copy of a prefix of
+    P's page would splice the wrong columns together. The fix: read each
+    sub-projection slice as its own descriptor &mdash; <strong>3 conv reads</strong>
+    (the "3-read") plus the ssm state &mdash; with <strong>no permutation on
+    P</strong>.
+  </p>
+
+  <h4>Worked example: P_TP = 1 &rarr; D_TP = 2 (tp_ratio = 2)</h4>
+
+  <p>
+    Take a Mamba2 conv state with global columns <code>x = 8</code>,
+    <code>B = 2</code>, <code>C = 2</code> (counting columns, not bytes &mdash;
+    real bytes are <code>columns &times; conv_rows &times; dtype</code>). The
+    prefill rank holds the whole 12-column page; each decode rank holds half of
+    <em>every</em> sub-projection: <code>x = 4</code>, <code>B = 1</code>,
+    <code>C = 1</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">P's full conv page &mdash; who reads what (D_TP = 2)</div>
+    <div class="cell-row tight">
+      <span class="cell label">P page<br>(1 rank)</span>
+      <span class="cell used match sm">x0</span>
+      <span class="cell used match sm">x1</span>
+      <span class="cell used match sm">x2</span>
+      <span class="cell used match sm">x3</span>
+      <span class="cell used hot sm">x4</span>
+      <span class="cell used hot sm">x5</span>
+      <span class="cell used hot sm">x6</span>
+      <span class="cell used hot sm">x7</span>
+      <span class="cell dirty match sm">B0</span>
+      <span class="cell dirty hot sm">B1</span>
+      <span class="cell cached match sm">C0</span>
+      <span class="cell cached hot sm">C1</span>
+    </div>
+    <div class="cell-row tight">
+      <span class="cell label">byte off</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">0</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">1</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">2</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">3</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">4</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">5</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">6</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">7</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">8</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">9</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">10</span>
+      <span class="cell sm" style="border:none;background:none;color:var(--muted)">11</span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="outline:2px solid var(--green);outline-offset:-2px;background:var(--blue-soft)"></span>D0 reads (green outline)</span>
+      <span class="legend-item"><span class="legend-sw" style="outline:2px solid var(--red);outline-offset:-2px;background:var(--blue-soft)"></span>D1 reads (red outline)</span>
+    </div>
+    <div class="diagram-caption">
+      D0's local page is <code>[x0 x1 x2 x3 | B0 | C0]</code> &mdash; bytes at
+      offsets 0&ndash;3, 8, 10 of P's page. D1's is
+      <code>[x4 x5 x6 x7 | B1 | C1]</code> &mdash; offsets 4&ndash;7, 9, 11.
+      Neither is a contiguous run.
+    </div>
+  </div>
+
+  <p>
+    <code>remote_conv_offsets(local_offset, tp_ratio)</code> computes exactly
+    these three <code>(offset, len)</code> reads per rank
+    (<span class="fileref">ssm_conv_transfer_utils.py:62-103</span>). With
+    <code>remote_conv0 = 4&times;2 = 8</code> (P's whole <code>x</code>) and
+    <code>remote_conv1 = 1&times;2 = 2</code> (P's whole <code>B</code>):
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>D rank</th><th><code>x</code> read</th><th><code>B</code> read</th><th><code>C</code> read</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>D0 (<code>off=0</code>)</td>
+        <td><code>(0, 4)</code></td>
+        <td><code>(8+0, 1)</code></td>
+        <td><code>(8+2+0, 1)</code> = 10</td>
+      </tr>
+      <tr>
+        <td>D1 (<code>off=1</code>)</td>
+        <td><code>(4, 4)</code></td>
+        <td><code>(8+1, 1)</code> = 9</td>
+        <td><code>(8+2+1, 1)</code> = 11</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    A <strong>4th read</strong> grabs the ssm temporal state, which is sharded
+    on its heads dimension: D rank <code>r</code> reads
+    <code>conv_size_remote + r &times; ssm_len</code>
+    (<span class="fileref">nixl/worker.py:1088-1096</span>). Contrast the naive
+    whole-page copy: D0 copying P's first 6 bytes gets
+    <code>[x0 x1 x2 x3 x4 x5]</code> &mdash; it picks up x4/x5 where
+    <code>B0</code>/<code>C0</code> belong and misses them entirely. Correct
+    layout is only recoverable as separate slices.
+  </p>
+
+  <div class="callout">
+    <strong>The other direction (P_TP &gt; D_TP, tp_ratio &lt; 0).</strong>
+    <p>
+      Now D holds the full state and each P rank holds a fraction, so D
+      <em>gathers</em> the same sub-projection from several P ranks and
+      concatenates the pieces into its local <code>x</code> (then <code>B</code>,
+      then <code>C</code>) region. <code>remote_conv_offsets</code> flips: it
+      returns P-sized offsets <code>(0, conv0/|ratio|)</code>,
+      <code>(conv0/|ratio|, conv1/|ratio|)</code>, … and D reads each P rank's
+      whole (smaller) page, placing the slices side by side. Still per
+      sub-projection, still no single contiguous copy &mdash; the interleave is
+      just on the write side instead of the read side.
+    </p>
+  </div>
+
+  <p>
+    The conv state is <strong>always</strong> TP-sharded this way, even when the
+    model's attention KV is replicated across ranks
+    (<span class="fileref">nixl/worker.py:1065-1066</span>). These 4-per-layer
+    regions are what <code>num_ssm_regions = len(block_len_per_layer) &times;
+    4</code> counts in <a href="#registration">4.3</a>, and they stride over
+    <code>logical_blocks</code> (next), not <code>num_blocks</code>.
+  </p>
+
+  <div class="callout info">
+    <strong>Why "always" sharded &mdash; padding vs. replication.</strong>
+    <p>
+      Attention takes the <a href="#registration">REPLICATE</a> path only because
+      of GQA/MQA: when <code>num_kv_heads &lt; tp_size</code> a KV head can't be
+      given to every rank, so it is <em>duplicated</em> &mdash; several ranks hold
+      byte-identical KV (the M3 key-only indexer). Mamba has an analogous small
+      dimension, <code>n_groups</code> (the B/C groups), but resolves it the
+      opposite way: at layer-build time it <strong>pads <code>n_groups</code> up
+      to a multiple of <code>tp_size</code></strong>
+      (<code>extra_groups_for_head_shards</code>,
+      <span class="fileref">mamba_utils.py:201-210</span>), so
+      <code>conv_dim</code> always divides evenly and each rank stores a
+      <em>distinct</em> <code>conv_dim / tp</code> slice
+      (<span class="fileref">mamba_utils.py:173-180</span>); the temporal state is
+      likewise <code>divide(num_heads, tp_size)</code>. Even in the
+      <code>n_groups = 1</code> case the duplicated group data lands as separate
+      per-rank slices of a padded buffer &mdash; never two ranks pointing at the
+      same bytes. So SSM cache is never byte-identical across ranks, and the
+      connector has no <code>if replicate</code> branch for it: conv and ssm
+      state are unconditionally <a href="#registration">SPLIT</a>, divided by TP
+      with a per-rank <code>local_offset</code>.
+    </p>
+  </div>
+
+  <div class="callout info">
+    <strong>Example models.</strong>
+    <p>
+      The connector supports two SSM families
+      (<span class="fileref">ssm_conv_transfer_utils.py</span>):
+      <strong>Mamba2</strong> &mdash; e.g. NVIDIA <em>Nemotron-H</em> /
+      Nemotron Nano 2, IBM <em>Bamba</em>, <em>Codestral Mamba</em> &mdash;
+      with conv sub-projections <code>(x, B, C)</code>; and <strong>Gated
+      DeltaNet (GDN)</strong> &mdash; e.g. <em>Qwen3-Next</em> &mdash; with
+      <code>(Q, K, V)</code>. These are hybrids: most layers are SSM, a few are
+      full attention (Nemotron Nano 2 keeps ~4 attention layers; Qwen3-Next runs
+      a 3:1 GDN-to-attention ratio). The attention layers land in the FA section,
+      the SSM layers in the SSM section &mdash; the exact split
+      <a href="#registration">4.3</a> exists to handle.
+    </p>
+  </div>
+
+  <h3>4.5 Logical vs physical blocks</h3>
+
+  <p>
+    Three closely-related counts appear throughout the connector, set once by
+    <code>_sync_block_size_with_kernel</code>
+    (<span class="fileref">nixl/worker.py:454-471</span>). You configure a
+    <strong>logical</strong> <code>block_size</code> (tokens per block, say
+    128). But an attention kernel may demand a smaller <strong>physical /
+    kernel</strong> block size (say 64); <code>select_common_block_size</code>
+    picks the common kernel size across the active backends. When they differ
+    the connector switches to speaking <em>physical</em> blocks:
+  </p>
+
+<pre><code>kernel_block_size = select_common_block_size(block_size, backends)   <span class="c"># e.g. 64</span>
+_logical_num_blocks = num_blocks                                     <span class="c"># count BEFORE rescale</span>
+<span class="k">if</span> block_size != kernel_block_size:
+    physical_blocks_per_logical = block_size // kernel_block_size    <span class="c"># 128 // 64 = 2</span>
+    block_size  = kernel_block_size                                  <span class="c"># now physical</span>
+    num_blocks *= physical_blocks_per_logical                        <span class="c"># physical count</span></code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Quantity</th><th>Meaning</th><th>Relation</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>physical_blocks_per_logical</code></td>
+        <td>How many kernel blocks tile one logical block (the "ratio")</td>
+        <td><code>block_size // kernel_block_size</code></td>
+      </tr>
+      <tr>
+        <td><code>num_blocks</code></td>
+        <td>Physical (kernel-granularity) block count &mdash; what FA descriptors index</td>
+        <td><code>_logical_num_blocks &times; ratio</code></td>
+      </tr>
+      <tr>
+        <td><code>logical_blocks</code></td>
+        <td>Logical block count &mdash; what SSM-state descriptors index</td>
+        <td><code>num_blocks // ratio</code> (= <code>_logical_num_blocks</code>)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="diagram">
+    <div class="diagram-title">ratio = 2 &mdash; one logical block tiles two kernel blocks</div>
+    <div class="cell-row">
+      <span class="cell label">logical<br>(size 128)</span>
+      <span class="cell cached" style="min-width:130px">L0</span>
+      <span class="cell cached" style="min-width:130px">L1</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">physical<br>(size 64)</span>
+      <span class="cell used" style="min-width:62px">p0</span>
+      <span class="cell used" style="min-width:62px">p1</span>
+      <span class="cell used" style="min-width:62px">p2</span>
+      <span class="cell used" style="min-width:62px">p3</span>
+    </div>
+    <div class="diagram-caption">
+      FA reads/writes at kernel granularity, so its descriptors run over
+      <code>num_blocks = 4</code>; the per-layer SSM state is one blob per
+      <em>logical</em> block, so its descriptors run over
+      <code>logical_blocks = num_blocks // 2 = 2</code>. The same ratio drives
+      <code>get_mapped_blocks</code>, which expands a logical block id into its
+      physical ids when P and D run different block sizes
+      (<span class="fileref">nixl/worker.py:2246-2265</span>).
+    </div>
+  </div>
+
+  <p>
+    <strong>Llama, DeepSeek-V3, and Kimi K2 all have ratio = 1</strong> &mdash;
+    the kernel block size equals the configured one, so logical and physical
+    blocks coincide and <code>logical_blocks == num_blocks</code>. The ratio
+    only exceeds 1 when a kernel locks a smaller block size than you asked for
+    (the 128&rarr;64 case above), which is also where
+    <code>get_mapped_blocks</code> and the <code>physical_blocks_per_logical</code>
+    scaling in the block-id pairing (<a href="#blockids">5.4</a>) earn their
+    keep.
+  </p>
+
+  <h3>4.6 In-block layout: why HND?</h3>
+
+  <p>
+    One more layout choice sits <em>inside</em> each region's block: the order of
+    the head (<code>H</code>) and token (<code>N</code>) axes. There are two
+    options &mdash; and for non-MLA models the NixlConnector
+    <strong>forces <code>HND</code></strong>
+    (<span class="fileref">nixl/connector.py:115-131</span>):
+  </p>
+
+  <ul>
+    <li><strong>HND</strong> = <code>(num_kv_heads, block_size, head_dim)</code>
+      &mdash; a head's data (all tokens in the block) is <em>contiguous</em>.</li>
+    <li><strong>NHD</strong> = <code>(block_size, num_kv_heads, head_dim)</code>
+      &mdash; a token's heads are contiguous, so any single head is
+      <em>strided</em> across the block.</li>
+  </ul>
+
+  <p>
+    The reason NIXL cares: a transfer descriptor is a contiguous
+    <code>(addr, len)</code>, and in hetero-TP a decode rank reads only its
+    <em>head-slice</em> at a per-rank offset (the SPLIT path of
+    <a href="#registration">4.3</a>). That slice is one clean descriptor
+    <strong>only if the rank's heads are contiguous</strong> &mdash; i.e. only
+    under HND.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One block, 4 heads &times; 4 tokens &mdash; rank A wants heads 0&ndash;1</div>
+    <div class="cell-row tight">
+      <span class="cell label">HND<br>head-major</span>
+      <span class="cell used xs">h0</span><span class="cell used xs">h0</span><span class="cell used xs">h0</span><span class="cell used xs">h0</span>
+      <span class="cell used xs">h1</span><span class="cell used xs">h1</span><span class="cell used xs">h1</span><span class="cell used xs">h1</span>
+      <span class="cell free xs">h2</span><span class="cell free xs">h2</span><span class="cell free xs">h2</span><span class="cell free xs">h2</span>
+      <span class="cell free xs">h3</span><span class="cell free xs">h3</span><span class="cell free xs">h3</span><span class="cell free xs">h3</span>
+    </div>
+    <div class="cell-row tight">
+      <span class="cell label">NHD<br>token-major</span>
+      <span class="cell used xs">h0</span><span class="cell used xs">h1</span><span class="cell free xs">h2</span><span class="cell free xs">h3</span>
+      <span class="cell used xs">h0</span><span class="cell used xs">h1</span><span class="cell free xs">h2</span><span class="cell free xs">h3</span>
+      <span class="cell used xs">h0</span><span class="cell used xs">h1</span><span class="cell free xs">h2</span><span class="cell free xs">h3</span>
+      <span class="cell used xs">h0</span><span class="cell used xs">h1</span><span class="cell free xs">h2</span><span class="cell free xs">h3</span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>rank A's heads (0&ndash;1)</span>
+      <span class="legend-item"><span class="legend-sw" style="background:#f1f1ee"></span>other ranks' heads</span>
+    </div>
+    <div class="diagram-caption">
+      Under <strong>HND</strong>, rank A's heads are the first 8 cells &mdash;
+      one contiguous run, one descriptor at offset
+      <code>rank_offset &times; per_head_block_len</code>. Under
+      <strong>NHD</strong> the same heads are scattered 2-on-2-off across every
+      token &mdash; no single contiguous slice exists.
+    </div>
+  </div>
+
+  <p>
+    So NHD <em>"will not support Decode/Prefill TP_ratio &gt; 1"</em>
+    (<span class="fileref">nixl/worker.py:605-622</span>). At
+    <code>tp_ratio = 1</code> it's harmless &mdash; each D rank reads the
+    <em>whole</em> block from its P counterpart, no head-slicing &mdash; which is
+    why the constraint only bites in hetero-TP. Three corollaries:
+  </p>
+
+  <ul>
+    <li><strong>MLA is exempt.</strong> <code>get_required_kvcache_layout</code>
+      returns <code>None</code> for MLA
+      (<span class="fileref">nixl/connector.py:122-127</span>): a single shared
+      latent has no head axis to split, so the whole-block (REPLICATE-style)
+      read works under any layout.</li>
+    <li><strong>Escape hatch.</strong> A device stuck on NHD can set
+      <code>enable_permute_local_kv</code> to stage a permuted <code>HND</code>
+      copy in a host buffer, restoring hetero-TP
+      (<span class="fileref">nixl/worker.py:609-622</span>).</li>
+    <li><strong>Validated at handshake.</strong> <code>kv_cache_layout</code>
+      rides in <code>NixlAgentMetadata</code> (the <a href="#handshake">3.3</a>
+      example shows <code>"HND"</code>), so a P/D layout mismatch is caught and
+      reconciled, not silently transferred wrong.</li>
+  </ul>
+
+  <h3>4.7 Remote (lazy, per engine)</h3>
+
+  <p>
+    Adding a remote agent only happens after the ZMQ handshake. Per
+    remote engine, per remote rank, D calls
+    (<span class="fileref">nixl/worker.py:1309-1312</span>):
+  </p>
+
+<pre><code>remote_agent_name = self.nixl_wrapper.add_remote_agent(
+    nixl_agent_meta.agent_metadata
+)
+self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+    self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs))
+</code></pre>
+
+  <p>
+    The "prepared xfer dlist" is NIXL's pre-baked descriptor table for
+    the remote agent's memory. It's cached per
+    <code>(engine_id, remote_tp_rank)</code>. Every subsequent request to
+    the same engine reuses it &mdash; that's why later requests are
+    cheap.
+  </p>
+
+  <h2 id="blockids">5. Where the block IDs come from</h2>
+
+  <p>
+    The READ needs two lists: where the data lives on P
+    (<code>remote_block_ids</code>) and where it should land on D
+    (<code>local_block_ids</code>). Neither travels over NIXL, and neither rides
+    the ZMQ handshake &mdash; the handshake only carries layout metadata
+    (<a href="#handshake">section&nbsp;3.3</a>). Both block lists are plain KV
+    indices that piggy-back on the <code>kv_transfer_params</code> dict attached
+    to the request. The "remote" naming is purely point of view:
+    <strong><code>remote_block_ids</code> are P's <em>own local</em> block
+    ids</strong>, called remote only because D is the one reading them.
+  </p>
+
+  <h3>5.1 P mints the list when prefill finishes</h3>
+
+  <p>
+    When P's prefill request completes, the scheduler's
+    <code>request_finished</code>
+    (<span class="fileref">nixl/scheduler.py:580-674</span>) is handed the
+    request's local KV block ids. Rather than free them it decides to
+    <em>delay</em> the free &mdash; so D still has something to read &mdash;
+    unpads any SWA/HMA placeholder blocks with
+    <code>get_sw_clipped_blocks</code>, and ships them inside the returned
+    <code>kv_transfer_params</code>:
+  </p>
+
+<pre><code>return delay_free_blocks, dict(
+    do_remote_prefill=is_p_node,
+    remote_block_ids=block_ids,          # P's OWN local blocks
+    remote_engine_id=self.engine_id,     # which agent D should READ
+    remote_request_id=request.request_id,
+    remote_host=self.side_channel_host,  # where D handshakes
+    remote_port=self.side_channel_port,
+    tp_size=...,
+    remote_num_tokens=request.num_computed_tokens,
+)
+</code></pre>
+
+  <p>
+    On the same step P arms the lease: the request id goes into
+    <code>_reqs_need_send</code> with an expiry timestamp &mdash; the very entry
+    that <a href="#lease">section&nbsp;8's</a> heartbeat later refreshes.
+  </p>
+
+  <h3>5.2 The params travel back to D</h3>
+
+  <p>
+    This dict rides the prefill response back to the orchestrator; the P/D proxy
+    attaches it to the decode request it then issues. By the time the request
+    lands on D's scheduler it is sitting in
+    <code>request.kv_transfer_params</code> with
+    <code>do_remote_prefill=True</code> and the full
+    <code>remote_block_ids</code> list. NIXL itself never moves these &mdash;
+    they arrive the same way the request text does.
+  </p>
+
+  <h4>Example: <code>kv_transfer_params</code> for Llama 3.1 8B</h4>
+
+  <p>
+    For a 120-token prompt on the same Llama-3.1-8B prefill engine as
+    <a href="#handshake">3.3</a> (<code>block_size = 16</code>, TP&nbsp;=&nbsp;1),
+    the dict that lands on D looks like:
+  </p>
+
+<pre><code>request.kv_transfer_params = {
+    <span class="s">"do_remote_prefill"</span>: True,                 <span class="c"># D should pull, not compute</span>
+    <span class="s">"do_remote_decode"</span>:  False,
+    <span class="s">"remote_block_ids"</span>:  [<span class="n">12</span>, <span class="n">13</span>, <span class="n">14</span>, <span class="n">15</span>, <span class="n">16</span>, <span class="n">17</span>, <span class="n">18</span>, <span class="n">19</span>],  <span class="c"># P's OWN local blocks</span>
+    <span class="s">"remote_engine_id"</span>:  <span class="s">"prefill-3f9c…"</span>,      <span class="c"># which P agent to READ from</span>
+    <span class="s">"remote_request_id"</span>: <span class="s">"cmpl-7a2f…"</span>,         <span class="c"># P's id for this request</span>
+    <span class="s">"remote_host"</span>:       <span class="s">"10.0.2.7"</span>,           <span class="c"># P's side-channel host</span>
+    <span class="s">"remote_port"</span>:       <span class="n">5557</span>,                 <span class="c"># VLLM_NIXL_SIDE_CHANNEL_PORT</span>
+    <span class="s">"tp_size"</span>:           <span class="n">1</span>,                    <span class="c"># P's TP → tp_ratio at D</span>
+    <span class="s">"remote_num_tokens"</span>: <span class="n">120</span>,                  <span class="c"># prefill length P computed</span>
+}</code></pre>
+
+  <ul>
+    <li>
+      <code>remote_block_ids</code> has <code>ceil(120 / 16) = 8</code> entries
+      &mdash; P's own physical blocks holding the prompt's KV, "remote" only from
+      D's seat (<a href="#blockids">5.1</a>).
+    </li>
+    <li>
+      <code>remote_engine_id</code> + <code>remote_host</code>/<code>remote_port</code>
+      are what D feeds the <a href="#handshake">3.3</a> handshake to fetch P's
+      <code>NixlAgentMetadata</code> and register it as a remote agent.
+    </li>
+    <li>
+      <code>remote_num_tokens</code> and <code>tp_size</code> drive D's pull
+      count (<a href="#blockids">5.3</a>) and the <code>tp_ratio</code> of the
+      READ (<a href="#blockids">5.4</a>, <a href="#registration">4.6</a>).
+    </li>
+  </ul>
+
+  <h3>5.3 D allocates its own half and pairs them</h3>
+
+  <p>
+    D never reuses P's indices &mdash; its KV cache is a different tensor on a
+    different GPU. It computes its <em>own</em> destination blocks in three
+    steps:
+  </p>
+
+  <ul>
+    <li>
+      <code>get_num_new_matched_tokens</code> validates the params and returns
+      how many tokens must be pulled:
+      <code>min(remote_num_tokens, num_prompt_tokens) &minus; num_computed_tokens</code>
+      &mdash; where <code>num_computed_tokens</code> already subtracts whatever D
+      holds in its <em>own</em> local prefix cache
+      (<span class="fileref">nixl/scheduler.py:393-429</span>).
+    </li>
+    <li>
+      The scheduler allocates blocks for those external tokens, then
+      <code>update_state_after_alloc</code> records D's freshly-allocated,
+      not-already-cached blocks as <code>local_block_ids</code> via
+      <code>get_unhashed_block_ids_all_groups()</code>, SWA-clipped
+      (<span class="fileref">nixl/scheduler.py:461-501</span>). A <em>full</em>
+      local prefix hit yields an <strong>empty</strong> list &mdash; "pull
+      nothing, but still notify P so it frees."
+    </li>
+    <li>
+      <code>build_connector_meta</code> &rarr; <code>add_new_req_to_recv</code>
+      packs both halves into one <code>ReqMeta</code>:
+      <code>local_block_ids</code> (D's blocks) and
+      <code>remote=RemoteMeta(block_ids=remote_block_ids, …)</code> (P's blocks)
+      (<span class="fileref">nixl/metadata.py:197-211</span>).
+    </li>
+  </ul>
+
+  <h3>5.4 Pairing is positional, with a tail-trim</h3>
+
+  <p>
+    At READ time the two lists are zipped index-by-index, per KV-cache group.
+    They can differ in length: P sent its <em>whole</em> block list, but D may
+    already hold a prefix locally. Because a cache hit is always a
+    <em>prefix</em>, the blocks still to fetch are P's <strong>tail</strong>, so
+    <code>_apply_prefix_caching</code> end-trims the remote list
+    (<span class="fileref">nixl/worker.py:2292-2316</span>):
+  </p>
+
+<pre><code>num_local_blocks = len(local_block_ids[i])
+assert num_local_blocks &lt;= len(remote_group)
+if num_local_blocks &lt; len(remote_group):
+    remote_block_ids[i] = remote_group[-num_local_blocks:]   # keep the tail
+</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Pairing on a partial prefix hit (homogeneous TP)</div>
+    <div class="cell-row">
+      <span class="cell label">P blocks<br>(remote)</span>
+      <span class="cell used">b0</span>
+      <span class="cell used">b1</span>
+      <span class="cell used match">b2</span>
+      <span class="cell used match">b3</span>
+      <span class="cell used match">b4</span>
+    </div>
+    <div class="cell-row">
+      <span class="cell label">D blocks<br>(local)</span>
+      <span class="cell cached">hit</span>
+      <span class="cell cached">hit</span>
+      <span class="cell used match">d2</span>
+      <span class="cell used match">d3</span>
+      <span class="cell used match">d4</span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>already in D's prefix cache</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df;outline:2px solid var(--green);outline-offset:-2px"></span>READ pair (b<sub>i</sub> &rarr; d<sub>i</sub>)</span>
+    </div>
+    <div class="diagram-caption">
+      D holds the first two blocks already, so <code>num_external_tokens</code>
+      covers only the last three; D allocates 3 fresh blocks
+      (<code>local_block_ids = [d2,d3,d4]</code>). The worker end-trims P's list
+      to <code>remote[-3:] = [b2,b3,b4]</code> and reads them pairwise. Cached
+      blocks are never re-transferred &mdash; that's the whole point of feeding
+      D's local hit back through <code>num_computed_tokens</code>.
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Block sizes need not match.</strong>
+    <p>
+      Before pairing, logical ids are expanded to kernel-physical ids
+      (<code>_logical_to_remote_kernel_block_ids</code> +
+      <code>get_mapped_blocks</code>,
+      <span class="fileref">nixl/worker.py:2246-2290, 2352</span>), so a P block
+      of size 4 can map onto a D block of size 16, and under hetero-TP the
+      per-group counts are reconciled to the minimum. After all trimming the
+      descriptor invariant must hold:
+      <code>len(local_block_descs_ids) == len(remote_block_descs_ids)</code>
+      (<span class="fileref">nixl/worker.py:2215</span>).
+    </p>
+  </div>
+
+  <h2 id="xfer">6. The <code>READ</code> transfer</h2>
+
+  <p>
+    On <code>start_load_kv</code>, after the handshake has completed,
+    <code>_read_blocks_for_req</code>
+    (<span class="fileref">nixl/worker.py:2021-2095</span>) computes the
+    full plan and emits one <code>READ</code> per remote rank that holds
+    a piece of this request's KV.
+  </p>
+
+<pre><code>read_specs = [
+    ReadSpec(
+        remote_rank=rank,
+        local_block_ids=[...],   # where on D the data goes
+        remote_block_ids=[...],  # where on P the data lives
+    )
+    for rank in plan.all_source_ranks
+]
+
+for spec in read_specs:
+    self._read_blocks(read_spec=spec, ...)
+</code></pre>
+
+  <p>
+    <strong>It is all-at-once per request per remote rank.</strong> No
+    per-layer batching. The
+    <code>save_kv_layer</code> and <code>wait_for_layer_load</code>
+    hooks on the base class are explicit no-ops for NIXL
+    (<span class="fileref">nixl/connector.py:255-267</span>). All of one
+    request's blocks go in one NIXL transfer per source rank.
+  </p>
+
+  <div class="callout warn">
+    <strong>Hetero-TP means multiple READs per request</strong>
+    <p>
+      If TP<sub>D</sub> &lt; TP<sub>P</sub>, a single D rank gathers from
+      multiple P ranks. That becomes one <code>READ</code> per
+      <code>(D_rank &rarr; P_rank)</code> pair. See
+      <a href="PARALLELISM.html">PARALLELISM.html</a> for the
+      head-dimension math.
+    </p>
+  </div>
+
+  <h2 id="completion">7. Completion: polling + NIXL notifs</h2>
+
+  <p>
+    NIXL transfers are <strong>non-blocking</strong>:
+    <code>nixl_wrapper.transfer(handle)</code> returns immediately and
+    the work happens in the NIXL backend. D learns of completion two ways
+    depending on which side it's on.
+  </p>
+
+  <h3>7.1 D side: poll xfer state</h3>
+
+  <p>
+    Each scheduler step, <code>get_finished</code> calls
+    <code>_pop_done_transfers</code>
+    (<span class="fileref">nixl/worker.py:1868-1913</span>):
+  </p>
+
+<pre><code>for handle in handles:
+    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+    if xfer_state == "DONE":
+        self.nixl_wrapper.release_xfer_handle(handle)
+    elif xfer_state == "PROC":
+        in_progress.append(handle)
+    else:
+        self._handle_failed_transfer(req_id, handle)
+</code></pre>
+
+  <p>
+    Once all handles for a request are <code>DONE</code>, the request
+    appears in <code>done_recving</code> and the local scheduler can
+    consume the prompt as if it had been local all along.
+  </p>
+
+  <h3>7.2 P side: receive notifs from D</h3>
+
+  <p>
+    D piggy-backs a notification on the READ
+    (<code>notif_msg=notif_id</code> in the call above). The notif body
+    is <code>"{remote_request_id}:{D_world_size}"</code>. P polls in
+    <code>get_finished</code> via
+    <code>self.nixl_wrapper.get_new_notifs()</code>
+    (<span class="fileref">nixl/worker.py:1792-1845</span>) and counts
+    how many D ranks have notified:
+  </p>
+
+<pre><code>self.consumer_notification_counts_by_req[req_id] += 1
+if self.consumer_notification_counts_by_req[req_id] == consumers_per_producer:
+    notified_req_ids.add(req_id)
+</code></pre>
+
+  <p>
+    Only once all D consumers have notified does P add the request to
+    <code>done_sending</code>. The <code>consumers_per_producer</code>
+    number is derived from the TP layout: with TP<sub>D</sub> = 4 and
+    TP<sub>P</sub> = 2, each P rank serves two D ranks, so each P rank
+    must wait for two notifs per request.
+  </p>
+
+  <h2 id="lease">8. The lease + heartbeat lifetime contract</h2>
+
+  <p>
+    What if D never notifies &mdash; crashed mid-load, network died?
+    The naive scheme leaks P's KV blocks forever. NIXL prevents that
+    with a lease + heartbeat:
+  </p>
+
+  <ul>
+    <li>
+      P tracks each in-flight request in
+      <code>self._reqs_to_send: dict[req_id, expiry_time]</code>.
+      The initial expiry is <code>kv_lease_duration</code> (default 30s,
+      configurable; <span class="fileref">nixl/worker.py:219-223</span>).
+    </li>
+    <li>
+      D periodically sends a <strong>heartbeat notif</strong> of the form
+      <code>"HB:req1,req2,..."</code>
+      (<span class="fileref">nixl/worker.py:2013</span> and
+      <span class="fileref">1994-2020</span>) listing every request
+      whose load it has in flight.
+    </li>
+    <li>
+      P's notif loop recognizes the <code>HB:</code> prefix and resets
+      each named request's expiry to <code>now + _lease_extension</code>,
+      where <code>_lease_extension = kv_lease_duration * 2 // 3</code>
+      (<span class="fileref">nixl/worker.py:1847-1866</span>).
+    </li>
+    <li>
+      In <code>get_finished</code>, P walks the time-sorted lease map
+      and evicts any request whose lease has expired
+      (<span class="fileref">nixl/worker.py:1771-1788</span>). Evicted
+      requests are reported as <code>done_sending</code> with a logged
+      warning so the scheduler can free their blocks.
+    </li>
+  </ul>
+
+  <div class="diagram">
+    <div class="diagram-title">Lease + heartbeat timeline</div>
+    <div class="timeline">
+      <div class="timeline-label">P arms lease</div>
+      <div class="timeline-track">
+        <div class="timeline-seg" style="left:0%;width:96%">expiry = T + 30s</div>
+      </div>
+
+      <div class="timeline-label">D HB tick</div>
+      <div class="timeline-track">
+        <div class="timeline-seg green" style="left:18%;width:6%">HB</div>
+        <div class="timeline-seg green" style="left:36%;width:6%">HB</div>
+        <div class="timeline-seg green" style="left:54%;width:6%">HB</div>
+        <div class="timeline-seg green" style="left:72%;width:6%">HB</div>
+      </div>
+
+      <div class="timeline-label">P sees HB</div>
+      <div class="timeline-track">
+        <div class="timeline-seg amber" style="left:18%;width:6%">+20s</div>
+        <div class="timeline-seg amber" style="left:36%;width:6%">+20s</div>
+        <div class="timeline-seg amber" style="left:54%;width:6%">+20s</div>
+        <div class="timeline-seg amber" style="left:72%;width:6%">+20s</div>
+      </div>
+
+      <div class="timeline-label">D notif done</div>
+      <div class="timeline-track">
+        <div class="timeline-seg red" style="left:85%;width:6%">DONE</div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Heartbeats fire every <code>kv_lease_duration // 6</code> &mdash;
+      6&times; faster than the lease decays. P always has the lease in a
+      "fresh enough" window even under packet drops. The completion
+      notif is independent &mdash; lease is the fallback if completion
+      never lands.
+    </div>
+  </div>
+
+  <h2 id="failures">9. Failure modes</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Transfer fails (D side)</h3>
+      <p>
+        <code>check_xfer_state</code> returns neither <code>DONE</code>
+        nor <code>PROC</code>:
+        <code>_handle_failed_transfer</code>
+        (<span class="fileref">nixl/worker.py:1915-1931</span>) marks the
+        request's block ids as invalid (so the scheduler will recompute
+        instead of trusting the half-written KV), puts the request into
+        <code>_failed_recv_reqs</code>, releases the NIXL handle, and
+        records the failure.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Handshake fails (D side)</h3>
+      <p>
+        Future's <code>done_callback</code>
+        (<span class="fileref">nixl/worker.py:729-740</span>) catches the
+        exception. Subsequent requests targeting that engine never get
+        added to <code>_ready_requests</code> and are marked failed.
+        Useful when P has died &mdash; the failure surface is a
+        well-defined ZMQ connect error, not a hung worker.
+      </p>
+    </div>
+    <div class="box">
+      <h3>D died mid-load (P side)</h3>
+      <p>
+        No HBs arrive. Lease ticks down to zero. P logs a warning and
+        adds the request to <code>done_sending</code> &mdash; the blocks
+        are freed and the warning carries the count of how many
+        consumers <em>did</em> manage to read. Block reclamation is
+        eventually consistent.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Compatibility hash mismatch</h3>
+      <p>
+        On handshake, D computes a SHA-256 of
+        (model, block layout, attention backend, ...) and compares to
+        P's. Mismatch &rArr; <code>RuntimeError</code>
+        (<span class="fileref">nixl/worker.py:537-553</span>). Can be
+        disabled with <code>enforce_handshake_compat=false</code> in
+        the KV transfer config &mdash; useful in dev, dangerous in prod.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="cheat">10. Cheat sheet</h2>
+
+  <table>
+    <thead>
+      <tr><th>Question</th><th>Answer</th><th>Where</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Push or pull?</td>
+        <td>Pull: D issues NIXL <code>READ</code></td>
+        <td><span class="fileref">nixl/worker.py:2220</span></td>
+      </tr>
+      <tr>
+        <td>How do P and D find each other?</td>
+        <td>ZMQ side channel on <code>VLLM_NIXL_SIDE_CHANNEL_PORT</code></td>
+        <td><span class="fileref">nixl/scheduler.py:271, nixl/worker.py:473-590</span></td>
+      </tr>
+      <tr>
+        <td>When is memory registered?</td>
+        <td>Local: at worker init. Remote: per engine, on first request</td>
+        <td><span class="fileref">nixl/worker.py:960, 1309</span></td>
+      </tr>
+      <tr>
+        <td>Where do <code>remote_block_ids</code> come from?</td>
+        <td>P's own local blocks, packed into <code>kv_transfer_params</code> at prefill finish; ride the request to D</td>
+        <td><span class="fileref">nixl/scheduler.py:638-674</span></td>
+      </tr>
+      <tr>
+        <td>How are local &amp; remote blocks paired?</td>
+        <td>Positional per group; remote tail-trimmed to D's uncached count</td>
+        <td><span class="fileref">nixl/worker.py:2292-2316</span></td>
+      </tr>
+      <tr>
+        <td>Why does NIXL split FA vs SSM descriptors?</td>
+        <td>Different strides: FA over <code>num_blocks</code> (head-shardable), SSM over <code>logical_blocks</code> (whole state). Two sections, SSM offset by <code>num_fa_descs</code></td>
+        <td><span class="fileref">nixl/worker.py:89-150</span></td>
+      </tr>
+      <tr>
+        <td>Per-layer or all-at-once?</td>
+        <td>All-at-once. Per-layer hooks are no-ops</td>
+        <td><span class="fileref">nixl/connector.py:255-267</span></td>
+      </tr>
+      <tr>
+        <td>How does D know completion?</td>
+        <td>Polls <code>check_xfer_state</code> in <code>get_finished</code></td>
+        <td><span class="fileref">nixl/worker.py:1868</span></td>
+      </tr>
+      <tr>
+        <td>How does P know completion?</td>
+        <td>Counts notifs delivered by NIXL on D's READ completion</td>
+        <td><span class="fileref">nixl/worker.py:1792-1845</span></td>
+      </tr>
+      <tr>
+        <td>How long does P hold blocks?</td>
+        <td>30s lease, extended by D heartbeats. Default-configurable.</td>
+        <td><span class="fileref">nixl/worker.py:219, 1771-1788</span></td>
+      </tr>
+      <tr>
+        <td>How are hetero-TP layouts handled?</td>
+        <td><code>tp_mapping.compute_tp_mapping</code> computes a plan per remote engine</td>
+        <td><span class="fileref">nixl/tp_mapping.py</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Next: <a href="MOONCAKE_PIPE.html">the direct Mooncake pipe</a> for
+    the same problem solved with the opposite initiation choice (P
+    pushes), or <a href="PARALLELISM.html">PARALLELISM.html</a> for the
+    TP/PP details glossed over here.
+  </p>
+</main>
+</body>
+</html>

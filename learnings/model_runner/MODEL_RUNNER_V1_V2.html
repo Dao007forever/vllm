@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GPU Model Runner — V1 vs V2 (MRV2)</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  /* page-local helpers */
+  .v1tag, .v2tag {
+    display:inline-block; font-family:"SF Mono",Monaco,monospace; font-size:0.72em;
+    padding:1px 7px; border-radius:4px; margin-right:5px; font-weight:650; vertical-align:middle;
+  }
+  .v1tag { background: var(--red-soft); border:1px solid #e0b3ae; color: var(--red); }
+  .v2tag { background: var(--green-soft); border:1px solid #abd1bb; color: var(--green); }
+  .filetree {
+    font-family:"SF Mono",Monaco,monospace; font-size:0.8em; line-height:1.7;
+    white-space:pre; color:var(--muted);
+  }
+  .filetree b { color: var(--blue); font-weight:650; }
+  .filetree .hl { color: var(--violet); }
+  .ln { color: var(--muted); font-size:0.82em; font-family:"SF Mono",Monaco,monospace; }
+  table.cmp td:first-child { font-weight:600; color:var(--fg); width:18%; }
+  .twocol { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0; }
+  @media (max-width:820px){ .twocol{ grid-template-columns:1fr; } }
+  .pcap { font-size:0.8em; color:var(--muted); text-align:center; margin-top:6px; font-style:italic; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../">&larr; learnings</a> &nbsp;|&nbsp; model_runner &nbsp;|&nbsp;
+    source: <span class="fileref">vllm/v1/worker/gpu_model_runner.py</span> &nbsp;vs&nbsp;
+    <span class="fileref">vllm/v1/worker/gpu/model_runner.py</span>
+  </div>
+
+  <h1>The GPU Model Runner — V1 vs V2</h1>
+  <p class="subtitle">
+    Both runners turn a <code>SchedulerOutput</code> into sampled tokens for one engine step.
+    V1 is the battle-tested 7.6k-line monolith. V2 (&ldquo;MRV2&rdquo;) is the experimental rewrite
+    that breaks the same job into small, testable modules. A guided tour of <em>every step in a
+    single step</em> — and what changed.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    Both share the same <em>two-phase</em> shape: <code>execute_model()</code> runs the forward pass
+    and stashes ephemeral state, then <code>sample_tokens()</code> samples + proposes drafts. The
+    difference is <em>structure</em>, not the algorithm. V1 keeps request state, input prep,
+    attention metadata, sampling and spec-decode all inside one class. V2 splits them into
+    <code>RequestState</code>, <code>InputBatch</code>, <code>BlockTables</code>, <code>ModelState</code>,
+    <code>Sampler</code>, a <code>CudaGraphManager</code> and helper modules — and adds
+    <em>staged writes</em> + <em>UVA buffers</em> to cut host&rarr;device sync overhead.
+  </div>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#orient">Orientation — where each lives</a></li>
+      <li><a href="#shared">The shared shape: a two-phase step</a></li>
+      <li><a href="#handshake">Scheduler &harr; runner: the per-step handshake</a></li>
+      <li><a href="#v1">Model Runner V1 — the steps</a></li>
+      <li><a href="#v2">Model Runner V2 — the steps</a></li>
+      <li><a href="#layout">File layout: monolith vs modules</a></li>
+      <li><a href="#compare">Side-by-side: what changed</a></li>
+      <li><a href="#ideas">The big design shifts</a></li>
+      <li><a href="#takeaways">Takeaways</a></li>
+    </ol>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="orient">1. Orientation — where each lives</h2>
+
+  <p>
+    A <em>model runner</em> lives inside the GPU worker process. Each engine step, the scheduler
+    hands it a <code>SchedulerOutput</code> (which requests run, how many tokens each, block tables,
+    grammar bitmasks) and it returns a <code>ModelRunnerOutput</code> (sampled token ids, logprobs,
+    KV-connector output). It owns the persistent <em>input batch</em>, the KV-cache block tables,
+    CUDA-graph capture, sampling, and speculative decoding.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3><span class="v1tag">V1</span> The monolith</h3>
+      <ul>
+        <li><span class="fileref">vllm/v1/worker/gpu_model_runner.py</span></li>
+        <li><strong>~7,600 lines</strong>, one <code>GPUModelRunner</code> class</li>
+        <li>Helpers: <code>gpu_input_batch.py</code> (<code>InputBatch</code>, <code>CachedRequestState</code>),
+            <code>block_table.py</code>, and a stack of mixins (LoRA / KV-connector / EC-connector)</li>
+        <li>The default, production path</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3><span class="v2tag">V2 / MRV2</span> The rewrite</h3>
+      <ul>
+        <li><span class="fileref">vllm/v1/worker/gpu/model_runner.py</span></li>
+        <li><strong>~1,600 lines</strong> for the class; ~5,200 lines across the <code>gpu/</code> package</li>
+        <li>~18 helper modules + sub-packages (<code>sample/</code>, <code>spec_decode/</code>,
+            <code>mm/</code>, <code>model_states/</code>, <code>pool/</code>)</li>
+        <li>Marked <em>experimental, under active development</em> in its <code>README.md</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Naming note</strong>
+    &ldquo;V1&rdquo; here means the <em>classic</em> runner that ships under <code>vllm/v1/</code> — not
+    the old V0 engine. &ldquo;V2&rdquo; / &ldquo;MRV2&rdquo; is the newer runner inside the
+    <code>vllm/v1/worker/gpu/</code> sub-package. Both target the same V1 engine; they are two
+    <em>implementations</em> of the same role. Commits tag it <code>[MRV2]</code> /
+    <code>[Model Runner V2]</code>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="shared">2. The shared shape: a two-phase step</h2>
+
+  <p>
+    Before diving into either, internalize the shape they <em>both</em> use. A single engine step is
+    split into two method calls. <code>execute_model()</code> does everything up to and including the
+    model forward and logits, then <strong>returns <code>None</code></strong> after stashing an
+    <code>ExecuteModelState</code> tuple on the runner. The worker then calls
+    <code>sample_tokens()</code>, which unpacks that state and does sampling, draft proposal and
+    bookkeeping.
+  </p>
+
+  <div class="flow">
+    <div class="flow-step b"><div class="num">PHASE 1</div><strong>execute_model()</strong><br>update state &rarr; prep inputs &rarr; attn metadata &rarr; forward &rarr; logits</div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step v"><div class="num">HANDOFF</div><strong>ExecuteModelState</strong><br>logits, hidden states, spec/attn metadata stashed on <code>self</code></div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step g"><div class="num">PHASE 2</div><strong>sample_tokens()</strong><br>grammar bitmask &rarr; sample &rarr; propose drafts &rarr; async D2H copy</div>
+  </div>
+
+  <div class="callout">
+    <strong>Why split it?</strong>
+    The grammar/structured-output bitmask for a request often isn't ready when the forward starts —
+    it's computed on the CPU in parallel. Splitting lets the GPU run the (expensive) forward while the
+    CPU finishes the bitmask, then <code>sample_tokens()</code> applies it just-in-time. The split
+    also creates a clean seam for <em>async scheduling</em>: the sampled-token D2H copy is launched on
+    a side stream and the result is collected later, so the next step's CPU prep overlaps it.
+  </div>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Handoff struct — V1</h3>
+      <p class="ln">gpu_model_runner.py:403</p>
+      <p>Big <code>NamedTuple</code> carrying: <code>scheduler_output</code>, <code>logits</code>,
+      <code>spec_decode_metadata</code>, <code>spec_decode_common_attn_metadata</code>,
+      <code>hidden_states</code>, <code>sample_hidden_states</code>, <code>aux_hidden_states</code>,
+      <code>ec_connector_output</code>, <code>cudagraph_stats</code>, <code>slot_mappings</code>.</p>
+    </div>
+    <div class="box">
+      <h3>Handoff struct — V2</h3>
+      <p class="ln">gpu/model_runner.py:1572</p>
+      <p>Leaner <code>NamedTuple</code>: <code>input_batch</code>, <code>attn_metadata</code>,
+      <code>slot_mappings_by_layer</code>, <code>hidden_states</code>, <code>aux_hidden_states</code>,
+      <code>finished_req_ids</code>. Much of what V1 stashes lives <em>inside</em> the
+      <code>input_batch</code> snapshot in V2.</p>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="handshake">3. Scheduler &harr; Model Runner: the per-step handshake</h2>
+
+  <p>
+    The runner never calls the scheduler, and the scheduler never calls the runner. They live in
+    different places — the <code>Scheduler</code> runs in the <strong>EngineCore</strong> process; each
+    <code>GPUModelRunner</code> runs inside a <strong>worker</strong>. <code>EngineCore</code> is the
+    broker: it drives one <em>engine step</em> by calling the scheduler, fanning the result out to every
+    worker's runner through the <code>model_executor</code>, then feeding the runner's output back to the
+    scheduler. Two plain data structures cross that boundary each step.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">One engine step — EngineCore.step() · core.py:479</div>
+    <div class="flow">
+      <div class="flow-step b"><div class="num">scheduler</div><strong>schedule()</strong><br>build the token plan &rarr; <code>SchedulerOutput</code></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v"><div class="num">executor</div><strong>execute_model()</strong><br>forward on GPU (non-blocking)</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a"><div class="num">scheduler (CPU, parallel)</div><strong>get_grammar_bitmask()</strong><br>&rarr; <code>GrammarOutput</code></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g"><div class="num">executor</div><strong>sample_tokens()</strong><br>&rarr; <code>ModelRunnerOutput</code></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><div class="num">scheduler</div><strong>update_from_output()</strong><br>append tokens, check stop &rarr; <code>EngineCoreOutputs</code></div>
+    </div>
+    <div class="diagram-caption">
+      The grammar bitmask is built on the host <em>while</em> the GPU runs the forward — which is exactly
+      why the runner splits <code>execute_model()</code> / <code>sample_tokens()</code> (&sect;2). A final
+      <code>post_step()</code> feeds the drafter's proposals back via <code>update_draft_token_ids()</code>.
+    </div>
+  </div>
+
+  <div class="trace">
+<b>EngineCore.step()</b> &nbsp;<span style="color:var(--muted)">core.py:479</span><br>
+&nbsp;<span class="step">1</span> scheduler.<b>schedule</b>(throttle) &nbsp;<span style="color:var(--muted)">→ SchedulerOutput &nbsp;(scheduler.py:387)</span><br>
+&nbsp;<span class="step">2</span> model_executor.<b>execute_model</b>(sched_out, non_block=True) &nbsp;<span style="color:var(--muted)">→ Future &nbsp;(forward runs on the worker's runner)</span><br>
+&nbsp;<span class="step">3</span> scheduler.<b>get_grammar_bitmask</b>(sched_out) &nbsp;<span style="color:var(--muted)">→ GrammarOutput &nbsp;(host, overlaps the forward)</span><br>
+&nbsp;<span class="step">4</span> model_output = future.result() ; <b>if None</b> → model_executor.<b>sample_tokens</b>(grammar_out)<br>
+&nbsp;<span class="step">5</span> scheduler.<b>update_from_output</b>(sched_out, model_output) &nbsp;<span style="color:var(--muted)">→ EngineCoreOutputs &nbsp;(scheduler.py:1463)</span><br>
+&nbsp;<span class="step">6</span> <b>post_step</b>: model_executor.take_draft_token_ids() → scheduler.<b>update_draft_token_ids</b>() &nbsp;<span style="color:var(--muted)">(core.py:510)</span>
+  </div>
+
+  <h3>What crosses the boundary — downstream (scheduler &rarr; runner)</h3>
+  <p>
+    <code>schedule()</code> packs everything the runner needs into one <code>SchedulerOutput</code>
+    (built at <span class="ln">scheduler.py:1057</span>). The runner's <code>_update_states()</code> (V1) /
+    <code>add_requests</code>+<code>update_requests</code> (V2) consume it field by field:
+  </p>
+
+  <table class="cmp">
+    <tr><th>SchedulerOutput field</th><th>What the runner does with it</th></tr>
+    <tr><td><code>scheduled_new_reqs</code><br><span class="ln">NewRequestData</span></td>
+        <td>Register a new request: prompt token ids, block ids, sampling params, generator. <span class="v2tag">V2</span> also ships the full <code>_all_token_ids</code> here.</td></tr>
+    <tr><td><code>scheduled_cached_reqs</code><br><span class="ln">CachedRequestData</span></td>
+        <td>Advance running requests: append <code>new_block_ids</code>, set <code>num_computed_tokens</code> / <code>num_output_tokens</code>, and (PP-without-async only) <code>new_token_ids</code>.</td></tr>
+    <tr><td><code>num_scheduled_tokens</code> / <code>total_…</code></td>
+        <td>How many token positions to run per request &rarr; drives input prep, the batch size, and CUDA-graph padding.</td></tr>
+    <tr><td><code>scheduled_spec_decode_tokens</code></td>
+        <td>Which draft tokens to <em>verify</em> this step — the input to rejection sampling.</td></tr>
+    <tr><td><code>scheduled_encoder_inputs</code> / <code>free_encoder_mm_hashes</code></td>
+        <td>Run the multimodal encoder for these items / free encoder-cache entries that are done.</td></tr>
+    <tr><td><code>preempted_req_ids</code></td>
+        <td>Drop these from the persistent input batch (their blocks were reclaimed).</td></tr>
+    <tr><td><code>finished_req_ids</code></td>
+        <td>Free the cached request state on the worker side.</td></tr>
+    <tr><td><code>num_common_prefix_blocks</code></td>
+        <td>Enables cascade-attention over the shared prefix.</td></tr>
+    <tr><td><code>new_block_ids_to_zero</code></td>
+        <td>Zero freshly-allocated KV blocks before use (models with <code>needs_kv_cache_zeroing</code>, e.g. Mamba).</td></tr>
+    <tr><td><code>num_spec_tokens_to_schedule</code></td>
+        <td>Dynamic-SD <em>K</em> for this step — how many drafts the drafter should propose.</td></tr>
+    <tr><td><code>kv_connector_metadata</code> / <code>ec_connector_metadata</code></td>
+        <td>Opaque load/save plans for KV-transfer (P/D, offload) and encoder-cache transfer.</td></tr>
+    <tr><td><code>GrammarOutput</code><br><span class="ln">separate, via get_grammar_bitmask</span></td>
+        <td>The structured-output bitmask, applied to logits inside <code>sample_tokens()</code>.</td></tr>
+  </table>
+
+  <h3>What crosses the boundary — upstream (runner &rarr; scheduler)</h3>
+  <p>
+    The runner returns one <code>ModelRunnerOutput</code>; <code>update_from_output()</code> walks it
+    (<span class="ln">scheduler.py:1463</span>) using <code>req_id_to_index</code> to map batch rows back to
+    requests:
+  </p>
+
+  <table class="cmp">
+    <tr><th>ModelRunnerOutput field</th><th>What the scheduler does with it</th></tr>
+    <tr><td><code>sampled_token_ids</code> + <code>req_ids</code> / <code>req_id_to_index</code></td>
+        <td>Append output tokens to each request, run <code>check_stop()</code>, advance the grammar FSM.</td></tr>
+    <tr><td><code>logprobs</code> / <code>prompt_logprobs_dict</code></td>
+        <td>Slice per request and attach to the <code>EngineCoreOutput</code>.</td></tr>
+    <tr><td><code>pooler_output</code></td>
+        <td>For pooling/embedding models — output is the pooled vector, request stops immediately.</td></tr>
+    <tr><td><code>num_nans_in_logits</code></td>
+        <td>Per-request health signal recorded on the request.</td></tr>
+    <tr><td><code>kv_connector_output</code></td>
+        <td>Finished KV transfers + <code>invalid_block_ids</code> (failed loads &rarr; trigger recompute).</td></tr>
+    <tr><td><code>cudagraph_stats</code></td>
+        <td>Padding / dispatch metrics folded into <code>SchedulerStats</code>.</td></tr>
+    <tr><td><code>routed_experts</code></td>
+        <td>MoE routing capture, persisted into the scheduler-side slot buffer.</td></tr>
+    <tr><td><code>DraftTokenIds</code><br><span class="ln">separate, via take_draft_token_ids</span></td>
+        <td><code>update_draft_token_ids()</code> attaches next-step drafts to each request (validated against the grammar).</td></tr>
+  </table>
+
+  <div class="callout">
+    <strong>The contract's load-bearing trick: optimistic advance, then reconcile.</strong>
+    <code>schedule()</code> pre-bumps <code>request.num_computed_tokens</code> by the scheduled count in
+    <code>_update_after_schedule()</code> <em>before the forward even runs</em>
+    (<span class="ln">scheduler.py:1141</span>) — that's what lets it schedule the next chunk
+    immediately and stay one step ahead. When the runner's output comes back,
+    <code>update_from_output()</code> <em>corrects</em> it: for spec-decode it rolls
+    <code>num_computed_tokens</code> (and <code>num_output_placeholders</code>) back by the number of
+    rejected draft tokens (<span class="ln">scheduler.py:1562&ndash;1567</span>). The scheduler plans
+    optimistically; the runner reports reality; the scheduler trues up.
+  </div>
+
+  <h3>Where the contract bends for V1 vs V2</h3>
+  <p>
+    <code>schedule()</code> itself branches on <code>use_v2_model_runner</code> when it builds the output —
+    so the two runners receive subtly different payloads:
+  </p>
+  <div class="grid">
+    <div class="box">
+      <h3><span class="v1tag">V1</span> payload shape</h3>
+      <ul>
+        <li>Resumed (preempted-then-restarted) requests travel in a <em>separate</em>
+            <code>scheduled_resumed_reqs</code> list. <span class="ln">:1023</span></li>
+        <li><code>NewRequestData</code> carries block ids but <em>not</em> the full token history.</li>
+        <li>Under PP-without-async, <code>CachedRequestData.new_token_ids</code> is populated so the
+            last-stage worker sees the sampled tokens. <span class="ln">:1242</span></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3><span class="v2tag">V2</span> payload shape</h3>
+      <ul>
+        <li>Resumed requests are <em>merged into</em> <code>scheduled_new_reqs</code>; the resumed list is
+            emptied. <span class="ln">:1012&ndash;1014</span></li>
+        <li><code>NewRequestData</code> additionally ships <code>req._all_token_ids</code> so
+            <code>RequestState</code> can seed its UVA token buffer. <span class="ln">:1015&ndash;1022</span></li>
+        <li>Sampled tokens flow worker-to-worker via the GPU broadcast path
+            (<code>input_batch.prev_sampled_token_ids</code>), so <code>new_token_ids</code> is omitted
+            except in PP-without-async. <span class="ln">:1239&ndash;1242</span></li>
+        <li>V2+PP+async adds a decode-throttle cadence: a request can't decode again until
+            <code>current_step &ge; next_decode_eligible_step</code>, matching the worker's sampled-token
+            broadcast ring. <span class="ln">:450, :277</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The async / pipelined variant: <code>step_with_batch_queue()</code> <span class="ln">core.py:519</span></strong>
+    With async scheduling or PP, EngineCore keeps several batches in flight. It schedules and launches the
+    next forward <em>before</em> the previous step's output is processed. Sampling for a step can be
+    <em>deferred</em> when its grammar bitmask depends on tokens still being computed
+    (<code>pending_structured_output_tokens</code>); in that case the drafter's tokens are validated via
+    <code>update_draft_token_ids_in_output()</code> (invalid drafts padded with <code>-1</code>) <em>before</em>
+    the deferred bitmask is computed. <span class="ln">core.py:612&ndash;629</span> This is why the runner copies
+    sampled tokens out on a side stream (V2's <code>AsyncOutput</code>) — the scheduler may not read them until
+    a later tick.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="v1">4. Model Runner V1 — the steps</h2>
+
+  <h3>Phase 1 &mdash; <code>execute_model()</code> <span class="ln">gpu_model_runner.py:4045</span></h3>
+
+  <ol class="steps">
+    <li><strong>Guard the two-phase invariant.</strong> Assert <code>execute_model_state is None</code>
+        (the previous step's <code>sample_tokens()</code> must have run). <span class="ln">:4050</span></li>
+    <li><strong><code>_update_states(scheduler_output)</code></strong> — reconcile the persistent batch with
+        the scheduler: drop finished/preempted requests, add new ones, advance
+        <code>num_computed_tokens</code> and block ids, then <code>condense()</code> + reorder +
+        <code>refresh_metadata()</code>. Returns an optional deferred-correction closure for async
+        spec-decode. <span class="ln">:1128 &middot; called at :4087</span></li>
+    <li><strong>Early exits.</strong> If no tokens were scheduled (or only a DP dummy run is needed),
+        handle that and bail. <span class="ln">:4097</span></li>
+    <li><strong><code>_prepare_inputs()</code></strong> — build the GPU input tensors: gather token ids,
+        compute positions (incl. M-RoPE / XD-RoPE), <code>query_start_loc</code>, <code>seq_lens</code>,
+        the discard mask, slot mappings per KV-cache group, and the <code>logits_indices</code> +
+        <code>spec_decode_metadata</code>. <span class="ln">:1890 &middot; called at :4129</span></li>
+    <li><strong><code>_determine_batch_execution_and_padding()</code></strong> — decide CUDA-graph mode
+        (<code>FULL</code> / <code>PIECEWISE</code> / <code>NONE</code>), pad the token count to a captured
+        size, and coordinate that decision across DP ranks. <span class="ln">:3811 &middot; called at :4150</span></li>
+    <li><strong><code>_get_slot_mappings()</code> + <code>_build_attention_metadata()</code></strong> — turn
+        block tables &amp; seq lens into per-layer attention metadata for each attention group.
+        <span class="ln">:4245, :4256</span></li>
+    <li><strong><code>_preprocess()</code></strong> — run the multimodal encoder if needed, embed input ids
+        (or use prompt embeds), and assemble <code>positions</code> + <code>model_kwargs</code>.
+        <span class="ln">:3427 &middot; called at :4279</span></li>
+    <li><strong><code>_model_forward()</code></strong> — call the model inside
+        <code>set_forward_context(...)</code>, dispatching to the captured CUDA graph or running eager.
+        Returns hidden states (and optional aux hidden states). <span class="ln">:3758 &middot; called at :4321</span></li>
+    <li><strong>Compute logits.</strong> Slice <code>sample_hidden_states</code> at
+        <code>logits_indices</code> and call <code>model.compute_logits()</code>; broadcast across PP if
+        needed. <span class="ln">:4329</span></li>
+    <li><strong>Stash &amp; return <code>None</code>.</strong> Pack everything into
+        <code>ExecuteModelState</code> on <code>self</code>, apply any deferred corrections, and return.
+        <span class="ln">:4387</span></li>
+  </ol>
+
+  <h3>Phase 2 &mdash; <code>sample_tokens()</code> <span class="ln">gpu_model_runner.py:4424</span></h3>
+
+  <ol class="steps">
+    <li><strong>Unpack <code>ExecuteModelState</code></strong> and clear it (re-arming the invariant).</li>
+    <li><strong>Apply the grammar bitmask</strong> in-place on logits via
+        <code>apply_grammar_bitmask()</code> for structured-output requests. <span class="ln">:4454</span></li>
+    <li><strong><code>_sample()</code></strong> — call <code>self.sampler(...)</code>, or
+        <code>self.rejection_sampler(...)</code> when spec-decode draft tokens are present.
+        <span class="ln">:3571</span></li>
+    <li><strong><code>_update_states_after_model_execute()</code></strong> — for hybrid (Mamba) models,
+        count accepted draft tokens and shift state. <span class="ln">:1498</span></li>
+    <li><strong><code>propose_draft_token_ids()</code></strong> — run the drafter (ngram / EAGLE / Medusa /
+        draft-model …) on the target hidden states to produce next-step drafts. <span class="ln">:4853</span></li>
+    <li><strong><code>_bookkeeping_sync()</code></strong> — write sampled tokens back into the persistent
+        batch &amp; <code>self.requests</code>, gather logprobs, count NaNs.</li>
+    <li><strong>Return</strong> a <code>ModelRunnerOutput</code> (or an async wrapper that resolves after
+        the side-stream D2H copy completes).</li>
+  </ol>
+
+  <div class="trace">
+<b>execute_model</b>(scheduler_output)<br>
+&nbsp;<span class="step">1</span> _update_states &nbsp;<span style="color:var(--muted)">→ self.requests / self.input_batch reconciled</span><br>
+&nbsp;<span class="step">2</span> _prepare_inputs &nbsp;<span style="color:var(--muted)">→ input_ids, positions, slot_mappings, logits_indices</span><br>
+&nbsp;<span class="step">3</span> _determine_batch_execution_and_padding &nbsp;<span style="color:var(--muted)">→ cudagraph_mode, batch_desc</span><br>
+&nbsp;<span class="step">4</span> _build_attention_metadata &nbsp;<span style="color:var(--muted)">→ per-layer attn metadata</span><br>
+&nbsp;<span class="step">5</span> _preprocess &nbsp;<span style="color:var(--muted)">→ embeds, mm encoder</span><br>
+&nbsp;<span class="step">6</span> _model_forward &nbsp;<span style="color:var(--muted)">→ hidden_states</span><br>
+&nbsp;<span class="step">7</span> compute_logits &nbsp;<span style="color:var(--muted)">→ logits</span><br>
+&nbsp;<span class="step">8</span> self.execute_model_state = ExecuteModelState(...) ; <b>return None</b><br>
+<br>
+<b>sample_tokens</b>(grammar_output)<br>
+&nbsp;<span class="step">1</span> apply_grammar_bitmask<br>
+&nbsp;<span class="step">2</span> _sample &nbsp;<span style="color:var(--muted)">→ sampler / rejection_sampler</span><br>
+&nbsp;<span class="step">3</span> propose_draft_token_ids<br>
+&nbsp;<span class="step">4</span> _bookkeeping_sync &nbsp;<span style="color:var(--muted)">→ write back, logprobs</span> ; <b>return ModelRunnerOutput</b>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>What the V1 class holds</strong>
+    <code>self.requests: dict[str, CachedRequestState]</code> (every active request),
+    <code>self.input_batch: InputBatch</code> (the persistent GPU batch + block table + sampling
+    metadata), a fleet of pre-allocated CPU+GPU buffers (<code>self.input_ids</code>,
+    <code>self.positions</code>, <code>self.query_start_loc</code>, <code>self.seq_lens</code>,
+    <code>self.num_computed_tokens</code> …), the <code>sampler</code> / <code>rejection_sampler</code>,
+    the <code>drafter</code>, and <code>self.attn_groups</code>. State and behavior live together.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="v2">5. Model Runner V2 — the steps</h2>
+
+  <p>
+    Same two phases — but the monolithic <code>_update_states</code> / <code>_prepare_inputs</code> are
+    decomposed into named methods that delegate to dedicated helper objects
+    (<code>self.req_states</code>, <code>self.block_tables</code>, <code>self.model_state</code>,
+    <code>self.input_buffers</code>, <code>self.cudagraph_manager</code>, <code>self.pp_handler</code>).
+  </p>
+
+  <h3>Phase 1 &mdash; <code>execute_model()</code> <span class="ln">gpu/model_runner.py:1102</span></h3>
+
+  <ol class="steps">
+    <li><strong>Request lifecycle, now four explicit calls.</strong> Where V1 has one
+        <code>_update_states</code>, V2 calls them in sequence:
+        <code>update_pp_decode_requests()</code> (collect sampled outputs broadcast from the last PP
+        rank pp_size steps ago) &middot; <code>finish_requests()</code> (drop finished/preempted) &middot;
+        <code>free_states()</code> (release encoder MM cache) &middot; <code>add_requests()</code> (register
+        new requests with <code>req_states</code> / <code>model_state</code> / <code>block_tables</code> /
+        sampler / lora) &middot; <code>update_requests()</code> (advance computed tokens, append blocks).
+        <span class="ln">:1112&ndash;1116</span></li>
+    <li><strong><code>block_tables.apply_staged_writes()</code></strong> — flush all the buffered block-table
+        edits to GPU in one shot (a Triton fused-write kernel for the multi-group case).
+        <span class="ln">:1117</span></li>
+    <li><strong>Early exit</strong> if <code>total_num_scheduled_tokens == 0</code> via
+        <code>kv_connector.no_forward()</code>. <span class="ln">:1118</span></li>
+    <li><strong><code>dispatch_cg_and_sync_dp()</code></strong> — compute the
+        <code>BatchExecutionDescriptor</code> (cg mode, padded tokens, uniform-token-count, active
+        LoRAs) <em>and</em> all-reduce it across DP ranks so every rank picks a compatible graph and
+        equal padding. Returns <code>batch_desc</code> + <code>num_tokens_across_dp</code>.
+        <span class="ln">:1143</span></li>
+    <li><strong><code>prepare_inputs(scheduler_output, batch_desc)</code></strong> — build the per-step
+        <code>InputBatch</code> snapshot (token ids, positions, <code>idx_mapping</code>,
+        <code>query_start_loc</code>, <code>logits_indices</code>, draft-token metadata). For dummy/DP/profile
+        runs it's <code>InputBatch.make_dummy()</code> instead. <span class="ln">:845 &middot; called at :1162</span></li>
+    <li><strong><code>prepare_attn(input_batch)</code></strong> — gather block tables and compute slot
+        mappings; then <code>build_slot_mappings_by_layer()</code> fans them into a per-layer dict and
+        <code>model_state.prepare_attn(...)</code> invokes each attention group's metadata builder.
+        <span class="ln">:1011, :1194, :1198</span></li>
+    <li><strong>Multimodal embeddings.</strong> On the first PP rank, <code>model_state.get_mm_embeddings()</code>
+        runs the encoder and returns <code>inputs_embeds</code> (called even on dummy runs so the compiled
+        graph sees a consistent signature). <span class="ln">:1207</span></li>
+    <li><strong>Build <code>model_inputs</code> + PP plumbing.</strong> Assemble the forward dict; for
+        non-first PP ranks, zero the token inputs and copy received
+        <code>IntermediateTensors</code> into the persistent buffer. <span class="ln">:1229&ndash;1254</span></li>
+    <li><strong>Forward dispatch — three branches.</strong>
+        <code>cudagraph_manager.run_fullgraph(batch_desc)</code> (replay a captured full graph) /
+        <code>run_pw_graph()</code> (piecewise / breakable graph) / eager <code>model(**model_inputs)</code>
+        inside <code>set_forward_context()</code>. <span class="ln">:1257&ndash;1293</span></li>
+    <li><strong>Extract outputs &amp; stash.</strong> Last PP rank pulls <code>hidden_states</code> (+ aux for
+        spec-decode); others package <code>IntermediateTensors</code>. Save
+        <code>ExecuteModelState</code> and return <code>None</code> (or the intermediates for the next
+        rank). <span class="ln">:1295&ndash;1323</span></li>
+  </ol>
+
+  <h3>Phase 2 &mdash; <code>sample_tokens()</code> <span class="ln">gpu/model_runner.py:1327</span></h3>
+
+  <ol class="steps">
+    <li><strong>Unpack <code>ExecuteModelState</code></strong>; clear it. <span class="ln">:1330</span></li>
+    <li><strong>Non-last PP ranks short-circuit:</strong> receive sampled tokens via
+        <code>pp_handler.receive()</code>, run <code>postprocess_num_computed_tokens()</code>, and return
+        without sampling. <span class="ln">:1342</span></li>
+    <li><strong><code>sample()</code></strong> — the modular <code>Sampler</code> returns
+        <code>(SamplerOutput, num_sampled, num_rejected)</code>; rejection sampling is selected when draft
+        tokens exist. <span class="ln">:1361</span></li>
+    <li><strong>PP broadcast.</strong> If PP is on, broadcast the sampled tokens to the other ranks on a
+        side stream via <code>pp_handler.broadcast()</code>. <span class="ln">:1365</span></li>
+    <li><strong>Prompt logprobs</strong> via <code>prompt_logprobs_worker</code>, then build the
+        <code>ModelRunnerOutput</code> shell. <span class="ln">:1374&ndash;1392</span></li>
+    <li><strong>Create <code>AsyncOutput</code></strong> — launch the sampled-token D2H copy on a dedicated
+        <code>copy_stream</code> and record an event; the scheduler resolves it later. <span class="ln">:1394</span></li>
+    <li><strong><code>postprocess_sampled()</code></strong> — update <code>req_states</code>
+        (<code>num_computed_tokens</code>, <code>last_sampled_tokens</code>, <code>all_token_ids</code>).
+        <span class="ln">:1422</span></li>
+    <li><strong><code>speculator.propose()</code></strong> — generate next-step drafts and store them in
+        <code>req_states.draft_tokens</code>; a <code>DraftTokensHandler</code> async-copies them out for
+        grammar validation. <span class="ln">:1430</span></li>
+    <li><strong><code>kv_connector.post_forward()</code></strong>, then <strong>return the <code>AsyncOutput</code></strong>.
+        <span class="ln">:1465&ndash;1468</span></li>
+  </ol>
+
+  <div class="trace">
+<b>execute_model</b>(scheduler_output)<br>
+&nbsp;<span class="step">1</span> update_pp_decode_requests / finish_requests / free_states / add_requests / update_requests<br>
+&nbsp;<span class="step">2</span> block_tables.apply_staged_writes &nbsp;<span style="color:var(--muted)">→ one fused H2D write</span><br>
+&nbsp;<span class="step">3</span> dispatch_cg_and_sync_dp &nbsp;<span style="color:var(--muted)">→ batch_desc (synced across DP)</span><br>
+&nbsp;<span class="step">4</span> prepare_inputs &nbsp;<span style="color:var(--muted)">→ InputBatch snapshot</span><br>
+&nbsp;<span class="step">5</span> prepare_attn → build_slot_mappings_by_layer → model_state.prepare_attn<br>
+&nbsp;<span class="step">6</span> model_state.get_mm_embeddings &nbsp;<span style="color:var(--muted)">(first PP rank)</span><br>
+&nbsp;<span class="step">7</span> run_fullgraph / run_pw_graph / eager &nbsp;<span style="color:var(--muted)">→ hidden_states</span><br>
+&nbsp;<span class="step">8</span> self.execute_model_state = ExecuteModelState(...) ; <b>return None</b><br>
+<br>
+<b>sample_tokens</b>()<br>
+&nbsp;<span class="step">1</span> sample &nbsp;<span style="color:var(--muted)">→ Sampler / rejection</span><br>
+&nbsp;<span class="step">2</span> AsyncOutput &nbsp;<span style="color:var(--muted)">→ side-stream D2H copy + event</span><br>
+&nbsp;<span class="step">3</span> postprocess_sampled &nbsp;<span style="color:var(--muted)">→ req_states updated</span><br>
+&nbsp;<span class="step">4</span> speculator.propose &nbsp;<span style="color:var(--muted)">→ req_states.draft_tokens</span> ; <b>return AsyncOutput</b>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>What the V2 class holds</strong>
+    Mostly <em>references to helpers</em>: <code>self.req_states</code> (RequestState),
+    <code>self.input_buffers</code> (persistent GPU buffers), <code>self.block_tables</code>,
+    <code>self.model_state</code> (model-specific behavior), <code>self.sampler</code>,
+    <code>self.cudagraph_manager</code>, <code>self.pp_handler</code>, <code>self.lora_state</code>,
+    <code>self.kv_connector</code>. The class orchestrates; the helpers own the data and the work.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="layout">6. File layout: monolith vs modules</h2>
+
+  <p>The clearest way to <em>see</em> the difference is the directory tree.</p>
+
+  <div class="twocol">
+    <div class="box">
+      <h3><span class="v1tag">V1</span></h3>
+<div class="filetree">v1/worker/
+├─ <b>gpu_model_runner.py</b>   <span class="hl">~7600 ln</span>
+│    GPUModelRunner            (one class)
+│    + ExecuteModelState
+├─ gpu_input_batch.py
+│    InputBatch
+│    CachedRequestState
+├─ block_table.py
+│    BlockTable / MultiGroup…
+├─ lora_model_runner_mixin.py
+├─ kv_connector_model_runner_mixin.py
+└─ ec_connector_model_runner_mixin.py</div>
+      <p class="pcap">Behavior centralized; helpers are data containers + mixins folded into one class.</p>
+    </div>
+    <div class="box">
+      <h3><span class="v2tag">V2</span></h3>
+<div class="filetree">v1/worker/gpu/
+├─ <b>model_runner.py</b>       <span class="hl">~1600 ln</span>
+├─ states.py          RequestState
+├─ input_batch.py     InputBatch
+├─ block_table.py     BlockTables
+├─ buffer_utils.py    Staged/UVA buffers
+├─ attn_utils.py      attn metadata
+├─ cudagraph_utils.py CudaGraphManager
+├─ async_utils.py     AsyncOutput
+├─ pp_utils.py        PPHandler
+├─ dp_utils.py        DP sync
+├─ warmup.py · lora_utils.py · …
+├─ <b>sample/</b>          Sampler + states
+├─ <b>spec_decode/</b>     speculators
+├─ <b>model_states/</b>    per-model behavior
+├─ <b>mm/</b> · <b>pool/</b></div>
+      <p class="pcap">One concern per module; the runner wires them together.</p>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="compare">7. Side-by-side: what changed</h2>
+
+  <table class="cmp">
+    <tr><th>Concern</th><th><span class="v1tag">V1</span> monolith</th><th><span class="v2tag">V2</span> modular</th></tr>
+    <tr>
+      <td>Request state</td>
+      <td><code>self.requests: dict[str, CachedRequestState]</code> inside the runner.</td>
+      <td><code>RequestState</code> object (<code>states.py</code>): persistent, slot-indexed, stage-able.</td>
+    </tr>
+    <tr>
+      <td>Step inputs</td>
+      <td>Built imperatively into pre-allocated <code>self.*</code> buffers by <code>_prepare_inputs()</code>.</td>
+      <td>An <code>InputBatch</code> dataclass <em>snapshot</em> returned by <code>prepare_inputs()</code> each step.</td>
+    </tr>
+    <tr>
+      <td>Lifecycle update</td>
+      <td>One big <code>_update_states()</code> (~340 lines).</td>
+      <td>Split: <code>finish_requests</code> / <code>free_states</code> / <code>add_requests</code> / <code>update_requests</code>.</td>
+    </tr>
+    <tr>
+      <td>Block tables</td>
+      <td>Direct CPU&rarr;GPU updates via <code>block_table.py</code>.</td>
+      <td><code>BlockTables</code> with <em>staged writes</em> flushed in one fused Triton kernel.</td>
+    </tr>
+    <tr>
+      <td>Buffers</td>
+      <td>Plain pinned CPU + GPU tensor pairs.</td>
+      <td><code>StagedWriteTensor</code> / <code>UvaBackedTensor</code> / round-robin UVA pools (<code>buffer_utils.py</code>).</td>
+    </tr>
+    <tr>
+      <td>Attention metadata</td>
+      <td>Built in-runner over <code>self.attn_groups</code>.</td>
+      <td><code>attn_utils.py</code> + per-group builders; <code>build_slot_mappings_by_layer()</code> fans out per layer.</td>
+    </tr>
+    <tr>
+      <td>Model-specific logic</td>
+      <td><code>if</code>-branches in the runner (Mamba, Whisper, M-RoPE …).</td>
+      <td><code>ModelState</code> polymorphism: <code>Default</code> / <code>Whisper</code> / <code>MambaHybrid</code> in <code>model_states/</code>.</td>
+    </tr>
+    <tr>
+      <td>Sampling</td>
+      <td><code>_sample()</code> calling <code>self.sampler</code>; sampling state in the runner.</td>
+      <td><code>sample/</code> package: <code>Sampler</code> + pluggable <code>SamplingStates</code>, penalties, bias, bad-words.</td>
+    </tr>
+    <tr>
+      <td>Spec-decode</td>
+      <td><code>propose_draft_token_ids()</code> with per-method branches in the runner.</td>
+      <td><code>spec_decode/</code> package: <code>init_speculator()</code> factory, <code>BaseSpeculator</code> subclasses.</td>
+    </tr>
+    <tr>
+      <td>CUDA graphs</td>
+      <td><code>cudagraph_dispatcher.dispatch()</code> + capture inline.</td>
+      <td><code>CudaGraphManager</code> keyed by <code>BatchExecutionDescriptor</code>; <code>run_fullgraph</code>/<code>run_pw_graph</code>.</td>
+    </tr>
+    <tr>
+      <td>DP coordination</td>
+      <td>Inline <code>coordinate_batch_across_dp()</code> in the padding decision.</td>
+      <td>Dedicated <code>dispatch_cg_and_sync_dp()</code> (<code>dp_utils.py</code>) — one call does dispatch + all-reduce.</td>
+    </tr>
+    <tr>
+      <td>Pipeline parallel</td>
+      <td>Direct broadcast handled in-runner.</td>
+      <td><code>PPHandler</code> (<code>pp_utils.py</code>): deferred queue + sibling NCCL communicator, consumed pp_size steps later.</td>
+    </tr>
+    <tr>
+      <td>Async output</td>
+      <td>D2H copy + async wrapper handled within bookkeeping.</td>
+      <td><code>AsyncOutput</code> object: own <code>copy_stream</code> + event, overlaps copy with draft proposal.</td>
+    </tr>
+    <tr>
+      <td>Handoff tuple</td>
+      <td>10-field <code>ExecuteModelState</code>.</td>
+      <td>6-field <code>ExecuteModelState</code> (rest lives in the <code>InputBatch</code> snapshot).</td>
+    </tr>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="ideas">8. The big design shifts</h2>
+
+  <h3>① From one class to a graph of collaborators</h3>
+  <p>
+    V1's power and pain are the same thing: everything is reachable from <code>self</code>. That makes
+    cross-cutting features (async spec-decode, M-RoPE, hybrid Mamba state) easy to bolt on but hard to
+    test in isolation, and the file grew to ~7.6k lines. V2 inverts this — the runner becomes a thin
+    orchestrator that <em>delegates</em> to <code>RequestState</code>, <code>BlockTables</code>,
+    <code>ModelState</code>, <code>Sampler</code>, <code>CudaGraphManager</code>, and friends. Each is
+    independently unit-testable.
+  </p>
+
+  <h3>② Staged writes + UVA buffers to hide H2D latency</h3>
+  <p>
+    Every step, request metadata (token ids, computed counts, block ids) must reach the GPU. V1 copies
+    eagerly. V2's <code>buffer_utils.py</code> introduces <strong>staged writes</strong>: CPU-side edits
+    accumulate in lists and are flushed as a <em>single</em> Triton kernel
+    (<code>apply_staged_writes()</code>), and large rarely-read tensors are <strong>UVA-backed</strong>
+    (unified memory, source-of-truth on CPU) to save VRAM. A round-robin UVA buffer pool lets multiple
+    in-flight steps copy without stalling each other.
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <strong><span class="v1tag">V1</span> eager writes</strong>
+      <p class="ln" style="margin-top:6px">edit → copy_to_gpu → edit → copy_to_gpu …</p>
+      <p>Many small H2D transfers per step.</p>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <strong><span class="v2tag">V2</span> staged writes</strong>
+      <p class="ln" style="margin-top:6px">stage_write × N → apply_staged_writes (1 kernel)</p>
+      <p>One fused transfer; fewer syncs.</p>
+    </div>
+  </div>
+
+  <h3>③ Model quirks become polymorphism, not branches</h3>
+  <p>
+    Whisper needs cross-attention; Mamba/hybrid models carry SSM state; some models need M-RoPE.
+    In V1 these are conditionals threaded through <code>_prepare_inputs</code>, <code>_preprocess</code>
+    and the state updates. V2 lifts them into a <code>ModelState</code> hierarchy
+    (<code>DefaultModelState</code>, <code>WhisperModelState</code>, <code>MambaHybridModelState</code>) chosen
+    at <code>load_model()</code>. The runner calls <code>model_state.prepare_attn()</code> /
+    <code>get_mm_embeddings()</code> / <code>prepare_inputs()</code> and lets the subclass do the right thing.
+  </p>
+
+  <h3>④ Cross-cutting concerns get their own objects</h3>
+  <p>
+    Pipeline parallel (<code>PPHandler</code>), data parallel (<code>dispatch_cg_and_sync_dp</code>),
+    async output (<code>AsyncOutput</code>), CUDA graphs (<code>CudaGraphManager</code> +
+    <code>BatchExecutionDescriptor</code>), and speculators (<code>spec_decode/</code>) each become a
+    named module with a small interface — versus V1, where they're methods and attributes interleaved
+    through the one class.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="takeaways">9. Takeaways</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Same algorithm</h3>
+      <p>Both: reconcile batch &rarr; prep inputs &rarr; attn metadata &rarr; forward &rarr; logits &rarr;
+      (handoff) &rarr; grammar &rarr; sample &rarr; draft &rarr; output. If you understand one phase split,
+      you understand both.</p>
+    </div>
+    <div class="box">
+      <h3>Different structure</h3>
+      <p>V1 keeps state + behavior in one class; V2 splits them into ~18 modules and helper objects with
+      narrow interfaces. The step list is shorter per-method because work moved into collaborators.</p>
+    </div>
+    <div class="box">
+      <h3>V2's perf bets</h3>
+      <p>Staged block-table writes (one fused kernel), UVA-backed buffers + pools (less VRAM, fewer
+      stalls), and an explicit <code>AsyncOutput</code> that overlaps the sampled-token copy with draft
+      proposal.</p>
+    </div>
+    <div class="box">
+      <h3>Status</h3>
+      <p>V1 is the default production path. V2 is <em>experimental, under active development</em> — read
+      its <code>README.md</code> and <code>git log</code> for <code>[MRV2]</code> tags before relying on
+      a detail; the package moves fast.</p>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Before you act on this</strong>
+    Line numbers here are snapshots of the current tree (V1 <code>execute_model</code> @ :4045,
+    V2 @ :1102, etc.). Both files change often — confirm against source before editing. Per repo policy,
+    treat this as a map, not the territory.
+  </div>
+
+  <div class="foot">
+    Sources read: <span class="fileref">vllm/v1/worker/gpu_model_runner.py</span>,
+    <span class="fileref">vllm/v1/worker/gpu/model_runner.py</span> and the
+    <span class="fileref">vllm/v1/worker/gpu/</span> package
+    (<code>states.py</code>, <code>input_batch.py</code>, <code>block_table.py</code>,
+    <code>buffer_utils.py</code>, <code>attn_utils.py</code>, <code>cudagraph_utils.py</code>,
+    <code>async_utils.py</code>, <code>pp_utils.py</code>, <code>dp_utils.py</code>,
+    <code>sample/</code>, <code>spec_decode/</code>); the handshake (&sect;3) from
+    <span class="fileref">vllm/v1/core/sched/scheduler.py</span> and
+    <span class="fileref">vllm/v1/engine/core.py</span>.
+    A learnings walkthrough — verify against current source before changing code.
+  </div>
+</main>
+</body>
+</html>

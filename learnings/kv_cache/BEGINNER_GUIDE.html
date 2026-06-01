@@ -1,0 +1,1276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Beginner's Guide to vLLM's KV Cache</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <a href="BEGINNER_GUIDE.md">BEGINNER_GUIDE.md</a>
+  </div>
+
+  <h1>A Beginner's Guide to vLLM's KV Cache</h1>
+  <p class="subtitle">
+    The on-ramp. Builds intuitions from scratch with small examples,
+    so the other docs read as confirmations rather than revelations.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      The cache exists because attention is repetitive: same prefix &rArr; same K/V.
+      Blocks (16 tokens) are the unit of allocation, kernel reads, and hashing.
+      A chained hash gives provably-correct prefix matches. Hybrid models split
+      layers into <em>groups</em> by lifecycle, and a column-packed tensor layout
+      pools physical memory across groups. The single-threaded scheduler is what
+      lets ref-counting, the free list, and the hash table all stay lock-free.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#prob">The problem: attention is repetitive</a></li>
+      <li><a href="#blocks">Why blocks, not per-token</a></li>
+      <li><a href="#prefix">Prefix cache: same prefix, same K/V</a></li>
+      <li><a href="#after">Why hash after the forward</a></li>
+      <li><a href="#sharing">What sharing buys, where it stops</a></li>
+      <li><a href="#groups">Why attention types live in groups</a></li>
+      <li><a href="#columns">The column-packing trick</a></li>
+      <li><a href="#blockmajor">Block-major memory layout</a></li>
+      <li><a href="#freelist">The doubly-linked free list</a></li>
+      <li><a href="#refcount">Ref counting without locks</a></li>
+      <li><a href="#preempt">When memory runs out: preempt the youngest</a></li>
+      <li><a href="#sentinels">Two sentinels: null blocks &amp; PAD_SLOT_ID</a></li>
+      <li><a href="#linear">Linear attention is a different problem</a></li>
+      <li><a href="#walk">The whole picture, one walk-through</a></li>
+      <li><a href="#takeaways">The big takeaways</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="prob">1. The problem: attention is repetitive, on purpose</h2>
+
+  <p>
+    When a transformer generates text token by token, each new token's
+    attention layer needs to look back at <em>every</em> previous token.
+    At step 100 the model attends to tokens 0..99; at step 101 it attends
+    to 0..100; and so on.
+  </p>
+  <p>
+    If you computed everything from scratch each step, you'd redo the K
+    and V projections for tokens 0..99 a hundred times. Those projections
+    don't change &mdash; token 5's K vector at layer 7 is the same on
+    step 100 as it was on step 6. So we cache them.
+  </p>
+
+  <div class="callout good">
+    <strong>What the KV cache is</strong>
+    At each layer, for every token we've seen, we save the K and V
+    tensors that attention computed. Next step, instead of recomputing
+    them, we read them out of memory. Every design decision below is in
+    service of "store K and V efficiently and find them again quickly."
+  </div>
+
+  <h3>A concrete picture</h3>
+
+  <p>
+    Cache size depends on <em>how</em> the model arranges its attention
+    heads. Three common designs, sized to a 32-layer model with hidden
+    size 4096 and head dim 128, fp16:
+  </p>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>Full MHA</h3>
+      <ul>
+        <li>32 KV heads</li>
+        <li>1 token, 1 layer: <code>32 &times; 128 &times; 2B = 8 KiB</code></li>
+        <li>1 token, all 32 layers: <code>32 &times; 2 &times; 8 KiB = <strong>512 KiB</strong></code></li>
+        <li>4k context: <strong>~2 GiB</strong></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>GQA (today's default)</h3>
+      <ul>
+        <li>32 Q heads, 8 KV heads</li>
+        <li>1 token, 1 layer: <code>2 KiB</code></li>
+        <li>1 token, all layers: <strong>128 KiB</strong></li>
+        <li>4k context: <strong>~512 MiB</strong> (4&times; smaller)</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>MLA (DeepSeek)</h3>
+      <ul>
+        <li>Latent dim 512 + RoPE dim 64</li>
+        <li>1 token, 1 layer: <code>~1.1 KiB</code></li>
+        <li>1 token, all layers: <strong>~36 KiB</strong></li>
+        <li>4k context: <strong>~144 MiB</strong> (14&times; smaller than MHA)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">4k-token request: cache bytes per scheme (32 layers, fp16)</div>
+    <div class="bar-stack">
+      <div class="bar-row">
+        <div class="bar-label">Full MHA</div>
+        <div class="bar-track"><div class="bar-fill red" style="width:100%">2.00 GiB</div></div>
+        <div class="bar-num">100%</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">GQA (8 KV heads)</div>
+        <div class="bar-track"><div class="bar-fill amber" style="width:25%">512 MiB</div></div>
+        <div class="bar-num">25%</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">MLA (latent 512)</div>
+        <div class="bar-track"><div class="bar-fill green" style="width:7%">144 MiB</div></div>
+        <div class="bar-num">7%</div>
+      </div>
+    </div>
+    <div class="diagram-caption">The cache <em>shape</em> (per-request, per-position storage) is identical &mdash; only bytes-per-token differs. Every design decision below applies to all three.</div>
+  </div>
+
+  <h3>How the cache grows as decode progresses</h3>
+
+  <div class="diagram">
+    <div class="diagram-title">One layer, one request &mdash; cache fills as tokens are generated</div>
+    <div class="diagram-row">
+      <span class="cell label">step 1</span>
+      <div class="cell-row tight">
+        <div class="cell xs used">t0</div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">step 4</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">t0</div><div class="cell xs cached">t1</div><div class="cell xs cached">t2</div><div class="cell xs used">t3</div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">step 8</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">t0</div><div class="cell xs cached">t1</div><div class="cell xs cached">t2</div><div class="cell xs cached">t3</div>
+        <div class="cell xs cached">t4</div><div class="cell xs cached">t5</div><div class="cell xs cached">t6</div><div class="cell xs used">t7</div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+        <div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div><div class="cell xs free"></div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">step 16</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">t0</div><div class="cell xs cached">t1</div><div class="cell xs cached">t2</div><div class="cell xs cached">t3</div>
+        <div class="cell xs cached">t4</div><div class="cell xs cached">t5</div><div class="cell xs cached">t6</div><div class="cell xs cached">t7</div>
+        <div class="cell xs cached">t8</div><div class="cell xs cached">t9</div><div class="cell xs cached">t10</div><div class="cell xs cached">t11</div>
+        <div class="cell xs cached">t12</div><div class="cell xs cached">t13</div><div class="cell xs cached">t14</div><div class="cell xs used">t15</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>written this step</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>cached (re-read on every later step)</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#f1f1ee"></span>empty slot</div>
+    </div>
+    <div class="diagram-caption">Each square is one token-slot of K/V at this layer. Every later step re-reads <em>every</em> green slot &mdash; that's why we can't afford to recompute them.</div>
+  </div>
+
+  <div class="callout info">
+    <strong>Why this matters for the design that follows</strong>
+    The numbers shrink, but the <em>shape</em> of the problem doesn't.
+    Every design decision below applies to all three schemes. Only
+    <code>page_size</code> (bytes-per-block) changes &mdash; and that ripples
+    cleanly through the code because the uniform-page-size invariant is
+    computed per-model.
+  </div>
+
+  <h2 id="blocks">2. Why we allocate in <em>blocks</em>, not per token</h2>
+
+  <p>
+    Naively you'd think one slot per token. The real design hands out
+    fixed-size <strong>blocks</strong> &mdash; typically 16 tokens at a
+    time. A 33-token request gets 3 blocks, not 33 slots, and the third
+    block has 15 empty positions waiting to be filled.
+  </p>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>1. Scheduler bookkeeping</h3>
+      <p>
+        Allocating and freeing blocks needs O(1). With per-token slots
+        you'd need a bitmap or per-request arena and either fragmentation
+        or scan cost. Fixed blocks &rArr; one free list of identical slots.
+      </p>
+    </div>
+    <div class="box">
+      <h3>2. Attention kernel</h3>
+      <p>
+        GPU kernels read K/V in tiles. FlashAttention issues <em>one</em>
+        memory load per 16-token chunk. Per-token allocation would scatter
+        those 16 tokens across the GPU, forcing 16 indirect lookups.
+      </p>
+    </div>
+    <div class="box">
+      <h3>3. Prefix-cache hash</h3>
+      <p>
+        vLLM caches prefixes by hashing block contents. Hashing a
+        fixed-size unit is cheap and chainable. A token-level hash would
+        multiply hash-table entries by 16&times; with no benefit.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    <strong>Analogy:</strong> a hotel books rooms, not square feet.
+    The room has 4 beds and you might use 1, but treating every square
+    foot as bookable would dwarf the wasted space.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">33-token request, block_size = 16</div>
+    <div class="diagram-row">
+      <span class="cell label">tokens</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">0</div><div class="cell xs cached">1</div><div class="cell xs cached">2</div><div class="cell xs cached">3</div>
+        <div class="cell xs cached">4</div><div class="cell xs cached">5</div><div class="cell xs cached">6</div><div class="cell xs cached">7</div>
+        <div class="cell xs cached">8</div><div class="cell xs cached">9</div><div class="cell xs cached">10</div><div class="cell xs cached">11</div>
+        <div class="cell xs cached">12</div><div class="cell xs cached">13</div><div class="cell xs cached">14</div><div class="cell xs cached">15</div>
+        <div class="cell xs cached">16</div><div class="cell xs cached">17</div><div class="cell xs cached">18</div><div class="cell xs cached">19</div>
+        <div class="cell xs cached">20</div><div class="cell xs cached">21</div><div class="cell xs cached">22</div><div class="cell xs cached">23</div>
+        <div class="cell xs cached">24</div><div class="cell xs cached">25</div><div class="cell xs cached">26</div><div class="cell xs cached">27</div>
+        <div class="cell xs cached">28</div><div class="cell xs cached">29</div><div class="cell xs cached">30</div><div class="cell xs cached">31</div>
+        <div class="cell xs used">32</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">blocks</span>
+      <div class="cell-row tight">
+        <div class="cell cached" style="min-width:calc(16 * 18px + 15 * 1px)">block 0 (full)</div>
+        <div class="cell cached" style="min-width:calc(16 * 18px + 15 * 1px)">block 1 (full)</div>
+        <div class="cell used" style="min-width:calc(16 * 18px + 15 * 1px)">block 2 (1/16 used &mdash; <strong>15 empty slots</strong>)</div>
+      </div>
+    </div>
+    <div class="diagram-caption">Three blocks for 33 tokens. The last block has 15 empty positions; decode fills them on the next 15 steps before allocating a 4th block. The waste is bounded by <code>block_size &minus; 1</code> tokens, not by request length.</div>
+  </div>
+
+  <p>
+    The <strong>internal fragmentation</strong> in the last block is
+    real but small. Continuing decode fills it anyway.
+  </p>
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k1">KV_CACHE_ASSUMPTIONS.html &sect;1</a> for the assertion-level details.</p>
+
+  <h2 id="prefix">3. The prefix cache: same prefix, same K/V</h2>
+
+  <div class="callout good">
+    <strong>Determinism is the whole story</strong>
+    K and V at position <em>p</em> are deterministic functions of the
+    effective inputs at positions 0..p. Same effective input in
+    (model weights, LoRA, MM features, cache namespace, KV group),
+    same result out.
+  </div>
+
+  <p>
+    So if request A has been processed and its blocks are still in GPU
+    memory, request B with the same prefix can <strong>point at A's
+    blocks</strong> and skip computing them.
+  </p>
+
+  <h3>Real-world payoff</h3>
+
+  <p>The classic case is a chat application with a long system prompt:</p>
+<pre><code>System: You are a helpful assistant. [...3000 more tokens...]
+User: Hi
+
+System: You are a helpful assistant. [...same 3000 tokens...]
+User: What's the weather?</code></pre>
+
+  <p>These share 3000+ tokens. Prefix caching skips the prefill for them on every new conversation.</p>
+
+  <h3>How do we know two prefixes are identical?</h3>
+
+  <p>
+    We can't compare token sequences directly &mdash; that's O(N) per
+    lookup. Instead vLLM hashes each block, chaining each hash through
+    the previous:
+  </p>
+<pre><code>block 0 hash = H(NONE_HASH, "The cat sat on the")
+block 1 hash = H(block_0_hash, " mat. The mat was")
+block 2 hash = H(block_1_hash, " green. It was a")</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Chained hash: each block hash binds the entire prefix</div>
+    <div class="chain">
+      <div class="chain-block">
+        <span class="label">NONE_HASH</span>
+        <code>per-process random</code>
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block cached">
+        <span class="label">block 0</span>
+        h<sub>0</sub> = H(NONE, tok[0..15])
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block cached">
+        <span class="label">block 1</span>
+        h<sub>1</sub> = H(h<sub>0</sub>, tok[16..31])
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block new">
+        <span class="label">block 2 (new)</span>
+        h<sub>2</sub> = H(h<sub>1</sub>, tok[32..47])
+      </div>
+    </div>
+    <div class="diagram-caption">
+      A hit on <strong>h<sub>2</sub></strong> proves the request shares blocks 0, 1, <em>and</em> 2 with the producer &mdash; because h<sub>2</sub> mathematically depends on h<sub>1</sub>, which depends on h<sub>0</sub>. One hash comparison vouches for the whole prefix.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">When prefixes diverge: divergence cascades forward</div>
+    <div class="chain">
+      <div class="chain-block cached">
+        <span class="label">req A blk 0</span>
+        h<sub>A0</sub>
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block cached">
+        <span class="label">req A blk 1</span>
+        h<sub>A1</sub> = H(h<sub>A0</sub>, &hellip;)
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block cached">
+        <span class="label">req A blk 2</span>
+        h<sub>A2</sub> = H(h<sub>A1</sub>, [&ldquo;&hellip; 4&rdquo;])
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block cached">
+        <span class="label">req A blk 3</span>
+        h<sub>A3</sub>
+      </div>
+    </div>
+    <div class="chain">
+      <div class="chain-block cached">
+        <span class="label">req B blk 0</span>
+        h<sub>A0</sub> &check;
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block cached">
+        <span class="label">req B blk 1</span>
+        h<sub>A1</sub> &check;
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block miss">
+        <span class="label">req B blk 2</span>
+        h<sub>B2</sub> = H(h<sub>A1</sub>, [&ldquo;&hellip; 5&rdquo;])
+      </div>
+      <span class="chain-arrow">&rarr;</span>
+      <div class="chain-block miss">
+        <span class="label">req B blk 3</span>
+        h<sub>B3</sub> &ne; h<sub>A3</sub>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      A and B share blocks 0 and 1. A single different token in block 2 makes h<sub>B2</sub> &ne; h<sub>A2</sub>, and from then on every downstream hash differs &mdash; even if the tokens later become identical again. <strong>The chain doesn't &ldquo;re-sync.&rdquo;</strong>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Beautiful property of chained hashes</strong>
+    If your block-N hash matches mine, all of blocks 0..N must also match,
+    because the chain encodes the whole history. One hash comparison
+    vouches for the entire prefix.
+  </div>
+
+  <p>
+    The real hash key also includes <strong>extra keys</strong> when
+    tokens alone aren't enough: LoRA/adapters, multimodal feature
+    identifiers, prompt embeddings, request <code>cache_salt</code>.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: <code>NONE_HASH</code> is randomized per process</strong>
+<pre><code># vllm/v1/core/kv_cache_utils.py
+NONE_HASH: BlockHash
+
+def init_none_hash(hash_fn):
+    global NONE_HASH
+    hash_seed = os.getenv("PYTHONHASHSEED")
+    if hash_seed is None:
+        NONE_HASH = BlockHash(os.urandom(32))   # &lt;-- random!
+    else:
+        NONE_HASH = BlockHash(hash_fn(hash_seed))</code></pre>
+    This prevents one tenant from poisoning another's cache by
+    guessing hashes &mdash; the same trick CPython uses for
+    <code>hash()</code>.
+  </div>
+
+  <p>&rarr; <a href="KV_CACHE.html#flow">KV_CACHE.html "Per-request flow"</a> and the receptive-field discussion.</p>
+
+  <h2 id="after">4. Why we hash <em>after</em> the forward, not before</h2>
+
+  <p>
+    You might think: "If I know the tokens, I can hash up front and look
+    them up before running the model." vLLM does compute the hash up front
+    for <em>lookup</em> &mdash; but it only inserts a
+    <code>(hash &rarr; block_id)</code> entry into the cache table
+    <strong>after</strong> the worker has actually written the K/V
+    contents.
+  </p>
+
+  <div class="callout warn">
+    <strong>Subtle but critical</strong>
+    The hash is a key into K/V <em>content</em>, not into block IDs. If
+    you inserted the hash before computation, two requests racing through
+    prefill at the same time could both think they have valid K/V at a
+    given block when really the block hasn't been written yet. You'd hand
+    out garbage to whoever looked up second.
+  </div>
+
+  <p>
+    So vLLM splits it in two: cheap CPU-side hash up front for lookup,
+    deferred insertion after the GPU finishes writing. Every K/V you read
+    from the cache is K/V that was actually computed.
+  </p>
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k5">KV_CACHE_ASSUMPTIONS.html &sect;5</a>.</p>
+
+  <h2 id="sharing">5. What sharing buys, and where it stops</h2>
+
+  <p>
+    Prefix caching only works for <strong>identical</strong> prefixes.
+    If A is <code>[1, 2, 3, 4]</code> and B is <code>[1, 2, 3, 5]</code>,
+    they share through token 3; as soon as one block diverges, every
+    subsequent block diverges too (its hash includes the parent's hash).
+  </p>
+
+  <p>
+    A natural question: "What about similar suffixes? In sliding-window
+    attention (SWA), where each token only attends to the last W tokens,
+    if both requests have the same last W tokens, why can't they share?"
+  </p>
+
+  <div class="callout bad">
+    <strong>No, never &mdash; for any transformer of depth &ge; 2</strong>
+    Even though the attention <em>mask</em> at layer L only reads the last
+    W positions, the K/V values <em>at</em> those positions depend on the
+    residual stream from earlier layers, which depends on tokens further
+    back. A 1-layer SWA network could share suffixes; a 2-layer SWA
+    network cannot. The receptive field of K/V <em>contents</em> expands
+    with depth even though the per-layer mask doesn't.
+  </div>
+
+  <p>
+    This is the <strong>receptive-field wall</strong>. It rules out a
+    whole class of "clever" cache-sharing schemes that look like they
+    should work and silently corrupt outputs if implemented. The current
+    chained hash + R&rarr;L scan returns exactly the hits that are
+    <em>provably</em> identical &mdash; no more.
+  </p>
+  <p>&rarr; <a href="KV_CACHE.html#wall">KV_CACHE.html "The correctness wall"</a> has the full argument with worked counterexample.</p>
+
+  <h2 id="groups">6. Why different attention types live in different "groups"</h2>
+
+  <p>
+    Modern models often mix attention types in one stack. Gemma-3
+    alternates SWA layers with full-attention. Jamba mixes Mamba layers
+    with attention. These types <strong>disagree about how their cache
+    behaves</strong>:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Full attention</th>
+        <th>Sliding window</th>
+        <th>Mamba</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>When can K/V be freed?</td><td>When request ends</td><td>When position falls out of window</td><td>After each step (default mode)</td></tr>
+      <tr><td>How to find cache hits?</td><td>Scan L&rarr;R</td><td>R&rarr;L, take last W blocks</td><td>R&rarr;L, take latest only</td></tr>
+      <tr><td>What's a "block"?</td><td>16 tokens of K/V</td><td>16 tokens of K/V</td><td>One snapshot of recurrent state</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    You can't put these into a single shared block table. Each cell would
+    mean different things in different rows. So vLLM partitions layers into
+    <strong>groups</strong> where every layer in a group agrees on those
+    answers.
+  </p>
+
+  <h3>Why not one block table per layer?</h3>
+
+  <p>
+    That's the safe extreme. It also wastes huge GPU memory: an 80-layer
+    model at 128k context burns ~10 GiB on block-table metadata alone
+    (the block table is on GPU because the kernel reads it directly).
+    Layers within the same attention type have <strong>identical
+    lifecycles</strong> &mdash; their block tables would be
+    byte-identical &mdash; so making them share is free.
+  </p>
+
+  <p>
+    Example: request A with 12 tokens and <code>block_size=4</code> owns
+    three logical blocks. All full-attention layers (L0, L7, L31) want
+    the same logical mapping. K/V <em>contents</em> differ per layer, but
+    "which physical block stores logical block 2 for A?" is identical.
+  </p>
+
+  <p>SWA layers have a different lifecycle, but the sharing logic holds within the SWA group:</p>
+<pre><code>full-attention group table: [47, 89, 153]
+SWA group table:            [NULL, 89, 153]</code></pre>
+
+  <h3>Why split SWA layers across multiple groups in Gemma-3?</h3>
+
+  <p>
+    If Gemma-3 has 5 SWA layers per 1 full-attention layer, putting all
+    50 SWA layers in one group with 10 full-attention layers in another
+    means "a block" in the SWA group would represent 5&times; more memory
+    than in the full-attention group. The scheduler could no longer ask
+    "do I have N free blocks?".
+  </p>
+
+  <p>
+    vLLM's solution: split the 50 SWA layers into 5 groups of 10. Now
+    every group has 10 layers, every block represents the same physical
+    memory, and one global free list works for everyone.
+  </p>
+
+  <p>&rarr; <a href="KV_CACHE_ALLOCATION.html#why-groups">KV_CACHE_ALLOCATION.html "Why Groups Exist At All"</a> for the full reasoning chain.</p>
+
+  <h2 id="columns">7. The column-packing trick</h2>
+
+  <p>
+    If you have 6 groups (1 full + 5 SWA) of 10 layers each, you have 60
+    layers total and 6 separate block tables. How do you allocate physical
+    memory for the K/V tensors?
+  </p>
+
+  <div class="callout info">
+    <strong>The clever answer</strong>
+    Each "column" of the layer grid shares a single physical tensor,
+    where columns are indexed by <em>layer-position-within-its-group</em>.
+    Equal group sizes make every column hold exactly one layer per group.
+  </div>
+
+<pre><code>            slot 0   slot 1  ...  slot 9
+Group 0:    L5       L11     ...  L59      &lt;- FULL
+Group 1:    L0       L6      ...  L54      &lt;- SWA
+Group 2:    L1       L7      ...  L55      &lt;- SWA
+Group 3:    L2       L8      ...  L56      &lt;- SWA
+Group 4:    L3       L9      ...  L57      &lt;- SWA
+Group 5:    L4       L10     ...  L58      &lt;- SWA
+            ====     ====         ====
+          Tensor 0 Tensor 1 ... Tensor 9</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">60 layers &rarr; 6 groups of 10 &rarr; 10 physical column tensors</div>
+    <div class="grid-2d" style="grid-template-columns: 90px repeat(10, 56px)">
+      <div class="lbl"></div>
+      <div class="lbl col">slot 0</div><div class="lbl col">slot 1</div><div class="lbl col">slot 2</div><div class="lbl col">slot 3</div><div class="lbl col">slot 4</div>
+      <div class="lbl col">slot 5</div><div class="lbl col">slot 6</div><div class="lbl col">slot 7</div><div class="lbl col">slot 8</div><div class="lbl col">slot 9</div>
+
+      <div class="lbl row">G0 <span class="tag full">FULL</span></div>
+      <div class="cell sm full-grp">L5</div><div class="cell sm full-grp">L11</div><div class="cell sm full-grp">L17</div><div class="cell sm full-grp">L23</div><div class="cell sm full-grp">L29</div>
+      <div class="cell sm full-grp">L35</div><div class="cell sm full-grp">L41</div><div class="cell sm full-grp">L47</div><div class="cell sm full-grp">L53</div><div class="cell sm full-grp">L59</div>
+
+      <div class="lbl row">G1 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L0</div><div class="cell sm swa-grp">L6</div><div class="cell sm swa-grp">L12</div><div class="cell sm swa-grp">L18</div><div class="cell sm swa-grp">L24</div>
+      <div class="cell sm swa-grp">L30</div><div class="cell sm swa-grp">L36</div><div class="cell sm swa-grp">L42</div><div class="cell sm swa-grp">L48</div><div class="cell sm swa-grp">L54</div>
+
+      <div class="lbl row">G2 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L1</div><div class="cell sm swa-grp">L7</div><div class="cell sm swa-grp">L13</div><div class="cell sm swa-grp">L19</div><div class="cell sm swa-grp">L25</div>
+      <div class="cell sm swa-grp">L31</div><div class="cell sm swa-grp">L37</div><div class="cell sm swa-grp">L43</div><div class="cell sm swa-grp">L49</div><div class="cell sm swa-grp">L55</div>
+
+      <div class="lbl row">G3 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L2</div><div class="cell sm swa-grp">L8</div><div class="cell sm swa-grp">L14</div><div class="cell sm swa-grp">L20</div><div class="cell sm swa-grp">L26</div>
+      <div class="cell sm swa-grp">L32</div><div class="cell sm swa-grp">L38</div><div class="cell sm swa-grp">L44</div><div class="cell sm swa-grp">L50</div><div class="cell sm swa-grp">L56</div>
+
+      <div class="lbl row">G4 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L3</div><div class="cell sm swa-grp">L9</div><div class="cell sm swa-grp">L15</div><div class="cell sm swa-grp">L21</div><div class="cell sm swa-grp">L27</div>
+      <div class="cell sm swa-grp">L33</div><div class="cell sm swa-grp">L39</div><div class="cell sm swa-grp">L45</div><div class="cell sm swa-grp">L51</div><div class="cell sm swa-grp">L57</div>
+
+      <div class="lbl row">G5 <span class="tag swa">SWA</span></div>
+      <div class="cell sm swa-grp">L4</div><div class="cell sm swa-grp">L10</div><div class="cell sm swa-grp">L16</div><div class="cell sm swa-grp">L22</div><div class="cell sm swa-grp">L28</div>
+      <div class="cell sm swa-grp">L34</div><div class="cell sm swa-grp">L40</div><div class="cell sm swa-grp">L46</div><div class="cell sm swa-grp">L52</div><div class="cell sm swa-grp">L58</div>
+
+      <div class="lbl row"></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>0</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>1</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>2</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>3</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>4</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>5</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>6</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>7</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>8</sub></div>
+      <div class="lbl col" style="font-weight:650;color:var(--violet)">T<sub>9</sub></div>
+    </div>
+    <div class="diagram-caption">
+      Each <strong>column</strong> (T<sub>0</sub>&hellip;T<sub>9</sub>) is one physical tensor. Each <strong>row</strong> is one group with its own block table. T<sub>0</sub> holds K/V for L5 (Full), L0, L1, L2, L3, L4 (all SWA) &mdash; different groups share the tensor because their block IDs come from a single global pool, so their slot indices can't collide.
+    </div>
+  </div>
+
+  <p>
+    There are <strong>10 physical tensors</strong>, not 60. Tensor 0
+    holds K/V for L5, L0, L1, L2, L3, L4 &mdash; one layer from each
+    group. Tensor 1 holds L11, L6, L7, L8, L9, L10.
+  </p>
+
+  <h3>A worked example: one request through the layout</h3>
+
+  <p>Collapse to a tractable size:</p>
+
+<pre><code>              slot 0   slot 1
+Group 0:      L0       L2        &lt;- FULL
+Group 1:      L1       L3        &lt;- SWA
+              ====     ====
+            Tensor 0 Tensor 1</code></pre>
+
+  <p>
+    4 layers, 2 attention types, <code>group_size = 2</code> &rarr;
+    2 column tensors. <code>block_size = 4</code>. Global pool has 100
+    free blocks, IDs 0..99.
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>Request arrives, scheduler allocates block IDs.</strong>
+      <p>Request A has 8 tokens. The scheduler pops 4 IDs from the single global free queue:</p>
+<pre><code>Group 0's table for A: [10, 11]
+Group 1's table for A: [20, 21]</code></pre>
+      <p>All 4 IDs are different &mdash; they all came from one global pool.</p>
+    </li>
+    <li>
+      <strong>Compute slot mappings per group.</strong>
+      <p>The kernel processes individual <em>tokens</em>, not blocks. vLLM precomputes a flat <code>slot_mapping</code> tensor with one entry per token:</p>
+<pre><code>block_index = token_position // block_size
+block_id    = block_table[request][block_index]
+offset      = token_position %  block_size
+slot_id     = block_id * block_size + offset</code></pre>
+      <p>For request A's 8 tokens:</p>
+<pre><code>Group 0 slot mapping (uses [10, 11]):
+  pos 0..3 &rarr; block 10 &rarr; slots 40, 41, 42, 43
+  pos 4..7 &rarr; block 11 &rarr; slots 44, 45, 46, 47
+
+Group 1 slot mapping (uses [20, 21]):
+  pos 0..3 &rarr; block 20 &rarr; slots 80, 81, 82, 83
+  pos 4..7 &rarr; block 21 &rarr; slots 84, 85, 86, 87</code></pre>
+      <p>One slot mapping per group, not per layer.</p>
+    </li>
+    <li>
+      <strong>Forward pass &mdash; each layer writes K/V.</strong>
+<pre><code>L0 (group 0, slot 0 in group &rarr; Tensor 0):
+   slot_mapping = [40..47] &rarr; writes slots 40..47 of Tensor 0
+L1 (group 1, slot 0 in group &rarr; Tensor 0):
+   slot_mapping = [80..87] &rarr; writes slots 80..87 of Tensor 0
+L2 (group 0, slot 1 in group &rarr; Tensor 1):
+   slot_mapping = [40..47] &rarr; writes slots 40..47 of Tensor 1
+L3 (group 1, slot 1 in group &rarr; Tensor 1):
+   slot_mapping = [80..87] &rarr; writes slots 80..87 of Tensor 1</code></pre>
+      <p>L0 and L1 share the same physical Tensor 0, but write to <strong>disjoint</strong> slot ranges (40-47 vs 80-87) because they have different block IDs. L0 and L2 use the same slot indices (40-47) but write to <strong>different</strong> Tensors (0 vs 1) because they're in different columns.</p>
+    </li>
+  </ol>
+
+  <h4>Where does one token's K/V end up across all 4 layers?</h4>
+
+  <p>Pick the token at position 5. In group 0: block 11, offset 1 &rarr; slot 45. In group 1: block 21, offset 1 &rarr; slot 85.</p>
+
+  <table>
+    <thead><tr><th>Layer</th><th>Tensor</th><th>Slot</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>L0</td><td>0</td><td>45</td><td>group 0, block 11, offset 1</td></tr>
+      <tr><td>L1</td><td>0</td><td>85</td><td>group 1, block 21, offset 1</td></tr>
+      <tr><td>L2</td><td>1</td><td>45</td><td>group 0, block 11, offset 1</td></tr>
+      <tr><td>L3</td><td>1</td><td>85</td><td>group 1, block 21, offset 1</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>Both axes of the layer grid are collision-free <em>by construction</em></strong>
+    <ul>
+      <li>Column-tensor structure keeps within-group layers in different tensors &rarr; different physical memory.</li>
+      <li>Global block ID pool keeps across-group layers on different slot indices &rarr; different addresses even when the tensor is shared.</li>
+    </ul>
+  </div>
+
+  <h3 id="hybrid-example">Worked example #2: mixed Full + SWA (the hybrid case)</h3>
+
+  <p>
+    The example above had two groups, but both groups were the same
+    attention type. The real win of groups is mixing types. Let's redo
+    the math with one Full group and one SWA group so you can see what
+    NULL blocks and uniform-sized tables actually look like.
+  </p>
+
+  <div class="callout info">
+    <strong>Setup</strong>
+    <ul>
+      <li>4 layers, 2 groups:
+        <ul>
+          <li><strong>G1</strong> = {L1, L3} &mdash; Full attention <span class="tag full">FULL</span></li>
+          <li><strong>G2</strong> = {L2, L4} &mdash; SWA, <code>sliding_window = 8</code> <span class="tag swa">SWA</span></li>
+        </ul>
+      </li>
+      <li><code>block_size = 4</code>, <code>request length = 16</code> tokens</li>
+    </ul>
+  </div>
+
+  <h4>What each group's block table looks like</h4>
+
+  <p>
+    Both groups have 4 logical blocks for a 16-token request
+    (<code>16 / 4 = 4</code>). Block-table size is <em>always</em> the
+    same across groups for a given request &mdash; that's the
+    uniform-page-size invariant in action. The difference is what's
+    <em>in</em> the entries:
+  </p>
+
+<pre><code>positions:           0..3   4..7   8..11   12..15
+G1 (Full) table:  [   1      2      3        4   ]   &lt;- 16 tokens of K/V live
+G2 (SWA)  table:  [ NULL   NULL    5        6   ]   &lt;-  8 tokens of K/V live</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">Hybrid block tables for one 16-token request</div>
+    <div class="diagram-row">
+      <span class="cell label">positions</span>
+      <div class="cell-row">
+        <div class="cell wide head">0..3</div>
+        <div class="cell wide head">4..7</div>
+        <div class="cell wide head">8..11</div>
+        <div class="cell wide head">12..15</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">G1 <span class="tag full">Full</span></span>
+      <div class="cell-row">
+        <div class="cell wide full-grp">blk 1</div>
+        <div class="cell wide full-grp">blk 2</div>
+        <div class="cell wide full-grp hot">blk 3</div>
+        <div class="cell wide full-grp">blk 4</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">G2 <span class="tag swa">SWA</span></span>
+      <div class="cell-row">
+        <div class="cell wide null">NULL</div>
+        <div class="cell wide null">NULL</div>
+        <div class="cell wide swa-grp hot">blk 5</div>
+        <div class="cell wide swa-grp">blk 6</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>Full attention &mdash; all positions live</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>SWA &mdash; only the window-of-8 tail is live</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#f5f5f3;border-style:dashed"></span>NULL block &mdash; outside window, no storage</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#fff;outline:2px solid var(--red)"></span>position 8 lookup</div>
+    </div>
+    <div class="diagram-caption">
+      Both tables are <strong>the same length</strong> (4 entries). The SWA table fills its outside-window positions with the NULL sentinel rather than dropping them &mdash; that uniform length is what keeps the slot-mapping arithmetic identical across groups.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Position 8 in physical memory (block_size = 4)</div>
+    <div class="flow">
+      <div class="flow-step b">
+        <span class="num">G1 (Full)</span>
+        <code>blk 3, off 0</code><br>
+        slot = 3&times;4 + 0 = <strong>12</strong>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v">
+        <span class="num">column tensor</span>
+        T<sub>0</sub> (L1)<br>T<sub>1</sub> (L3)
+      </div>
+    </div>
+    <div class="flow">
+      <div class="flow-step g">
+        <span class="num">G2 (SWA)</span>
+        <code>blk 5, off 0</code><br>
+        slot = 5&times;4 + 0 = <strong>20</strong>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v">
+        <span class="num">column tensor</span>
+        T<sub>0</sub> (L2)<br>T<sub>1</sub> (L4)
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Same logical position, different slot IDs &mdash; because block IDs 3 and 5 came from one global pool. L1 (G1) and L2 (G2) both live in T<sub>0</sub> but at slots 12 and 20 respectively, so they can never collide.
+    </div>
+  </div>
+
+  <p>
+    G2's first two entries are the <code>null_block</code> sentinel
+    (<a href="#sentinels">&sect;12</a>) &mdash; positions 0..7 fall
+    <em>outside</em> SWA's window-of-8 ending at position 15, so the SWA
+    layers will never read them. There's no physical slot allocated for
+    those positions in G2; the entries just exist to keep the block
+    table the same size as G1's. Without that uniform size, the slot
+    arithmetic and column-packing layout would break.
+  </p>
+
+  <h4>Slot-ID computation at position 8</h4>
+
+  <p>Apply the formula in both groups:</p>
+<pre><code>block_index = token_position // block_size
+block_id    = block_table[request][block_index]
+offset      = token_position %  block_size
+slot_id     = block_id * block_size + offset</code></pre>
+
+  <p>Position 8 lives in block-table index 2 in both groups:</p>
+
+  <table>
+    <thead><tr><th>Group</th><th><code>block_index</code></th><th><code>block_id</code></th><th><code>offset</code></th><th><code>slot_id</code></th></tr></thead>
+    <tbody>
+      <tr>
+        <td>G1 (Full)</td>
+        <td><code>8 // 4 = 2</code></td>
+        <td><code>table[2] = 3</code></td>
+        <td><code>8 % 4 = 0</code></td>
+        <td><code>3 * 4 + 0 = 12</code></td>
+      </tr>
+      <tr>
+        <td>G2 (SWA)</td>
+        <td><code>8 // 4 = 2</code></td>
+        <td><code>table[2] = 5</code></td>
+        <td><code>8 % 4 = 0</code></td>
+        <td><code>5 * 4 + 0 = 20</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Both groups have a valid slot at position 8 (it's inside SWA's window
+    of <code>[8..15]</code>). They have <em>different</em> slot IDs (12 vs
+    20) because their block tables point to different physical block IDs
+    (3 vs 5) drawn from the same global <code>BlockPool</code>.
+  </p>
+
+  <h4>Slot-ID computation at position 4 (the interesting case)</h4>
+
+  <table>
+    <thead><tr><th>Group</th><th><code>block_index</code></th><th><code>block_id</code></th><th><code>slot_id</code></th></tr></thead>
+    <tbody>
+      <tr><td>G1 (Full)</td><td><code>1</code></td><td><code>table[1] = 2</code></td><td><code>2 * 4 + 0 = 8</code></td></tr>
+      <tr><td>G2 (SWA)</td><td><code>1</code></td><td><code>table[1] = NULL</code></td><td><code>PAD_SLOT_ID = -1</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Position 4 has fallen out of SWA's window. G1 still writes/reads
+    K/V at slot 8 of its column tensors; G2 emits <code>PAD_SLOT_ID</code>
+    so the kernel skips the write. Same token, same logical position &mdash;
+    different physical fate depending on the layer's lifecycle.
+  </p>
+
+  <div class="callout good">
+    <strong>The three invariants you can read off this example</strong>
+    <ol>
+      <li><strong>Block tables are the same size across groups</strong> &mdash; both are 4 entries long for a 16-token request, because both groups agree on <code>block_size = 4</code>.</li>
+      <li><strong>NULL entries fill SWA's expired positions</strong> &mdash; the SWA layer literally won't read those positions, so no physical block is allocated there.</li>
+      <li><strong>Block IDs come from one global pool</strong> &mdash; G1 holds {1, 2, 3, 4}, G2 holds {NULL, NULL, 5, 6}, all drawn from the same <code>BlockPool</code> with no overlap. That's the scheduler invariant that makes column packing collision-free.</li>
+    </ol>
+  </div>
+
+  <h3>A concrete timeline of one slot</h3>
+
+  <div class="diagram">
+    <div class="diagram-title">Tensor 0, slot 42 &mdash; same bytes, sequence of owners</div>
+    <div class="timeline">
+      <div class="timeline-label">T0 startup</div>
+      <div class="timeline-track">
+        <div class="timeline-seg muted" style="left:0;width:100%">zeros &mdash; unowned</div>
+      </div>
+      <div class="timeline-label">T1 alloc A</div>
+      <div class="timeline-track">
+        <div class="timeline-seg muted" style="left:0;width:8%">.</div>
+        <div class="timeline-seg" style="left:8%;width:38%">L5 (group 0) writes req A's K/V</div>
+        <div class="timeline-seg amber" style="left:46%;width:54%">L5 reads K/V on every decode step</div>
+      </div>
+      <div class="timeline-label">T2 A finishes</div>
+      <div class="timeline-track">
+        <div class="timeline-seg amber" style="left:0;width:30%">L5 still owns</div>
+        <div class="timeline-seg dashed" style="left:30%;width:70%">stale L5 K/V &mdash; sitting in free queue</div>
+      </div>
+      <div class="timeline-label">T3 alloc B</div>
+      <div class="timeline-track">
+        <div class="timeline-seg dashed" style="left:0;width:5%">.</div>
+        <div class="timeline-seg green" style="left:5%;width:40%">L2 (group 3) overwrites with req B's K/V</div>
+        <div class="timeline-seg amber" style="left:45%;width:55%">L2 reads K/V on B's decode steps</div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Same physical address, three lifecycles. The slot isn't tied to a layer or group &mdash; whoever currently holds <code>block_id = 42</code> writes there. Between owners (T2), the bytes stay but are unreferenced. <strong>This is why ref counting matters</strong>: it tracks <em>who is reading</em>, not <em>who wrote</em>.
+    </div>
+  </div>
+
+  <h3>Why this matters (it's not the allocation count)</h3>
+
+  <p>
+    Per-group layout would still have 6 block tables. Column packing's
+    win is <strong>cross-group physical-memory pooling</strong>: one slot 42
+    reused across groups, not 6 slot-42s sitting in 6 partitioned tensors.
+    When SWA groups have lighter demand (windowing frees blocks mid-request),
+    those freed slots return to a shared pool that the full-attention group
+    can immediately reuse.
+  </p>
+
+  <p>&rarr; <a href="KV_CACHE_ALLOCATION.html#columns">KV_CACHE_ALLOCATION.html "The Structural Mechanism"</a> for the byte-level diagrams.</p>
+
+  <h2 id="blockmajor">8. Why blocks are stored block-major in memory</h2>
+
+  <p>Inside one block (e.g., block 42 in Tensor 0), the layout is:</p>
+<pre><code>[2, block_size, num_kv_heads, head_size]
+ ^   ^           ^             ^
+ |   |           |             head dim
+ |   |           num KV heads
+ |   token-within-block (0..15)
+ K vs V</code></pre>
+
+  <p>
+    The 16 tokens are laid out <strong>contiguously</strong>. This is
+    "block-major", the opposite of "token-major" (where token 0 of block 0
+    would sit next to token 0 of block 1).
+  </p>
+
+  <div class="callout info">
+    <strong>Why block-major?</strong>
+    The kernel reads a block at a time. FlashAttention issues one
+    contiguous load for all 16 tokens' K and V. Block-major makes that
+    load a single linear stride. Token-major would force scattered reads.
+  </div>
+
+  <p>Block-major also makes copies cheap: one <code>memcpy</code> per block per layer of <code>page_size</code> bytes.</p>
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k3">KV_CACHE_ASSUMPTIONS.html &sect;3</a>.</p>
+
+  <h2 id="freelist">9. The free list is doubly-linked, and that's not arbitrary</h2>
+
+  <p>
+    When a block becomes unused, it goes onto a <strong>free queue</strong>:
+    candidates for eviction. The free queue is a hand-rolled doubly-linked
+    list &mdash; not Python's <code>collections.deque</code>.
+  </p>
+
+  <p>Why? You sometimes need to <strong>pull a block out of the middle</strong>:</p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Scenario</h3>
+      <ul>
+        <li>Request A finishes; blocks (still holding valid K/V) go to the free queue.</li>
+        <li>Request B arrives with the same prefix &mdash; hits the cache, wants blocks currently in A's freed list but not yet evicted.</li>
+        <li>B's block lookup pulls those blocks out of the <em>middle</em> in O(1) and increments their ref count.</li>
+      </ul>
+      <p>A <code>deque</code> only supports O(1) operations at the <em>ends</em>. Middle removal would be O(N).</p>
+    </div>
+    <div class="box">
+      <h3>The eviction-order trick</h3>
+      <p>
+        When request A frees its blocks, they're added in <strong>reverse</strong>
+        order (tail block first, head last). Tail blocks are the least likely
+        to be hit by future requests; head blocks (system prompt, shared
+        prefix) might serve many. Reverse insertion puts tails at the front
+        of the eviction queue.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Code: the fake head/tail sentinels</strong>
+<pre><code># kv_cache_utils.py: FreeKVCacheBlockQueue
+self.fake_free_list_head = KVCacheBlock(block_id=-1)
+self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+# Fake sentinels reduce branching in popleft/append/remove paths.</code></pre>
+    The whole class is hand-rolled to avoid allocating Python objects
+    during list manipulation &mdash; closing the perf gap to <code>deque</code>
+    (which is implemented in C).
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">FreeKVCacheBlockQueue &mdash; doubly-linked list with head/tail sentinels</div>
+    <div class="linked-list">
+      <div class="ll-node sentinel">
+        <span class="ll-tag">HEAD</span>
+        id = &minus;1
+      </div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node head">
+        <span class="ll-tag">pop next</span>
+        blk 88<br><span style="color:var(--muted)">(tail of req A)</span>
+      </div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node">blk 87</div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node">blk 86</div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node">
+        <span class="ll-tag">cached</span>
+        blk 47<br><span style="color:var(--muted)">(B can hit)</span>
+      </div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node">blk 12</div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node tail">
+        <span class="ll-tag">evict last</span>
+        blk 4<br><span style="color:var(--muted)">(head of req A)</span>
+      </div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node sentinel">
+        <span class="ll-tag">TAIL</span>
+        id = &minus;1
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <strong>Reverse-order insertion</strong>: when req A finishes, its tail block (88) lands at the front &mdash; least likely to be reused. Shared-prefix blocks (head of A) sit near the eviction end. <strong>Middle removal</strong>: if req B hashes match blk 47, it gets pulled out of the middle in O(1) &mdash; impossible with <code>deque</code>.
+    </div>
+  </div>
+
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k7">KV_CACHE_ASSUMPTIONS.html &sect;7</a>.</p>
+
+  <h2 id="refcount">10. Reference counting without locks</h2>
+
+  <p>
+    When two requests share a cached block, vLLM tracks a <code>ref_cnt</code>
+    per block &mdash; literally <code>block.ref_cnt += 1</code> on a Python
+    attribute. No atomics, no locks.
+  </p>
+
+  <div class="callout good">
+    <strong>Why this is safe</strong>
+    The scheduler is single-threaded. Every code path that touches
+    <code>ref_cnt</code> runs inside <code>Scheduler.schedule()</code> or
+    <code>Scheduler.update_from_output()</code>, and there's exactly one
+    scheduler thread per engine. No race possible.
+  </div>
+
+  <p>
+    This is load-bearing for performance: at thousands of blocks per step,
+    even a <code>threading.Lock</code> per touch would show up in profiles.
+    The single-threaded scheduler also makes the doubly-linked free list
+    safe and the hash table lock-free.
+  </p>
+
+  <div class="callout warn">
+    <strong>If anyone proposes to parallelize the scheduler</strong>
+    &hellip; they'll touch all three of these at once.
+  </div>
+
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k8">KV_CACHE_ASSUMPTIONS.html &sect;8</a> and the "Patterns" section at the bottom.</p>
+
+  <h2 id="preempt">11. When memory runs out: preempt the <em>youngest</em></h2>
+
+  <p>
+    Eventually a request can't allocate the blocks it needs. The scheduler
+    <strong>preempts</strong> another running request &mdash; kicks it out
+    of running state, frees its blocks, sends it back to WAITING.
+  </p>
+
+  <div class="callout info">
+    <strong>Counterintuitively, FCFS preempts the youngest</strong>
+    The oldest running request has the most computed K/V (longest context,
+    most blocks held). Preempting it would throw away tens of thousands
+    of tokens of work. Preempting the youngest throws away the least.
+  </div>
+
+  <p>
+    Preempted requests retry, often hitting the cache for their own
+    already-computed prefix on the second try. Preemption is conservative
+    and reversible; eviction (dropping cache entries entirely) is more
+    aggressive.
+  </p>
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k12">KV_CACHE_ASSUMPTIONS.html &sect;12</a>.</p>
+
+  <h2 id="sentinels">12. Two sentinels: null blocks and <code>PAD_SLOT_ID</code></h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>null block (<code>is_null=True</code>)</h3>
+      <p>
+        Appears in block tables for SWA or Mamba groups when a request
+        has logical positions that the layer won't read. Null blocks have
+        <code>ref_cnt=0</code> permanently and never enter the free queue.
+      </p>
+    </div>
+    <div class="box">
+      <h3><code>PAD_SLOT_ID = -1</code></h3>
+      <p>
+        Appears in the per-token <code>slot_mapping</code> for tokens that
+        exist in the batched tensor but aren't real (CUDA-graph padding,
+        decode positions past a request's end). Backends treat -1 as
+        invalid and skip the write.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Why both, and why -1?</strong>
+    Null blocks live in the <em>block table</em> (group-level metadata)
+    and mean "this position has no storage." <code>PAD_SLOT_ID</code>
+    lives in the <em>slot mapping</em> (per-token) and means "this token
+    isn't real." Different problems, different sentinels. <code>-1</code>
+    specifically because 0 is a valid block ID and a valid slot ID.
+  </div>
+  <p>&rarr; <a href="KV_CACHE_ASSUMPTIONS.html#k4">KV_CACHE_ASSUMPTIONS.html &sect;4</a>.</p>
+
+  <h2 id="linear">13. Linear attention (Mamba, RWKV) is a different problem</h2>
+
+  <p>
+    Everything so far assumed <em>softmax attention</em>: every past
+    token's K/V is addressable by index. <strong>Linear attention</strong>
+    doesn't work that way. It compresses the entire history into a
+    fixed-size <strong>state tensor</strong>:
+  </p>
+<pre><code>S[p]   = f(S[p-1], x[p])           # state evolves
+out[p] = g(S[p], x[p])             # output read from state</code></pre>
+
+  <div class="callout bad">
+    <strong>No positional structure</strong>
+    You can't ask the state "what was K at position 47?" &mdash; the
+    information has been irreversibly mixed into the running state. You
+    can only resume from a <em>checkpoint</em>.
+  </div>
+
+  <table>
+    <thead><tr><th>Aspect</th><th>Softmax attention</th><th>Linear attention</th></tr></thead>
+    <tbody>
+      <tr><td>Memory per request</td><td>O(N)</td><td>O(1) running, O(N/block_size) with prefix cache</td></tr>
+      <tr><td>Position lookup</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Partial sharing</td><td>Per-block (every 16 tokens)</td><td>Per-checkpoint only</td></tr>
+      <tr><td>Hit granularity</td><td>Continuous run of cached blocks</td><td>Latest single checkpoint</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    vLLM still uses the same <code>BlockPool</code>, same hashing, same
+    group abstraction for Mamba layers &mdash; but the <em>contents</em>
+    of a "block" mean something completely different. A Mamba block holds
+    "one snapshot of the recurrent state," and "block size" becomes the
+    <em>interval between snapshots</em>, not the number of cached tokens.
+  </p>
+
+  <p>
+    <code>MambaManager.find_longest_cache_hit</code> reflects this: scans
+    right-to-left and returns just <em>one</em> matching checkpoint, filling
+    all earlier slots with null blocks.
+  </p>
+
+  <p>&rarr; <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a> and <a href="MAMBA.html">MAMBA.html</a> for the full story.</p>
+
+  <h2 id="walk">14. The whole picture, in one walk-through</h2>
+
+  <p>What happens when a request arrives at vLLM:</p>
+<pre><code>Request: [tokens A B C D E F G H I J K L]   (12 tokens, block_size=4)</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">End-to-end: a 12-token request, 2 cached blocks + 1 new block</div>
+    <div class="flow">
+      <div class="flow-step b">
+        <span class="num">1 &mdash; HASH</span>
+        compute h<sub>0</sub>, h<sub>1</sub>, h<sub>2</sub>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g">
+        <span class="num">2 &mdash; LOCAL LOOKUP</span>
+        h<sub>0</sub>&rarr;47 &check;<br>
+        h<sub>1</sub>&rarr;89 &check;<br>
+        h<sub>2</sub> miss
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v">
+        <span class="num">3 &mdash; CONNECTOR</span>
+        external h<sub>2</sub>?<br>
+        <span style="color:var(--muted)">(none today)</span>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a">
+        <span class="num">4 &mdash; ALLOCATE</span>
+        touch(47, 89)<br>
+        pop 153<br>
+        table = [47, 89, 153]
+      </div>
+    </div>
+    <div class="flow">
+      <div class="flow-step b">
+        <span class="num">5 &mdash; SLOT MAP</span>
+        pos 8..11 &rarr;<br>
+        slots 612..615
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step r">
+        <span class="num">6 &mdash; FORWARD</span>
+        read K/V from 47, 89<br>
+        write block 153
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g">
+        <span class="num">7 &mdash; CACHE INSERT</span>
+        h<sub>2</sub> &rarr; 153<br>
+        <em>after</em> write completes
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v">
+        <span class="num">8 &mdash; FINISH</span>
+        dec ref(47, 89, 153)<br>
+        free queue, reverse order
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Steps 1-2 happen on CPU before the GPU is touched. Step 6 is the only GPU-heavy step &mdash; it processes <em>only</em> the new block. Step 7 is the deferred insert that makes prefix caching correct (see &sect;4).
+    </div>
+  </div>
+
+  <ol class="steps">
+    <li>
+      <strong>Lookup the prefix cache.</strong> Compute block hashes:
+<pre><code>block_0 hash = H(NONE_HASH, [A B C D])
+block_1 hash = H(block_0, [E F G H])
+block_2 hash = H(block_1, [I J K L])</code></pre>
+      Walk through <code>BlockHashToBlockMap</code>. Suppose blocks 0
+      and 1 hit (physical block IDs 47, 89). Block 2 misses.
+    </li>
+    <li><strong>External cache.</strong> If a connector is configured, ask whether peers/CPU/storage have block 2. Suppose no &mdash; proceed.</li>
+    <li><strong>Allocate.</strong> Touch blocks 47, 89 (pull out of free queue, increment ref counts). Pop a fresh ID &mdash; say, 153. Block table: <code>[47, 89, 153]</code>.</li>
+    <li><strong>Schedule.</strong> Write block table to GPU. Compute slot mapping for tokens needing processing (only block 2).</li>
+    <li><strong>Forward pass.</strong> Kernel reads K/V for cached prefix from 47 and 89, computes K/V for block 2, writes to block 153's slots.</li>
+    <li><strong>Cache the new block.</strong> After forward fills block 153, vLLM inserts <code>(block_2_hash &rarr; 153)</code> into <code>BlockHashToBlockMap</code>.</li>
+    <li><strong>Continue decoding.</strong> Each new token writes K/V to whichever block has space. When a block fills, hash it and add to the table.</li>
+    <li><strong>Finish.</strong> Decrement ref counts. Blocks whose ref count hits zero go to the free queue (in reverse order). If a future request hits their hash, they're pulled out and reused.</li>
+  </ol>
+
+  <h2 id="takeaways">15. The big takeaways</h2>
+
+  <ol>
+    <li><strong>The cache exists because attention is repetitive</strong> &mdash; same prefix means same K/V, so don't compute it twice.</li>
+    <li><strong>Blocks are the unit of everything.</strong> They make allocation O(1), kernels efficient, and hashing chainable.</li>
+    <li><strong>The chained hash is the key correctness mechanism.</strong> Anything weaker silently corrupts outputs.</li>
+    <li><strong>Groups partition layers by lifecycle.</strong> Different attention types need different block tables, scan directions, eviction rules.</li>
+    <li><strong>The uniform-block-size invariant</strong> is what lets one global block ID space serve all groups. Column-packed allocation builds on it.</li>
+    <li><strong>The single-threaded scheduler is load-bearing</strong> for ref counting, the free list, and the lock-free hash table.</li>
+    <li><strong>Linear attention reuses the allocator but has totally different semantics.</strong> Mamba blocks store state checkpoints, not K/V.</li>
+    <li><strong>Failures here are silent.</strong> No kernel-level alarm if a wrong block gets returned. That's why the code is dense with assertions.</li>
+  </ol>
+
+  <div class="callout info">
+    <strong>When you're ready for more depth</strong>
+    <ul>
+      <li><a href="KV_CACHE.html">KV_CACHE.html</a> &mdash; prefix-caching flow and the receptive-field argument.</li>
+      <li><a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a> &mdash; groups, block IDs, and the column-packed tensor layout.</li>
+      <li><a href="KV_CACHE_ASSUMPTIONS.html">KV_CACHE_ASSUMPTIONS.html</a> &mdash; the 15 hidden assumptions and what would break.</li>
+      <li><a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a> and <a href="MAMBA.html">MAMBA.html</a> &mdash; how the same machinery hosts a totally different architecture.</li>
+    </ul>
+  </div>
+</main>
+</body>
+</html>

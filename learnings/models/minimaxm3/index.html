@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax M3 in vLLM — Architecture, Blackwell Kernels &amp; KV Cache</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#30363d;
+    --txt:#e6edf3; --muted:#9da7b3; --accent:#7ee787; --accent2:#79c0ff;
+    --warn:#f0883e; --pink:#ff7b9c; --purple:#d2a8ff; --yellow:#f2cc60;
+    --mono:"SF Mono", "JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px 120px;}
+  header.hero{padding:48px 22px 30px;background:
+    radial-gradient(1200px 400px at 20% -10%, rgba(121,192,255,.18), transparent),
+    radial-gradient(900px 380px at 90% -10%, rgba(210,168,255,.16), transparent);
+    border-bottom:1px solid var(--border);}
+  header.hero .wrap{padding-bottom:0}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.4px}
+  h1 .tag{font:600 12px var(--mono);color:#0d1117;background:var(--accent);
+    padding:3px 8px;border-radius:6px;vertical-align:middle;margin-left:10px}
+  .sub{color:var(--muted);font-size:16px;margin:0}
+  .pill-row{margin-top:20px;display:flex;flex-wrap:wrap;gap:8px}
+  .pill{font:600 12px var(--mono);background:var(--panel);border:1px solid var(--border);
+    border-radius:20px;padding:5px 12px;color:var(--accent2)}
+  .pill b{color:var(--txt)}
+  h2{font-size:22px;margin:46px 0 14px;padding-top:14px;border-top:1px solid var(--border);
+    letter-spacing:-.3px}
+  h2 .num{color:var(--accent);font:700 18px var(--mono);margin-right:10px}
+  h3{font-size:17px;margin:26px 0 8px;color:var(--purple)}
+  p{margin:10px 0}
+  code{font:13px var(--mono);background:#22272e;padding:1px 6px;border-radius:5px;color:var(--yellow)}
+  a.src{font:12px var(--mono);color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--border)}
+  a.src:hover{color:var(--accent2)}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin:16px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  td code{font-size:12px}
+  .dt{font:600 11px var(--mono);padding:2px 7px;border-radius:5px;white-space:nowrap;display:inline-block}
+  .dt.bf16{background:rgba(121,192,255,.16);color:var(--accent2)}
+  .dt.fp8{background:rgba(240,136,62,.18);color:var(--warn)}
+  .dt.fp32{background:rgba(210,168,255,.16);color:var(--purple)}
+  .dt.i32{background:rgba(126,231,135,.14);color:var(--accent)}
+  .dt.uint8{background:rgba(242,204,96,.16);color:var(--yellow)}
+  .yes{color:var(--accent);font-weight:600}
+  .no{color:var(--muted)}
+  .partial{color:var(--yellow)}
+  .note{border-left:3px solid var(--accent2);background:var(--panel2);padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0}
+  .warnbox{border-left:3px solid var(--warn);background:rgba(240,136,62,.07);padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0}
+  /* layer stack */
+  .stack{display:flex;flex-direction:column;gap:4px;font:13px var(--mono);margin:8px 0}
+  .lyr{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;border:1px solid var(--border)}
+  .lyr .idx{color:var(--muted);min-width:62px}
+  .lyr .label{flex:1}
+  .lyr.dense{background:rgba(121,192,255,.08);border-color:rgba(121,192,255,.3)}
+  .lyr.sparse{background:rgba(210,168,255,.07);border-color:rgba(210,168,255,.28)}
+  .lyr.mtp{background:rgba(126,231,135,.07);border-color:rgba(126,231,135,.3)}
+  .lyr .badge{font:600 10px var(--mono);padding:2px 7px;border-radius:5px;background:#22272e;color:var(--muted)}
+  /* flow diagram */
+  .flow{display:flex;flex-direction:column;gap:0;margin:10px 0;font:13px var(--mono)}
+  .step{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;position:relative}
+  .step .k{color:var(--accent2);font-weight:600}
+  .arrow{text-align:center;color:var(--muted);font-size:16px;line-height:1.2;padding:2px 0}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0;font-size:12.5px;color:var(--muted)}
+  .legend span b{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:middle}
+  .big{font:700 30px var(--mono);color:var(--accent)}
+  .big.alt{color:var(--warn)}
+  .kpi{text-align:center;padding:18px}
+  .kpi .lbl{color:var(--muted);font-size:13px;margin-top:4px}
+  .meta{color:var(--muted);font-size:12.5px;margin-top:30px;border-top:1px solid var(--border);padding-top:14px}
+  ul.tight{margin:8px 0;padding-left:22px}
+  ul.tight li{margin:4px 0}
+  .twocol{column-count:2;column-gap:26px}
+  @media(max-width:760px){.twocol{column-count:1}}
+  .toc{font-size:14px;columns:2}
+  .toc a{color:var(--accent2);text-decoration:none;display:block;padding:3px 0}
+  .toc a:hover{text-decoration:underline}
+  @media(max-width:600px){.toc{columns:1}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>MiniMax&nbsp;M3 <span class="tag">vLLM walkthrough</span></h1>
+    <p class="sub">Sparse-attention MoE backbone — architecture, the kernels it runs on NVIDIA Blackwell (sm_100), tensor dtypes, and KV-cache size per token.</p>
+    <div class="pill-row">
+      <span class="pill"><b>60</b> layers</span>
+      <span class="pill"><b>6144</b> hidden</span>
+      <span class="pill"><b>128</b> experts · top-<b>4</b></span>
+      <span class="pill">GQA <b>64</b>q / <b>4</b>kv · <b>128</b> head</span>
+      <span class="pill">lightning indexer · top-<b>16</b> blocks</span>
+      <span class="pill"><b>1</b> MTP head</span>
+      <span class="pill">ModelOpt <b>MXFP8</b></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="card toc">
+    <a href="#arch">1 · Model architecture</a>
+    <a href="#decoder">2 · The decoder layer</a>
+    <a href="#attn">3 · Attention &amp; the lightning indexer</a>
+    <a href="#moe">4 · MoE &amp; dense MLP</a>
+    <a href="#kernels">5 · Blackwell kernels &amp; dtypes</a>
+    <a href="#dtype">6 · Dtype flow end-to-end</a>
+    <a href="#kv">7 · KV cache size per token</a>
+  </div>
+
+  <div class="note">
+    <b>What M3 is.</b> MiniMax&nbsp;M3 is a DeepSeek-V3.2-style <em>sparse-attention</em> MoE model — <b>not</b> the
+    linear-attention MiniMax-Text-01 / M2 family. Each long-context attention layer runs a tiny "lightning indexer"
+    that scores 128-token KV blocks, keeps the top-16, and attends only to those. The vLLM implementation lives under
+    <code>vllm/models/minimax_m3/</code>, split into a hardware-neutral <code>common/</code> and per-vendor
+    <code>nvidia/</code> + <code>amd/</code> branches (mirrors <code>deepseek_v4</code>). Everything below describes the
+    <b>NVIDIA / Blackwell</b> branch.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="arch"><span class="num">1</span>Model architecture</h2>
+
+  <p>The registry entry is <code>MiniMaxM3SparseForCausalLM</code> (text) wrapped by
+  <code>MiniMaxM3SparseForConditionalGeneration</code> for the VL variant
+  <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L935">model.py:935</a>. The backbone is
+  60 decoder layers over a 6144-d residual stream:</p>
+
+  <div class="card">
+    <div style="font:13px var(--mono);color:var(--muted);margin-bottom:6px">MiniMaxM3Model</div>
+    <div class="stack">
+      <div class="lyr" style="background:#22272e"><span class="idx">embed</span><span class="label">VocabParallelEmbedding · vocab 200064 → 6144</span><span class="dt bf16">bf16</span></div>
+      <div class="lyr dense"><span class="idx">layer 0–2</span><span class="label">full attention + <b>dense</b> SwiGLU-OAI MLP (12288)</span><span class="badge">dense ×3</span></div>
+      <div class="lyr sparse"><span class="idx">layer 3–59</span><span class="label">indexer + <b>block-sparse</b> attention + <b>MoE</b> (128 experts, top-4 + 1 shared)</span><span class="badge">sparse ×57</span></div>
+      <div class="lyr" style="background:#22272e"><span class="idx">norm</span><span class="label">final Gemma RMSNorm</span><span class="dt bf16">bf16</span></div>
+      <div class="lyr" style="background:#22272e"><span class="idx">lm_head</span><span class="label">ParallelLMHead → LogitsProcessor (untied, 200064)</span><span class="dt fp32">fp32 logits</span></div>
+      <div class="lyr mtp"><span class="idx">MTP ×1</span><span class="label">one extra sparse decoder layer for multi-token prediction / EAGLE3 spec decode</span><span class="badge">optional</span></div>
+    </div>
+    <div class="legend">
+      <span><b style="background:rgba(121,192,255,.5)"></b>dense layer</span>
+      <span><b style="background:rgba(210,168,255,.5)"></b>sparse layer</span>
+      <span><b style="background:rgba(126,231,135,.5)"></b>MTP (spec decode only)</span>
+    </div>
+  </div>
+
+  <p>Two <em>independent</em> config-driven splits decide each layer's behaviour
+  <a class="src" href="../../../vllm/transformers_utils/configs/minimax_m3.py#L85">minimax_m3.py:85</a>:</p>
+  <ul class="tight">
+    <li><code>moe_layer_freq = [0]*3 + [1]*57</code> → layers 0–2 use a <b>dense MLP</b>, layers 3–59 use the <b>MoE</b> block.</li>
+    <li><code>sparse_attention_freq = [0]*3 + [1]*57</code> → layers 0–2 use <b>full attention</b>, layers 3–59 use the <b>lightning-indexer block-sparse</b> path.</li>
+  </ul>
+  <p>For the default checkpoint the two splits coincide, but the code keeps them separate — don't assume "MoE layer" ⇒ "sparse-attention layer".</p>
+
+  <h3>Key config</h3>
+  <table>
+    <tr><th>Field</th><th>Value</th><th>Field</th><th>Value</th></tr>
+    <tr><td><code>hidden_size</code></td><td>6144</td><td><code>num_hidden_layers</code></td><td>60</td></tr>
+    <tr><td><code>num_attention_heads</code></td><td>64</td><td><code>num_key_value_heads</code></td><td>4 (GQA)</td></tr>
+    <tr><td><code>head_dim</code></td><td>128</td><td><code>partial_rotary_factor</code></td><td>0.5 → rotary_dim 64</td></tr>
+    <tr><td><code>rope_theta</code></td><td>5e6</td><td><code>max_position_embeddings</code></td><td>524288</td></tr>
+    <tr><td><code>num_local_experts</code></td><td>128</td><td><code>num_experts_per_tok</code></td><td>4 + 1 shared</td></tr>
+    <tr><td><code>dense_intermediate_size</code></td><td>12288</td><td><code>intermediate_size</code> (expert)</td><td>3072</td></tr>
+    <tr><td><code>scoring_func</code></td><td>sigmoid + bias</td><td><code>routed_scaling_factor</code></td><td>2.0</td></tr>
+    <tr><td><code>hidden_act</code></td><td>swigluoai (α 1.702, limit 7.0)</td><td><code>vocab_size</code></td><td>200064</td></tr>
+    <tr><td colspan="2"><b>sparse</b> <code>sparse_index_dim</code> 128 · <code>sparse_num_index_heads</code> 4</td><td colspan="2"><code>sparse_topk_blocks</code> 16 · <code>sparse_block_size</code> 128 · score <code>max</code></td></tr>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="decoder"><span class="num">2</span>The decoder layer</h2>
+
+  <p>One class <code>MiniMaxM3DecoderLayer</code> serves every layer and branches internally on its index
+  <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L658">model.py:658</a>. All norms are
+  <b>Gemma-style RMSNorm</b> (<code>use_gemma_norm=True</code>, the <code>(1+w)</code> scaling baked into FlashInfer kernels).</p>
+
+  <div class="card">
+    <div class="flow">
+      <div class="step"><span class="k">residual ← hidden_states</span> &nbsp;(<span class="dt bf16">bf16</span> stream)</div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">input_layernorm</span> — Gemma RMSNorm (fused with the previous layer's deferred all-reduce when <code>fuse_input_allreduce</code>)</div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">self_attn</span> — <span class="partial">MiniMaxM3Attention</span> (dense) <b>or</b> <span style="color:var(--purple)">MiniMaxM3SparseAttention</span> (indexer + block-sparse). <code>o_proj</code> with <code>reduce_results=False</code></div>
+      <div class="arrow">↓ &nbsp;+ residual</div>
+      <div class="step"><span class="k">post_attention_layernorm</span> — <code>fused_allreduce_gemma_rms_norm</code> (completes the attention all-reduce)</div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">block_sparse_moe</span> (sparse layers) <b>or</b> <span class="k">mlp</span> (dense layers 0–2)</div>
+      <div class="arrow">↓ &nbsp;+ residual → next layer</div>
+    </div>
+    <p style="font-size:13px;color:var(--muted);margin:6px 0 0">Both the attention <code>o_proj</code> and the dense-MLP <code>down_proj</code> set <code>reduce_results=False</code>; the tensor-parallel all-reduce is <b>deferred and fused</b> into the next Gemma RMSNorm via <code>fused_allreduce_gemma_rms_norm</code> (under PP=1) <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L760">model.py:760</a>.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="attn"><span class="num">3</span>Attention &amp; the lightning indexer</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">Dense layers (0–2) — full attention</h3>
+      <ul class="tight">
+        <li>Merged <code>QKVParallelLinear</code> (no bias), 64 q / 4 kv heads × 128.</li>
+        <li><b>Per-head</b> Gemma QK-norm + <b>partial NeoX RoPE</b> (first 64 of 128 dims rotated).</li>
+        <li>No output gate (<code>attention_output_gate=False</code>).</li>
+        <li>QK-norm + RoPE + KV-insert collapse into one C++ op <code>fused_minimax_m3_qknorm_rope_kv_insert</code> <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L368">model.py:368</a>.</li>
+        <li>Runs the generic <code>Attention</code> layer → FlashInfer trtllm-gen on Blackwell.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Sparse layers (3–59) — indexer + block-sparse</h3>
+      <ul class="tight">
+        <li>One fused GEMM <code>MinimaxM3QKVParallelLinearWithIndexer</code> emits <code>[q | k | v | index_q | index_k]</code> <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L437">model.py:437</a>.</li>
+        <li>Index query: <b>4 heads × 128</b>; index key: a <b>single 128-d vector</b> per token.</li>
+        <li>Indexer scores each 128-token block (<code>max</code> over the block), keeps <b>top-16</b>.</li>
+        <li>Main attention then runs only over the selected blocks.</li>
+        <li>Index value/output projections are <b>always disabled</b> in M3.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Sparse-attention forward path</h3>
+  <div class="card">
+    <div class="flow">
+      <div class="step">fused QKV+indexer GEMM → <code>[q|k|v|index_q|index_k]</code> &nbsp;<span class="dt bf16">bf16</span></div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">fused_minimax_m3_qknorm_rope_kv_insert</span> — Gemma QK-norm + partial RoPE on q / k / index_q / index_k, <b>and</b> scatter-insert k,v → main paged cache and index_k → indexer side-cache</div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">indexer(index_query)</span> — Triton score (<code>max</code> over 128-token blocks, <span class="dt fp32">fp32</span>) + bitonic <b>top-16</b> selection → <code>topk_idx</code> <span class="dt i32">int32</span> block ids <a class="src" href="../../../vllm/models/minimax_m3/common/ops/index_topk.py#L81">index_topk.py:81</a></div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">impl.forward(q, kv_cache, topk_idx)</span> — block-sparse attention over selected pages → output</div>
+      <div class="arrow">↓</div>
+      <div class="step"><span class="k">o_proj</span> (RowParallelLinear, all-reduce deferred to next norm)</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Impl is chosen at runtime</b> by <code>select_main_impl_cls</code> <a class="src" href="../../../vllm/models/minimax_m3/common/sparse_attention.py#L376">sparse_attention.py:376</a>:
+    on Blackwell (capability-family 100) with a <b>bf16</b> KV cache and <code>topk_blocks ∈ {4,8,16,32}</code>, <b>prefill</b> uses the
+    SM100 MSA FMHA (<code>fmha_sm100</code>); otherwise (fp8 KV, non-Blackwell) it falls back to Triton. <b>Decode always uses Triton split-K</b> — there is no MSA decode kernel yet
+    <a class="src" href="../../../vllm/models/minimax_m3/nvidia/sparse_attention_msa.py#L51">sparse_attention_msa.py:51</a>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="moe"><span class="num">4</span>MoE &amp; dense MLP</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">MoE block (layers 3–59)</h3>
+      <ul class="tight">
+        <li><b>Router</b> <code>GateLinear</code>: weights &amp; logits in <span class="dt fp32">fp32</span>, sigmoid scoring + per-expert correction bias <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L226">model.py:226</a>.</li>
+        <li>128 experts, <b>top-4</b>, <code>renormalize</code>, <code>routed_scaling_factor=2.0</code>.</li>
+        <li><b>1 shared expert</b> (always-on MLP, fused into the FusedMoE call).</li>
+        <li>Activation <code>swigluoai_uninterleave</code> folded into the expert kernel.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Dense MLP (layers 0–2)</h3>
+      <ul class="tight">
+        <li><code>MergedColumnParallelLinear</code> gate_up → <code>RowParallelLinear</code> down, no bias.</li>
+        <li><code>dense_intermediate_size = 12288</code>.</li>
+        <li>SwiGLU-OAI via the <code>silu_and_mul_with_clamp</code> C++ kernel: <code>clamp(gate)·σ(α·gate)·(clamp(up)+β)</code> with α=1.702, limit=7.0.</li>
+        <li><code>down_proj</code> all-reduce deferred into the next layer's input norm.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="kernels"><span class="num">5</span>Blackwell kernels &amp; their dtypes</h2>
+
+  <p>M3 is shipped as a <b>ModelOpt MXFP8</b> checkpoint: linear/expert weights are
+  <span class="dt fp8">fp8_e4m3fn</span> values with <span class="dt uint8">uint8</span> (E8M0) micro-scales over
+  <b>1×32</b> blocks <a class="src" href="../../../vllm/model_executor/layers/quantization/utils/mxfp8_utils.py#L9">mxfp8_utils.py:9</a>.
+  The practical split on Blackwell: <b>attention runs in bf16</b>, <b>MoE expert GEMMs run in fp8</b> with fp32 accumulation.</p>
+
+  <table>
+    <tr><th>Kernel / op</th><th>Computes</th><th>In → Out dtype</th><th>Blackwell-gated</th></tr>
+    <tr>
+      <td><b>FlashInfer trtllm-gen attn</b><br><span style="color:var(--muted);font-size:12px">dense layers 0–2</span></td>
+      <td>Full GQA attention, head 128</td>
+      <td><span class="dt bf16">bf16</span> q/k/v, <span class="dt bf16">bf16</span>/<span class="dt fp8">fp8</span> KV → <span class="dt bf16">bf16</span> (fp32 softmax)</td>
+      <td class="yes">yes — family 100</td>
+    </tr>
+    <tr>
+      <td><b>MSA sparse FMHA</b> <code>fmha_sm100</code><br><span style="color:var(--muted);font-size:12px">build_k2q_csr + sparse_atten_func · sparse <em>prefill</em></span></td>
+      <td>Block-sparse attention over indexer-selected 128-blocks</td>
+      <td><span class="dt bf16">bf16</span> q + bf16 KV → <span class="dt bf16">bf16</span></td>
+      <td class="yes">yes — sm100 + bf16 KV + topk∈{4,8,16,32}</td>
+    </tr>
+    <tr>
+      <td><b>Triton block-sparse decode</b><br><span style="color:var(--muted);font-size:12px">sparse <em>decode</em> (split-K + merge)</span></td>
+      <td>Flash-decoding over selected blocks</td>
+      <td><span class="dt bf16">bf16</span> q; bf16/fp8 KV (dequant on load) → <span class="dt bf16">bf16</span> (fp32 acc)</td>
+      <td class="no">no — used on BW (no MSA decode yet)</td>
+    </tr>
+    <tr>
+      <td><b>Triton block-sparse prefill</b><br><span style="color:var(--muted);font-size:12px">fallback when MSA-ineligible</span></td>
+      <td>Block-sparse prefill</td>
+      <td><span class="dt bf16">bf16</span> q; bf16/fp8 KV → <span class="dt bf16">bf16</span></td>
+      <td class="no">no</td>
+    </tr>
+    <tr>
+      <td><b>Triton lightning-indexer</b><br><span style="color:var(--muted);font-size:12px">index_topk.py — score + bitonic top-k</span></td>
+      <td>Per-block max score → top-16 block ids</td>
+      <td><span class="dt bf16">bf16</span> idx_q/idx_k → scores <span class="dt fp32">fp32</span>, ids <span class="dt i32">int32</span></td>
+      <td class="no">no (PDL on sm9+)</td>
+    </tr>
+    <tr>
+      <td><b>fused_minimax_m3_qknorm_rope_kv_insert</b> (C++)<br><span style="color:var(--muted);font-size:12px">torch.ops._C</span></td>
+      <td>Per-head Gemma QK-norm + partial RoPE + paged KV/index-K insert</td>
+      <td><span class="dt bf16">bf16</span> (fp32 variance) → <span class="dt bf16">bf16</span> in place</td>
+      <td class="no">no</td>
+    </tr>
+    <tr>
+      <td><b>FlashInfer Gemma RMSNorm</b><br><span style="color:var(--muted);font-size:12px">gemma_rmsnorm / gemma_fused_add_rmsnorm</span></td>
+      <td>(1+w)-scaled RMSNorm, fused add+norm</td>
+      <td><span class="dt bf16">bf16</span> (fp32 acc) → <span class="dt bf16">bf16</span></td>
+      <td class="no">no</td>
+    </tr>
+    <tr>
+      <td><b>FlashInfer trtllm fused AR+norm</b><br><span style="color:var(--muted);font-size:12px">fused_allreduce_gemma_rms_norm</span></td>
+      <td>TP all-reduce + residual add + Gemma RMSNorm</td>
+      <td><span class="dt bf16">bf16</span> (fp32 acc) → <span class="dt bf16">bf16</span></td>
+      <td class="partial">effectively — needs FI workspace, else eager fallback</td>
+    </tr>
+    <tr>
+      <td><b>FlashInfer trtllm MXFP8 grouped GEMM</b><br><span style="color:var(--muted);font-size:12px">fused MoE experts (w13, w2)</span></td>
+      <td>Routed-expert SwiGLU-OAI MoE GEMMs</td>
+      <td><span class="dt fp8">fp8_e4m3</span> act+wt, <span class="dt uint8">uint8</span> scales → <span class="dt bf16">bf16</span> (fp32 acc)</td>
+      <td class="yes">yes — family 100 + FI fused-moe</td>
+    </tr>
+    <tr>
+      <td><b>MXFP8 quantize</b> (Triton)<br><span style="color:var(--muted);font-size:12px">feeds the MoE GEMM</span></td>
+      <td>Dynamic per-token act quant + E8M0 scales</td>
+      <td><span class="dt bf16">bf16</span> → <span class="dt fp8">fp8_e4m3</span> + <span class="dt uint8">uint8</span></td>
+      <td class="no">no</td>
+    </tr>
+    <tr>
+      <td><b>silu_and_mul_with_clamp</b> (C++)<br><span style="color:var(--muted);font-size:12px">dense MLP + shared expert</span></td>
+      <td>SwiGLU-OAI <code>clamp(g)·σ(αg)·(clamp(u)+β)</code></td>
+      <td><span class="dt bf16">bf16</span> (fp32 mid) → <span class="dt bf16">bf16</span></td>
+      <td class="no">no</td>
+    </tr>
+    <tr>
+      <td><b>GateLinear router GEMM</b><br><span style="color:var(--muted);font-size:12px">dsv3_router_gemm / cuBLAS</span></td>
+      <td>MoE router logits</td>
+      <td><span class="dt bf16">bf16</span> x, <span class="dt fp32">fp32</span> wt → <span class="dt fp32">fp32</span> logits</td>
+      <td class="partial">partly — specialized kernel sm90+/shape</td>
+    </tr>
+    <tr>
+      <td><b>reshape_and_cache_flash</b> (C++)<br><span style="color:var(--muted);font-size:12px">dense layers KV insert</span></td>
+      <td>Scatter K/V into paged cache by slot</td>
+      <td><span class="dt bf16">bf16</span>/<span class="dt fp8">fp8</span> → cache</td>
+      <td class="no">no</td>
+    </tr>
+  </table>
+
+  <div class="warnbox">
+    <b>Not an M3 kernel.</b> The <code>vllm/model_executor/layers/minimax_rms_norm/</code> Lamport one-shot all-reduce + QK-RMSNorm
+    (<code>minimax_allreduce_rms_qk</code>) belongs to <b>MiniMax-M2</b> and the linear-attention layer, not M3. M3's tensor-parallel
+    fusion is the FlashInfer <code>fused_allreduce_gemma_rms_norm</code> path above. Easy to conflate by the shared "minimax" prefix.
+  </div>
+
+  <div class="note">
+    <b>MSA warmup.</b> <code>minimax_m3_msa_warmup</code> runs a dummy mixed-batch prefill to compile the SM100
+    <code>fmha_sm100</code> sparse kernels before serving — gated to <code>is_cuda() &amp;&amp; is_device_capability_family(100)</code>,
+    so it only fires on Blackwell <a class="src" href="../../../vllm/model_executor/warmup/minimax_m3_msa_warmup.py#L29">minimax_m3_msa_warmup.py:29</a>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="dtype"><span class="num">6</span>Dtype flow end-to-end</h2>
+
+  <table>
+    <tr><th>Stage</th><th>Dtype</th><th>Notes</th></tr>
+    <tr><td>Token embeddings &amp; residual stream</td><td><span class="dt bf16">bf16</span></td><td>model compute dtype; never cast off bf16 in the main path</td></tr>
+    <tr><td>Attention Q/K/V compute</td><td><span class="dt bf16">bf16</span></td><td>projection <em>weights</em> may be MXFP8; activations &amp; attention math are bf16</td></tr>
+    <tr><td>Main KV cache</td><td><span class="dt bf16">bf16</span> · opt <span class="dt fp8">fp8</span></td><td>default <code>auto</code>=bf16; <code>--kv-cache-dtype fp8</code> stores e4m3/e5m2, dequant on load</td></tr>
+    <tr><td>Indexer keys / queries / cache</td><td><span class="dt bf16">bf16</span></td><td><b>always bf16</b> — fp8/fp4 hard-raise <code>NotImplementedError</code> <a class="src" href="../../../vllm/models/minimax_m3/common/indexer.py#L123">indexer.py:123</a></td></tr>
+    <tr><td>Indexer scores → block ids</td><td><span class="dt fp32">fp32</span> → <span class="dt i32">int32</span></td><td>max-pooled per block, bitonic top-k</td></tr>
+    <tr><td>MoE router (gate)</td><td><span class="dt fp32">fp32</span></td><td>weights &amp; logits upcast to fp32 regardless of expert dtype</td></tr>
+    <tr><td>MoE expert weights + activations</td><td><span class="dt fp8">fp8_e4m3</span></td><td>MXFP8 1×32 micro-scaled, fp32 accumulate, <span class="dt bf16">bf16</span> out</td></tr>
+    <tr><td>Final logits</td><td><span class="dt fp32">fp32</span></td><td>standard LogitsProcessor output over the untied lm_head</td></tr>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="kv"><span class="num">7</span>KV cache size per token</h2>
+
+  <p>Each <b>sparse</b> attention layer registers <b>two</b> caches; each <b>dense</b> layer registers only the main one.
+  All figures are per tensor-parallel rank at TP=1 (they scale ~<code>1/tp</code> down to a 1-head floor).</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">① Main GQA K/V cache <span style="font-weight:400;color:var(--muted);font-size:13px">— every layer</span></h3>
+      <p style="font:13px var(--mono);color:var(--muted)">FullAttentionSpec · shape (blocks, <b>2</b>, 128, kv_heads, head)</p>
+      <p>Per token = <code>2 (K,V) × 4 kv_heads × 128 × dtype</code></p>
+      <p><span class="dt bf16">bf16</span> = <b>2048 B</b> &nbsp;·&nbsp; <span class="dt fp8">fp8</span> = <b>1024 B</b>
+      <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py#L537">model.py:537</a></p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">② Indexer key cache <span style="font-weight:400;color:var(--muted);font-size:13px">— sparse layers only</span></h3>
+      <p style="font:13px var(--mono);color:var(--muted)">MLAAttentionSpec · shape (blocks, 128, head) — <b>key-only, 1 head</b></p>
+      <p>Per token = <code>1 × 128 × 2</code> (always bf16)</p>
+      <p><span class="dt bf16">bf16</span> = <b>256 B</b> &nbsp;<span style="color:var(--muted)">(does not shrink under fp8 KV)</span>
+      <a class="src" href="../../../vllm/models/minimax_m3/common/indexer.py#L142">indexer.py:142</a></p>
+    </div>
+  </div>
+
+  <p>The sparse layers keep the <b>full</b> K/V cache — sparsity is applied only at attention time by selecting blocks,
+  so nothing is dropped from storage. The indexer key cache is purely additive.</p>
+
+  <h3>Per-token totals (60-layer backbone)</h3>
+  <table>
+    <tr><th>Layers</th><th>Count</th><th>Main KV / tok</th><th>Indexer / tok</th><th>Subtotal / tok (bf16)</th></tr>
+    <tr><td>Dense full-attn (0–2)</td><td>3</td><td>2048 B</td><td>—</td><td>6,144 B</td></tr>
+    <tr><td>Sparse attn (3–59)</td><td>57</td><td>2048 B</td><td>256 B</td><td>131,328 B</td></tr>
+    <tr style="border-top:2px solid var(--accent)"><td colspan="4"><b>Total per token (default bf16 KV)</b></td><td><b>137,472 B</b></td></tr>
+  </table>
+
+  <div class="grid2">
+    <div class="card kpi">
+      <div class="big">134.25 KiB</div>
+      <div class="lbl">per token · <b>bf16</b> KV cache (default)<br>137,472 bytes · indexer ≈ 10.6%</div>
+    </div>
+    <div class="card kpi">
+      <div class="big alt">74.25 KiB</div>
+      <div class="lbl">per token · <b>fp8</b> KV cache (<code>--kv-cache-dtype fp8</code>)<br>76,032 bytes · indexer stays bf16 ≈ 19.2%</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>With MTP / spec decode enabled</b>, the single MTP layer is a full sparse layer and adds one more layer's worth:
+    <b>+2,304 B</b> (bf16) or <b>+1,280 B</b> (fp8) per token — grand totals
+    <b>≈136.5 KiB</b> (bf16) / <b>≈75.5 KiB</b> (fp8). It is only allocated when a speculative/MTP config is active
+    <a class="src" href="../../../vllm/models/minimax_m3/nvidia/mtp.py#L54">mtp.py:54</a>.
+  </div>
+
+  <div class="warnbox">
+    <b>Asymmetry to remember:</b> fp8 halves the main K/V cache but leaves the indexer cache at bf16 (it's hard-coded to bf16 today),
+    so the indexer's share of the footprint nearly doubles in relative terms (10.6% → 19.2%) when you switch to fp8 KV.
+  </div>
+
+  <div class="meta">
+    Sources (grep-verified against working tree): architecture &amp; dtypes
+    <a class="src" href="../../../vllm/models/minimax_m3/nvidia/model.py">nvidia/model.py</a>;
+    sparse attention
+    <a class="src" href="../../../vllm/models/minimax_m3/common/sparse_attention.py">common/sparse_attention.py</a>,
+    <a class="src" href="../../../vllm/models/minimax_m3/nvidia/sparse_attention_msa.py">nvidia/sparse_attention_msa.py</a>;
+    indexer
+    <a class="src" href="../../../vllm/models/minimax_m3/common/indexer.py">common/indexer.py</a>,
+    <a class="src" href="../../../vllm/models/minimax_m3/common/ops/index_topk.py">common/ops/index_topk.py</a>,
+    <a class="src" href="../../../vllm/models/minimax_m3/common/ops/sparse_attn.py">common/ops/sparse_attn.py</a>;
+    config
+    <a class="src" href="../../../vllm/transformers_utils/configs/minimax_m3.py">configs/minimax_m3.py</a>;
+    KV byte formulas
+    <a class="src" href="../../../vllm/v1/kv_cache_interface.py">v1/kv_cache_interface.py</a>.
+    Describes the NVIDIA/Blackwell branch as of this working tree (branch <code>dao/understand</code>). Verify against source before relying on specifics — code moves.
+  </div>
+
+</div>
+</body>
+</html>

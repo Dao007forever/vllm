@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Why Mamba Is a Different Cache Problem</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <a href="MAMBA.md">MAMBA.md</a>
+  </div>
+
+  <h1>Why Mamba Is a Different Cache Problem</h1>
+  <p class="subtitle">
+    Sibling document to <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a>:
+    one layer down, what makes <strong>Mamba</strong> specifically
+    awkward for the cache subsystem &mdash; selectivity, two state
+    tensors, two kernels, a block-size constraint that doesn't come
+    from the math.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      Mamba is a <em>selective</em> state-space model (state-update
+      weights are a function of the input) with <strong>two</strong>
+      state tensors per layer, <strong>two</strong> kernels (parallel
+      scan for prefill, step recurrence for decode), and a
+      <strong>block-size constraint imposed by vLLM's allocator</strong>
+      rather than the math. The conv state forces a special
+      <code>align</code> cache mode; selectivity blocks fast-forward
+      replay; the sequential recurrence blocks DCP/PCP. Each row of the
+      summary table below is a place the cache infrastructure grew a
+      Mamba-specific affordance.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#two-tensors">1. Two state tensors per layer</a></li>
+      <li><a href="#selectivity">2. Selectivity</a></li>
+      <li><a href="#two-kernels">3. Two kernels: scan vs recurrence</a></li>
+      <li><a href="#chunk-vs-block">4. <code>chunk_size</code> isn't <code>block_size</code></a></li>
+      <li><a href="#align">5. Why <code>align</code> mode exists</a></li>
+      <li><a href="#spec">6. <code>num_speculative_blocks</code></a></li>
+      <li><a href="#dcp">7. DCP and PCP are not supported</a></li>
+      <li><a href="#hybrid">8. Hybrid layouts (Jamba, Granite)</a></li>
+      <li><a href="#blocksize-meaning">9. What "block size" even means for Mamba</a></li>
+      <li><a href="#table">10. Summary table</a></li>
+      <li><a href="#lesson">11. The general lesson</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="two-tensors">1. Mamba's "state" is two tensors, not one</h2>
+
+  <p>
+    <code>MambaSpec.shapes</code> is
+    <code>tuple[tuple[int, ...], ...]</code>
+    (<span class="fileref">kv_cache_interface.py:532</span>) &mdash;
+    plural. Every Mamba layer keeps two buffers per request:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>SSM state <span class="tag mamba">d_inner &times; d_state</span></h3>
+      <p>
+        The long-range recurrent summary. This is the "linear-attention
+        state" from <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a>.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Conv state <span class="tag mamba">d_inner &times; (d_conv &minus; 1)</span></h3>
+      <p>
+        A tiny rolling window of recent activations feeding the depthwise
+        1D convolution between input projection and the selective scan
+        (<code>d_conv = 4</code> typically).
+      </p>
+    </div>
+  </div>
+
+  <p>Both have to be persisted, restored, and shipped together. The cache infrastructure treats them as a single "page" &mdash; <code>page_size_bytes</code> sums both &mdash; but the kernel addresses them separately.</p>
+
+  <div class="diagram">
+    <div class="diagram-title">One Mamba layer's state per request: two tensors, one page</div>
+    <div class="compare">
+      <div class="side left">
+        <h4 style="margin-top:0">SSM state &mdash; the recurrent summary</h4>
+        <p style="font-size:0.85em">Shape: <code>d_inner &times; d_state</code> (e.g. 16 &times; 16).
+        Holds the entire history compressed.</p>
+        <div style="display:grid;grid-template-columns:repeat(8,1fr);gap:2px;margin-top:8px;max-width:280px">
+          <div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div>
+          <div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div>
+          <div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div>
+          <div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div>
+          <div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div>
+          <div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div><div class="cell xs full-grp">s</div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px">
+          <strong>Lifecycle:</strong> updated by <em>every</em> token in the step recurrence. Reading the state at position <em>t</em> means reading "everything t and before, fused into one tensor."
+        </p>
+      </div>
+      <div class="vs">+</div>
+      <div class="side right">
+        <h4 style="margin-top:0">Conv state &mdash; rolling window</h4>
+        <p style="font-size:0.85em">Shape: <code>d_inner &times; (d_conv &minus; 1)</code> (e.g. 16 &times; 3 when <code>d_conv = 4</code>).
+        Holds the last 3 token activations before convolution.</p>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:2px;margin-top:8px;max-width:110px">
+          <div class="cell xs mamba-grp">c<sub>t-3</sub></div><div class="cell xs mamba-grp">c<sub>t-2</sub></div><div class="cell xs mamba-grp">c<sub>t-1</sub></div>
+          <div class="cell xs mamba-grp">c<sub>t-3</sub></div><div class="cell xs mamba-grp">c<sub>t-2</sub></div><div class="cell xs mamba-grp">c<sub>t-1</sub></div>
+          <div class="cell xs mamba-grp">c<sub>t-3</sub></div><div class="cell xs mamba-grp">c<sub>t-2</sub></div><div class="cell xs mamba-grp">c<sub>t-1</sub></div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px">
+          <strong>Lifecycle:</strong> shift-left + append on every token. If you drop it and restart, the depthwise conv produces wrong outputs until 3 fresh tokens refill it.
+        </p>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <code>page_size_bytes = sizeof(SSM) + sizeof(conv) + padding</code>. Both tensors must be saved/restored atomically &mdash; the cache "page" is the bundle, but two distinct kernels touch the two halves.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Why <code>page_size_padded</code> exists</strong>
+    The two tensors' raw byte sum may not match attention's
+    <code>page_size</code>, so vLLM pads the Mamba page up to the uniform
+    invariant from <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a>.
+    Padding bytes are unused but make the column-packed tensor layout work.
+  </div>
+
+  <div class="callout bad">
+    <strong>What this changes vs "generic linear attention"</strong>
+    A state hand-off between layers, steps, or machines must move
+    <em>both</em> tensors atomically. Restoring only the SSM state and
+    zeroing the conv state would inject a 3-step transient where the
+    convolution sees fresh-start input &mdash; garbage tokens until the
+    conv buffer fills. The <code>align</code> cache mode exists for
+    exactly this conv-state subtlety.
+  </div>
+
+  <h2 id="selectivity">2. Selectivity: state-update weights depend on the input</h2>
+
+  <p>Original S4 had fixed <code>(A, B, C)</code> matrices. <strong>Mamba's selective SSM</strong> makes <code>A_t, B_t, C_t</code> functions of the input token at step <code>t</code>:</p>
+
+<pre><code>A_t, B_t, C_t = projection(x_t)
+S_t = A_t &middot; S_{t-1} + B_t &middot; x_t
+y_t = C_t &middot; S_t</code></pre>
+
+  <p>This is the architectural innovation that earned the "Mamba" name over S4.</p>
+
+  <div class="diagram">
+    <div class="diagram-title">Selectivity: every token decides how much past it keeps</div>
+    <div class="flow">
+      <div class="flow-step" style="background:#fff5e6;border-color:#f7d599">
+        <div style="font-size:0.78em;color:var(--muted);font-weight:600">step t = 5</div>
+        <div style="margin-top:4px"><code>x</code> = "the"</div>
+        <div style="font-size:0.78em;color:var(--muted);margin-top:4px">low-info filler word</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step" style="background:#fff;border-color:var(--border)">
+        <div style="font-size:0.78em;color:var(--muted);font-weight:600">projection</div>
+        <div style="margin-top:4px;font-size:0.85em"><code>A<sub>5</sub>, B<sub>5</sub>, C<sub>5</sub></code></div>
+        <div style="font-size:0.78em;color:var(--green);margin-top:4px">A close to I &rarr; keep state</div>
+        <div style="font-size:0.78em;color:var(--green)">B near 0 &rarr; ignore input</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step" style="background:#eaf6ee;border-color:#abd1bb">
+        <div style="font-size:0.78em;color:var(--muted);font-weight:600">S<sub>5</sub></div>
+        <div style="margin-top:4px">&asymp; S<sub>4</sub></div>
+      </div>
+    </div>
+    <div class="flow" style="margin-top:8px">
+      <div class="flow-step" style="background:#ffefef;border-color:#e0b3ae">
+        <div style="font-size:0.78em;color:var(--muted);font-weight:600">step t = 6</div>
+        <div style="margin-top:4px"><code>x</code> = "Mamba"</div>
+        <div style="font-size:0.78em;color:var(--muted);margin-top:4px">salient noun</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step" style="background:#fff;border-color:var(--border)">
+        <div style="font-size:0.78em;color:var(--muted);font-weight:600">projection</div>
+        <div style="margin-top:4px;font-size:0.85em"><code>A<sub>6</sub>, B<sub>6</sub>, C<sub>6</sub></code></div>
+        <div style="font-size:0.78em;color:var(--red);margin-top:4px">A smaller &rarr; forget some past</div>
+        <div style="font-size:0.78em;color:var(--red)">B large &rarr; absorb input</div>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step" style="background:#fdeaea;border-color:#e0b3ae">
+        <div style="font-size:0.78em;color:var(--muted);font-weight:600">S<sub>6</sub></div>
+        <div style="margin-top:4px">&ne; S<sub>5</sub></div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <strong>S4 (fixed gates):</strong> <code>A</code>, <code>B</code>, <code>C</code> are model parameters &mdash; same for every step. <strong>Mamba (selective):</strong> they are functions of the input. To replay step 6, you must re-run the input projection on "Mamba" &mdash; you can't shortcut by multiplying by precomputed <code>A<sup>k</sup></code>. That's why a lost prefix can't be cheaply recovered.
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>For the cache, this means</strong>
+    You cannot cheaply replay a missed prefix. With a fixed-<code>A</code>
+    SSM, you could in principle precompute powers of <code>A</code> and
+    fast-forward. With selectivity, the weights are determined by the
+    actual tokens, so replay requires running the full input projection
+    on every missed token. <strong>Replay costs the same as the original
+    compute.</strong>
+  </div>
+
+  <p>
+    This is the load-bearing reason <code>MambaManager</code> does
+    <em>not</em> implement "replay from the latest checkpoint" as a
+    recovery path during eviction or preemption. If the state is gone,
+    the only way back is to re-run the full prefix &mdash; same as a
+    cold prefill.
+  </p>
+
+  <h2 id="two-kernels">3. Two kernels: parallel scan (prefill) vs step recurrence (decode)</h2>
+
+  <p>
+    Softmax attention uses one kernel for prefill and decode (FlashAttention
+    varlen handles both). Mamba2 uses two
+    (<span class="fileref">mamba2_attn.py:107-167</span>):
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Prefill: chunk-wise parallel scan</h3>
+      <p>
+        Processes <code>chunk_size</code> tokens at once. Produces both
+        per-token outputs and the final state. <code>chunk_size</code>
+        is configured via <code>model_config.get_mamba_chunk_size()</code>
+        &mdash; a per-model constant, typically 256.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Decode: step recurrence</h3>
+      <p>
+        One token at a time: <code>S_t = A_t &middot; S_{t-1} + B_t &middot; x_t</code>.
+        Different metadata shape from prefill.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Code: chunk metadata only when prefills present</strong>
+<pre><code># mamba2_attn.py:148
+# Mamba2AttentionMetadata.seq_idx, chunk_offsets, cu_seqlens_chunks
+# are populated ONLY when num_prefills &gt; 0</code></pre>
+    Decode-only batches skip the chunk metadata path entirely.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Prefill 12 tokens with <code>chunk_size = 4</code>, then 3 decode steps</div>
+    <div class="diagram-row">
+      <span class="cell label">prefill</span>
+      <div class="cell-row tight">
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t0</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t1</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t2</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t3</div>
+      </div>
+      <span style="font-size:0.85em;color:var(--muted)">chunk 0 (parallel scan)</span>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">&nbsp;</span>
+      <div class="cell-row tight">
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t4</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t5</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t6</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t7</div>
+      </div>
+      <span style="font-size:0.85em;color:var(--muted)">chunk 1 (parallel scan)</span>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label">&nbsp;</span>
+      <div class="cell-row tight">
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t8</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t9</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t10</div>
+        <div class="cell sm" style="background:#e6f0ff;border-color:#94b9e6">t11</div>
+      </div>
+      <span style="font-size:0.85em;color:var(--muted)">chunk 2 (parallel scan) &rarr; <span style="color:var(--green)">S<sub>11</sub> = chunk-tail state</span></span>
+    </div>
+    <div class="diagram-row" style="margin-top:14px;border-top:1px dashed var(--border);padding-top:10px">
+      <span class="cell label">decode</span>
+      <div class="cell-row tight">
+        <div class="cell sm" style="background:#eaf6ee;border-color:#abd1bb">t12</div>
+        <div class="cell sm" style="background:#eaf6ee;border-color:#abd1bb">t13</div>
+        <div class="cell sm" style="background:#eaf6ee;border-color:#abd1bb">t14</div>
+      </div>
+      <span style="font-size:0.85em;color:var(--muted)">step recurrence (one kernel call per token)</span>
+    </div>
+    <div class="diagram-caption">
+      Two kernels, two metadata shapes. The chunk scan returns both per-token outputs <em>and</em> the chunk-tail state &mdash; that tail becomes the input to the next chunk (or the first decode step). <code>last_state_block_idx</code> is what tracks <em>which</em> physical block holds that hand-off state.
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>What this changes for the scheduler</strong>
+    Chunked prefill must hand off the SSM state from chunk N's tail to
+    chunk N+1's head. For attention, this is implicit in the block table
+    (just append). For Mamba, the state at the chunk boundary must
+    explicitly be the input to the next forward. This is what
+    <code>last_state_block_idx</code>
+    (<span class="fileref">single_type_kv_cache_manager.py:805</span>)
+    tracks.
+  </div>
+
+  <h2 id="chunk-vs-block">4. <code>chunk_size</code> is not <code>block_size</code></h2>
+
+  <p>Mamba2 has <em>three</em> sizes that get confused:</p>
+
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Source</th><th>What it controls</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>block_size</code></td><td><code>cache_config.block_size</code> (or aligned)</td><td>Logical block size for BlockPool &mdash; checkpoint cadence in <code>all</code> mode.</td></tr>
+      <tr><td><code>chunk_size</code></td><td><code>model_config.get_mamba_chunk_size()</code></td><td>Parallel-scan kernel tile. Architectural constant.</td></tr>
+      <tr><td><code>d_conv</code></td><td>Model architecture (typically 4)</td><td>Conv state lookback length.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>The inverse of attention's situation</strong>
+    For attention, <code>block_size</code> is constrained by the kernel
+    (see <a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT.html</a>).
+    For Mamba, <code>block_size</code> is constrained by <em>no kernel</em>
+    &mdash; it's a pure allocation knob &mdash; but it must satisfy the
+    uniform-page-size invariant across groups when paired with attention.
+    The constraint comes from the <em>allocator</em>, not the math.
+  </div>
+
+  <h2 id="align">5. Why <code>mamba_cache_mode="align"</code> exists (it's the conv state)</h2>
+
+  <p>
+    <a href="LINEAR_ATTENTION.html#p5">LINEAR_ATTENTION.html "Three cache modes"</a>
+    introduced the three modes. The <code>align</code> mode is
+    Mamba-specific, and the reason is the conv state.
+  </p>
+
+  <p>
+    The depthwise convolution of width <code>d_conv</code> reads
+    <code>d_conv &minus; 1</code> past tokens' projected activations.
+    At a block boundary, the next block's first token needs the previous
+    block's last <code>d_conv &minus; 1</code> tokens to seed the conv
+    &mdash; otherwise the convolution attends to zeros, producing wrong
+    outputs.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: two blocks live per request in <code>align</code> mode</strong>
+<pre><code># kv_cache_interface.py:555
+return self.page_size_bytes * (2 + self.num_speculative_blocks)</code></pre>
+  </div>
+
+  <p>The "previous block" holds the conv-state lookback for the start of the "current block." When the current block fills, the previous can be freed; the current becomes the new previous.</p>
+
+  <div class="callout code-ref">
+    <strong>Code: <code>last_state_block_idx</code> tracking</strong>
+<pre><code># single_type_kv_cache_manager.py:868-885
+last_state_block_idx = self.last_state_block_idx.get(request_id)
+if (
+    last_state_block_idx is not None
+    and last_state_block_idx &lt; cdiv(num_computed_tokens, self.block_size) - 1
+):
+    blocks = self.req_to_blocks[request_id]
+    if blocks[last_state_block_idx] != self._null_block:
+        self.block_pool.free_blocks([blocks[last_state_block_idx]])
+        blocks[last_state_block_idx] = self._null_block</code></pre>
+  </div>
+
+  <div class="callout info">
+    <strong>What <code>align</code> "aligns"</strong>
+    Mamba block boundaries to attention block boundaries in a hybrid
+    model, <em>while</em> keeping the conv lookback live across each
+    transition. Without <code>align</code>, a hybrid model's Mamba layers
+    would diverge by a few tokens at every attention block boundary
+    because the conv state at the boundary was zero-padded.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Conv state lookback at a block boundary (<code>block_size = 16</code>, <code>d_conv = 4</code>)</div>
+    <div class="diagram-row">
+      <span class="cell label">block N-1</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">t<sub>0</sub></div>
+        <div class="cell xs" style="background:#eee;color:var(--muted);min-width:36px;border-style:dashed">&hellip;</div>
+        <div class="cell xs cached">t<sub>12</sub></div>
+        <div class="cell xs mamba-grp" style="border-width:2px"><strong>t<sub>13</sub></strong></div>
+        <div class="cell xs mamba-grp" style="border-width:2px"><strong>t<sub>14</sub></strong></div>
+        <div class="cell xs mamba-grp" style="border-width:2px"><strong>t<sub>15</sub></strong></div>
+      </div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label" style="color:var(--green)">block N</span>
+      <div class="cell-row tight">
+        <div class="cell xs" style="background:#fff7d6;border-color:#e6c97a;border-width:2px">t<sub>16</sub></div>
+        <div class="cell xs cached">t<sub>17</sub></div>
+        <div class="cell xs cached">t<sub>18</sub></div>
+        <div class="cell xs" style="background:#eee;color:var(--muted);min-width:36px;border-style:dashed">&hellip;</div>
+        <div class="cell xs cached">t<sub>31</sub></div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Token <code>t<sub>16</sub></code> (first of block N) needs the depthwise conv to see <strong>t<sub>13</sub>, t<sub>14</sub>, t<sub>15</sub></strong> &mdash; the last <code>d_conv-1 = 3</code> activations from block N-1. If block N-1 had already been freed, the conv reads zeros and the SSM output is wrong for the next 3 tokens.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Why <code>align</code> mode keeps "<code>2 + num_spec</code>" blocks alive per request</div>
+    <div class="diagram-row">
+      <span class="cell label" style="color:var(--muted)">step A: writing block N</span>
+      <div class="cell-row tight">
+        <div class="cell xs evicted">N-2</div>
+        <div class="cell xs mamba-grp">N-1 (prev)</div>
+        <div class="cell xs" style="background:#fff7d6;border-color:#e6c97a">N (cur)</div>
+        <div class="cell xs free">N+1</div>
+      </div>
+      <span style="font-size:0.82em;color:var(--muted)">N-1 alive for conv lookback; N actively written</span>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label" style="color:var(--muted)">step B: N just filled</span>
+      <div class="cell-row tight">
+        <div class="cell xs evicted">N-2</div>
+        <div class="cell xs evicted" style="text-decoration:line-through">N-1</div>
+        <div class="cell xs mamba-grp">N (prev)</div>
+        <div class="cell xs" style="background:#fff7d6;border-color:#e6c97a">N+1 (cur)</div>
+      </div>
+      <span style="font-size:0.82em;color:var(--muted)">N-1 freed; N becomes the new prev</span>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:#fff5e0;border-color:#e6c97a"></span>current block (being written)</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#fff5e6;border-color:#f7d599"></span>previous block (alive for conv lookback)</div>
+      <div class="legend-item"><span class="legend-sw" style="background:#f6f6f6;border-color:#ccc"></span>freed</div>
+    </div>
+    <div class="diagram-caption">
+      Hence the "<code>2</code>" in <code>page_size_bytes * (2 + num_speculative_blocks)</code> &mdash; one current, one prev. <code>last_state_block_idx</code> is the pointer that says which block plays the "prev" role; when the current fills, the old prev is freed and current becomes prev.
+    </div>
+  </div>
+
+  <p>
+    A pure-Mamba (non-hybrid) model could run with <code>mode="none"</code>
+    because there are no attention boundaries to align to &mdash; but the
+    conv-state issue still exists if you ever evict and resume mid-sequence.
+    <code>none</code> is fine for monolithic in-place inference; <code>align</code>
+    is required for chunked prefill, hybrid models, or anything that
+    crosses a block boundary.
+  </p>
+
+  <h2 id="spec">6. <code>num_speculative_blocks</code>: rollback budget for spec decode</h2>
+
+  <p>
+    Speculative decoding generates <code>K</code> draft tokens, runs them
+    through the target model, and verifies acceptance. Rejected drafts
+    must be rolled back. For attention, rollback is trivial &mdash; don't
+    advance the block table cursor; the unused K/V at the tail is just
+    unread.
+  </p>
+
+  <div class="callout bad">
+    <strong>For Mamba, rollback is hard</strong>
+    The state at draft step <code>K</code> is <em>already overwritten</em>
+    by the draft tokens (the recurrence advanced). To roll back to "only
+    the first 2 of 5 drafts accepted," you need the state as of step 2,
+    not the current state.
+  </div>
+
+  <p>
+    <code>num_speculative_blocks</code>
+    (<span class="fileref">kv_cache_interface.py:537</span>) reserves
+    extra blocks per request so the pre-draft state is checkpointed and
+    the draft runs forward into a separate block. After verification,
+    discard the unaccepted-draft block and the pre-draft block becomes
+    the new running state.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Code: the conservative subtraction in <code>remove_skipped_blocks</code></strong>
+<pre><code># single_type_kv_cache_manager.py:865
+# NOTE: with async scheduling, num_computed_tokens can contain
+# draft tokens from the previous step that may or may not be rejected.
+# Assume all tokens are rejected so we don't free blocks we might need.
+num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <strong>Why "assume all rejected"</strong>
+    Free the "draft" block optimistically and you've lost the only copy of
+    valid state. Attention can afford to be optimistic because rejected
+    K/V is harmless dead bytes; Mamba cannot because state is overwritten
+    in place.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Spec decode: 5 drafts, 2 accepted &mdash; rollback contrast</div>
+    <div class="compare">
+      <div class="side left">
+        <h4 style="margin-top:0">Attention</h4>
+        <p style="font-size:0.85em">K/V is per-token. Rejected drafts &equiv; dead bytes at the tail.</p>
+        <div class="cell-row tight" style="margin-top:6px">
+          <div class="cell xs cached">t<sub>99</sub></div>
+          <div class="cell xs cached" style="border-color:var(--green);border-width:2px">d1&#10003;</div>
+          <div class="cell xs cached" style="border-color:var(--green);border-width:2px">d2&#10003;</div>
+          <div class="cell xs evicted">d3&#10007;</div>
+          <div class="cell xs evicted">d4&#10007;</div>
+          <div class="cell xs evicted">d5&#10007;</div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px">
+          Cursor advances to t<sub>101</sub>. d3..d5 K/V remain in memory, just unread &mdash; overwritten on the next step. Cost: zero extra blocks.
+        </p>
+      </div>
+      <div class="vs">vs</div>
+      <div class="side right">
+        <h4 style="margin-top:0">Mamba</h4>
+        <p style="font-size:0.85em">State is overwritten in place by every draft &mdash; need a checkpoint.</p>
+        <div class="cell-row tight" style="margin-top:6px;align-items:flex-end">
+          <div style="text-align:center">
+            <div class="cell xs cached" style="border-color:var(--green);border-width:2px">S<sub>99</sub></div>
+            <div style="font-size:0.7em;color:var(--muted);margin-top:2px">pre-draft block</div>
+          </div>
+          <div style="font-size:1.3em;color:var(--muted);align-self:center">&rarr;</div>
+          <div style="text-align:center">
+            <div class="cell xs evicted">S<sub>104</sub></div>
+            <div style="font-size:0.7em;color:var(--red);margin-top:2px">draft block (discard)</div>
+          </div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px">
+          Replay d1, d2 from S<sub>99</sub> to get S<sub>101</sub> &mdash; pre-draft block <em>must</em> still be allocated. <code>num_speculative_blocks</code> is the reservation that guarantees this.
+        </p>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Asymmetry: attention's K/V is immutable once written, so "extra" K/V is harmless. Mamba's state is mutable in place, so the only way to support rollback is to reserve a separate block to write into &mdash; never destroying the checkpoint.
+    </div>
+  </div>
+
+  <h2 id="dcp">7. DCP and PCP are not supported</h2>
+
+  <div class="callout code-ref">
+    <strong>Code: hard asserts</strong>
+<pre><code># MambaManager.find_longest_cache_hit
+# single_type_kv_cache_manager.py:825-826
+assert dcp_world_size == 1, "DCP not support mamba now."
+assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
+  </div>
+
+  <p>
+    DCP (decode context parallelism) and PCP (prefill context parallelism)
+    shard a request's tokens across ranks for attention computation. For
+    softmax attention this works because each token's K/V is independent
+    &mdash; rank 0 computes K/V for tokens 0..N/2, rank 1 for N/2..N,
+    then they exchange.
+  </p>
+
+  <p>
+    For Mamba, the recurrence is sequential: <code>S_t</code> depends on
+    <code>S_{t-1}</code>. Sharding tokens across ranks breaks the chain.
+    There are parallel-scan algorithms that reduce sequential dependency
+    (the chunk-wise scan already uses one within a chunk) but they don't
+    trivially extend to cross-rank parallelism without communication on
+    every step.
+  </p>
+
+  <div class="callout warn">
+    <strong>Fundamental architectural mismatch, not an unimplemented feature</strong>
+    Any cluster-scale plan for Mamba inference has to either replicate
+    (TP for parameters but not for sequence dimension) or pipeline-parallelize
+    (PP splits layers, sequence stays whole on each stage).
+    Sequence-dimension sharding is off the table.
+  </div>
+
+  <h2 id="hybrid">8. Hybrid layouts (Jamba, Granite-Hybrid)</h2>
+
+  <p>Jamba, Granite-Hybrid, and similar architectures interleave Mamba layers with attention layers in a fixed ratio. The design rationale matters for the cache:</p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Mamba layers: cheap context</h3>
+      <p>
+        Carry long-context "feel" cheaply. State is O(1), so a 256k-context
+        Mamba layer holds 256k tokens of context for the same RAM cost as
+        a 4k-context one. This is where the long-context budget goes.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Attention layers: exact retrieval</h3>
+      <p>
+        Some queries genuinely need to attend back to a specific token
+        &mdash; a cited fact, a code symbol, a named entity. Attention
+        layers are kept (at much lower count) to preserve this capability.
+      </p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Cache implications</strong>
+    <ul>
+      <li>Memory profile is dominated by attention layers (linear in N) even though there are fewer of them.</li>
+      <li>Prefix-caching benefit is dominated by attention.</li>
+      <li>The <code>align</code> cache mode is not optional &mdash; without it, Mamba layers desynchronize from attention at block boundaries.</li>
+    </ul>
+  </div>
+
+  <p>
+    Grouping consequence: Jamba-class models always have at least two
+    groups (one Mamba, one attention), each with its own block table,
+    eviction rule, and <code>SingleTypeKVCacheManager</code>. The hybrid
+    coordinator fans <code>find_longest_cache_hit</code> across them with
+    the <code>alignment_tokens</code> discipline so neither group hits a
+    prefix the other doesn't.
+  </p>
+
+  <h2 id="blocksize-meaning">9. What "block size" even means for Mamba</h2>
+
+  <p>
+    For attention, "block of size 16" means: K/V for 16 consecutive token
+    positions, addressable by <code>slot = block_id * 16 + offset</code>.
+    The 16 is a real, semantic unit.
+  </p>
+
+  <p>
+    For Mamba, "block of size 16" means: a snapshot of state taken once
+    per 16 input tokens. The block contains <em>one</em> <code>(SSM_state,
+    conv_state)</code> pair, not 16 of them.
+  </p>
+
+  <div class="callout bad">
+    <strong>The "16" is the interval between snapshots, not the content multiplicity</strong>
+    The slot mapping math (<code>slot = block_id * block_size + offset</code>)
+    doesn't even apply to reading &mdash; Mamba kernels read the state at
+    the block's snapshot point, not at specific offsets within the block.
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">"<code>block_size = 16</code>" means very different things</div>
+    <div class="compare">
+      <div class="side left">
+        <h4 style="margin-top:0">Attention block</h4>
+        <p style="font-size:0.85em">Contains 16 K/V pairs, one per token. Each addressable.</p>
+        <div class="cell-row tight" style="margin-top:8px;flex-wrap:wrap">
+          <div class="cell xs cached">k<sub>0</sub>v<sub>0</sub></div>
+          <div class="cell xs cached">k<sub>1</sub>v<sub>1</sub></div>
+          <div class="cell xs cached">k<sub>2</sub>v<sub>2</sub></div>
+          <div class="cell xs cached">k<sub>3</sub>v<sub>3</sub></div>
+          <div class="cell xs cached">k<sub>4</sub>v<sub>4</sub></div>
+          <div class="cell xs cached">k<sub>5</sub>v<sub>5</sub></div>
+          <div class="cell xs cached">k<sub>6</sub>v<sub>6</sub></div>
+          <div class="cell xs cached">k<sub>7</sub>v<sub>7</sub></div>
+          <div class="cell xs cached">k<sub>8</sub>v<sub>8</sub></div>
+          <div class="cell xs cached">k<sub>9</sub>v<sub>9</sub></div>
+          <div class="cell xs cached">k<sub>10</sub>v<sub>10</sub></div>
+          <div class="cell xs cached">k<sub>11</sub>v<sub>11</sub></div>
+          <div class="cell xs cached">k<sub>12</sub>v<sub>12</sub></div>
+          <div class="cell xs cached">k<sub>13</sub>v<sub>13</sub></div>
+          <div class="cell xs cached">k<sub>14</sub>v<sub>14</sub></div>
+          <div class="cell xs cached">k<sub>15</sub>v<sub>15</sub></div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px">
+          <strong>Read:</strong> <code>slot = block_id * 16 + offset</code> &rarr; pick any one of 16. <strong>Memory grows</strong> linearly with block_size.
+        </p>
+      </div>
+      <div class="vs">vs</div>
+      <div class="side right">
+        <h4 style="margin-top:0">Mamba block</h4>
+        <p style="font-size:0.85em">Contains <em>one</em> state snapshot. Taken once every 16 tokens.</p>
+        <div class="cell-row tight" style="margin-top:8px;align-items:center;justify-content:center">
+          <div style="text-align:center">
+            <div class="cell" style="background:var(--mamba-soft, #fff5e6);border-color:#f7d599;min-width:170px;min-height:50px;display:flex;flex-direction:column;justify-content:center;font-size:0.9em">
+              <div><strong>(S<sub>16</sub>, conv<sub>16</sub>)</strong></div>
+              <div style="font-size:0.72em;color:var(--muted);margin-top:2px">snapshot after t<sub>0</sub>..t<sub>15</sub></div>
+            </div>
+          </div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px">
+          <strong>Read:</strong> just dereference the block; "offset" is meaningless. <strong>Memory is constant</strong> in block_size &mdash; only the checkpoint cadence changes.
+        </p>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Attention's <code>block_size</code> is a <em>content</em> count. Mamba's <code>block_size</code> is a <em>checkpoint interval</em>. The BlockPool doesn't care &mdash; it serves both abstractions from the same allocation primitive &mdash; which is exactly the value of keeping the bottom of the stack agnostic.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Three Mamba cache modes &mdash; how many blocks per request, and where snapshots live</div>
+    <div class="diagram-row">
+      <span class="cell label">none</span>
+      <div class="cell-row tight">
+        <div class="cell sm mamba-grp" style="min-width:80px"><strong>S<sub>final</sub></strong></div>
+      </div>
+      <span style="font-size:0.82em;color:var(--muted)">1 block: only the current rolling state. No prefix caching, no rollback.</span>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">align</span>
+      <div class="cell-row tight">
+        <div class="cell sm mamba-grp" style="min-width:80px">S<sub>prev</sub></div>
+        <div class="cell sm mamba-grp" style="min-width:80px"><strong>S<sub>cur</sub></strong></div>
+        <div class="cell sm free" style="min-width:80px">(+spec)</div>
+      </div>
+      <span style="font-size:0.82em;color:var(--muted)">2 + num_spec: keeps conv lookback across block boundaries.</span>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">all</span>
+      <div class="cell-row tight">
+        <div class="cell sm mamba-grp">S<sub>16</sub></div>
+        <div class="cell sm mamba-grp">S<sub>32</sub></div>
+        <div class="cell sm mamba-grp">S<sub>48</sub></div>
+        <div class="cell sm" style="background:#eee;color:var(--muted);min-width:36px;border-style:dashed">&hellip;</div>
+        <div class="cell sm mamba-grp"><strong>S<sub>cur</sub></strong></div>
+      </div>
+      <span style="font-size:0.82em;color:var(--muted)"><code>cdiv(max_len, block_size)</code>: every block boundary checkpointed for prefix caching.</span>
+    </div>
+    <div class="diagram-caption">
+      <code>none</code> is cheapest but throws away history. <code>align</code> is what hybrid models use &mdash; conv-state alignment, spec budget, no prefix sharing. <code>all</code> opens up Mamba prefix caching at the cost of one block per <code>block_size</code> tokens of context.
+    </div>
+  </div>
+
+  <p>
+    This is a clean illustration of <code>BlockPool</code> being agnostic
+    to what a block holds. Same allocation primitive, very different
+    semantics. It also explains why Mamba's <code>block_size</code> is
+    often much larger (64, 128, 256, ...) &mdash; there's no kernel cost
+    to a larger block, just a checkpoint-frequency / memory tradeoff.
+  </p>
+
+  <h2 id="table">10. Summary table: where Mamba diverges from attention</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Softmax attention</th>
+        <th>Mamba</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>State per layer per request</td><td>O(N) K/V</td><td>Two fixed tensors: SSM + conv</td></tr>
+      <tr><td>Replay cost from missed prefix</td><td>O(N) per layer</td><td>O(N) per layer (selectivity blocks fast-forward)</td></tr>
+      <tr><td>Prefill kernel</td><td>FlashAttention varlen</td><td>Chunk-wise parallel scan</td></tr>
+      <tr><td>Decode kernel</td><td>Same as prefill</td><td>Different: step recurrence</td></tr>
+      <tr><td><code>block_size</code> constrained by</td><td>Kernel tile size</td><td>Allocator only</td></tr>
+      <tr><td><code>chunk_size</code> constrained by</td><td>(no separate chunk_size)</td><td>Model architecture</td></tr>
+      <tr><td>Cross-block lookback</td><td>None</td><td><code>d_conv &minus; 1</code> tokens of conv state</td></tr>
+      <tr><td>Spec-decode rollback</td><td>Free, just don't advance</td><td>Reserve <code>num_speculative_blocks</code></td></tr>
+      <tr><td>DCP/PCP support</td><td>Yes</td><td>No (sequential recurrence)</td></tr>
+      <tr><td>Slot-mapping semantics</td><td><code>block * size + offset</code></td><td>Block holds one state snapshot; offset meaningless</td></tr>
+      <tr><td>Allocator-imposed page padding</td><td>None</td><td><code>page_size_padded</code> to match attention</td></tr>
+    </tbody>
+  </table>
+
+  <p>Each row is a place where the cache infrastructure had to grow a Mamba-specific affordance.</p>
+
+  <h2 id="lesson">11. The general lesson</h2>
+
+  <p>The cache subsystem was originally designed for one shape of compute (softmax attention). Adding Mamba required:</p>
+
+  <ul>
+    <li>A new <code>SingleTypeKVCacheManager</code> subclass with its own scan direction and hit semantics.</li>
+    <li>A new <code>KVCacheSpec</code> subclass (<code>MambaSpec</code>) with multiple state shapes and a padding field.</li>
+    <li>New scheduler bookkeeping (<code>last_state_block_idx</code>, <code>num_speculative_blocks</code>).</li>
+    <li>A new metadata path in attention backends (<code>Mamba2AttentionMetadata</code>).</li>
+    <li>A new alignment discipline (<code>alignment_tokens</code> / <code>mamba_cache_mode="align"</code>).</li>
+    <li>Explicit guards excluding it from features that don't compose (<code>assert dcp_world_size == 1</code>).</li>
+  </ul>
+
+  <div class="callout good">
+    <strong>Each is small and well-localized</strong>
+    Together they make the point that "the KV cache" is not a single
+    abstraction with one extension point &mdash; it's a stack of
+    conventions about <em>what a block contains, when it gets written,
+    when it can be reused, and what the kernel expects to find there</em>.
+    Mamba reuses the bottom of the stack (BlockPool, hashing) and
+    diverges at the top (everything semantic).
+  </div>
+
+  <p>
+    When future architectures land &mdash; linear-attention variants,
+    hybrid retrieval modules, learned-cache schemes &mdash; the same
+    pattern will repeat: keep the allocator, replace the semantics, add
+    a manager subclass, document the new constraints.
+  </p>
+
+  <p class="subtitle">
+    See also: <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a>
+    for the conceptual frame this builds on, and
+    <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a> for
+    the column-packing layout that hosts both Mamba and attention groups.
+  </p>
+</main>
+</body>
+</html>

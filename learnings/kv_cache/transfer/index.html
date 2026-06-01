@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KV Cache Transfer for P/D Disaggregation &mdash; vLLM Learning Notes</title>
+<link rel="stylesheet" href="../../_shared.css" />
+<style>
+  .reading-paths {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin: 20px 0;
+  }
+  .reading-paths .box h3 { color: var(--violet); }
+  .doc-list { padding-left: 0; list-style: none; margin: 8px 0; }
+  .doc-list li { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+  .doc-list li:last-child { border-bottom: none; }
+  .doc-list a { font-weight: 650; }
+  .doc-list .blurb { color: var(--muted); display: block; font-size: 0.92em; margin-top: 2px; }
+  @media (max-width: 820px) {
+    .reading-paths { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">&larr; KV Cache</a> &middot;
+    <span>Transfer (P/D disaggregation)</span>
+  </div>
+
+  <h1>KV Cache Transfer for P/D Disaggregation</h1>
+  <p class="subtitle">
+    How vLLM ships KV cache between a prefill worker (P) and a decode
+    worker (D) so they can be scaled, profiled, and hardware-targeted
+    independently. Covers the NIXL connector, both Mooncake connectors,
+    and how each survives heterogeneous TP/PP/DP between P and D.
+  </p>
+
+  <section class="tldr">
+    <strong>What's here</strong>
+    <p>
+      Five notes covering the <em>transfer plane</em> sitting between
+      prefill and decode in a disaggregated vLLM deployment. We treat the
+      KV cache as a shared resource that must be moved &mdash; not just
+      allocated &mdash; and we look at the three transports vLLM ships in
+      tree.
+    </p>
+    <p>
+      <em>New here?</em> Start with <a href="PD_DISAGG.html">PD_DISAGG.html</a>
+      for the protocol contract every connector implements. Then read the
+      transport you care about. <a href="PARALLELISM.html">PARALLELISM.html</a>
+      is the cross-cutting note explaining how heterogeneous TP/PP between
+      P and D is reconciled.
+    </p>
+  </section>
+
+  <h2>Reading paths</h2>
+
+  <div class="reading-paths">
+    <div class="box">
+      <h3>1. On-ramp</h3>
+      <p>You've heard the term "P/D disaggregation" and want the mental model first.</p>
+      <ol>
+        <li><a href="PD_DISAGG.html">PD_DISAGG.html</a></li>
+        <li>Then pick a transport &mdash; NIXL is the canonical reference.</li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>2. Operator's path</h3>
+      <p>You're deploying a Mooncake or NIXL cluster and need to reason about handshakes, parallelism, and failure.</p>
+      <ol>
+        <li><a href="PD_DISAGG.html">PD_DISAGG.html</a></li>
+        <li><a href="NIXL.html">NIXL.html</a> <em>or</em> <a href="MOONCAKE_PIPE.html">MOONCAKE_PIPE.html</a></li>
+        <li><a href="PARALLELISM.html">PARALLELISM.html</a></li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>3. Caching / store path</h3>
+      <p>You want a global KV store with deduplication across engine runs, not just a P&rarr;D pipe.</p>
+      <ol>
+        <li><a href="PD_DISAGG.html">PD_DISAGG.html</a></li>
+        <li><a href="MOONCAKE_STORE.html">MOONCAKE_STORE.html</a></li>
+        <li><a href="../connector/MOONCAKE.md">connector/MOONCAKE.md</a> (companion note on <code>ReqMeta</code>)</li>
+      </ol>
+    </div>
+  </div>
+
+  <h2>All notes</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Protocol &amp; survey</h3>
+      <ul class="doc-list">
+        <li>
+          <a href="PD_DISAGG.html">PD_DISAGG.html</a>
+          <span class="blurb">Why split prefill and decode in the first place. The five-method <code>KVConnectorBase_V1</code> contract every transport implements. Push vs pull as a design choice. Where the cache transfer plane sits relative to vLLM's scheduler and worker.</span>
+        </li>
+        <li>
+          <a href="PARALLELISM.html">PARALLELISM.html</a>
+          <span class="blurb">How NIXL, the direct Mooncake pipe, and the Mooncake store each handle TP<sub>P</sub> &ne; TP<sub>D</sub>. Head-dimension splitting, GQA dedup, MLA replication, Mamba's three-projection conv state. Why PP rarely differs in practice but DP routinely does.</span>
+        </li>
+        <li>
+          <a href="ABSTRACTIONS.html">ABSTRACTIONS.html</a>
+          <span class="blurb">The mathematical objects under heterogeneous-parallel transfer: the KV cache as a <em>product index space</em>, sharding as a <em>partition</em>, the transfer plan as a <em>common refinement (meet)</em> that factorizes per axis &mdash; <code>P&and;D = (P<sub>L</sub>&and;D<sub>L</sub>)&times;(P<sub>H</sub>&and;D<sub>H</sub>)</code>. Maps to DTensor / GSPMD / CuTe and sketches an <code>Axis</code>-based planner. Companion theory note to PARALLELISM.</span>
+        </li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Transports</h3>
+      <ul class="doc-list">
+        <li>
+          <a href="NIXL.html">NIXL.html</a>
+          <span class="blurb">D-initiated <strong>READ</strong> (pull) over NIXL agents. ZMQ side-channel handshake + lazy per-engine agent registration. All-at-once batched async transfer, polled in the scheduler loop. Lease-with-heartbeat keeps P from freeing blocks too early.</span>
+        </li>
+        <li>
+          <a href="MOONCAKE_PIPE.html">MOONCAKE_PIPE.html</a>
+          <span class="blurb">P-initiated <strong>PUSH</strong> via <code>batch_transfer_sync_write</code>. FastAPI bootstrap server publishes worker addresses; D queries, sends a request with its own block addresses, P sends KV directly into them. The <em>direct</em> Mooncake connector &mdash; no shared store.</span>
+        </li>
+        <li>
+          <a href="MOONCAKE_STORE.html">MOONCAKE_STORE.html</a>
+          <span class="blurb">Producer <code>batch_put</code>s, consumer <code>batch_get</code>s. Both go through a distributed KV store keyed by content hash. Decouples P and D in time (cache hits across engine runs), at the cost of one extra hop and a coordinator. Companion read: <a href="../connector/MOONCAKE.md">connector/MOONCAKE.md</a>.</span>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>The three transports at a glance</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">Transport comparison</div>
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          <th>NIXL</th>
+          <th>Mooncake pipe</th>
+          <th>Mooncake store</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>Direction</th>
+          <td>D pulls (NIXL <code>READ</code>)</td>
+          <td>P pushes (<code>batch_transfer_sync_write</code>)</td>
+          <td>P puts, D gets (both go through store)</td>
+        </tr>
+        <tr>
+          <th>Endpoints</th>
+          <td>P&harr;D NIXL agents</td>
+          <td>P&harr;D Mooncake <code>TransferEngine</code></td>
+          <td>Workers&harr;store (cluster)</td>
+        </tr>
+        <tr>
+          <th>Discovery</th>
+          <td>ZMQ ROUTER side-channel, lazy per-engine</td>
+          <td>FastAPI bootstrap server, register+query</td>
+          <td>None &mdash; lookup keys in store</td>
+        </tr>
+        <tr>
+          <th>Initiator</th>
+          <td>D (kv_consumer)</td>
+          <td>D requests, P transfers</td>
+          <td>Decoupled producer/consumer threads</td>
+        </tr>
+        <tr>
+          <th>Cross-run cache</th>
+          <td>No</td>
+          <td>No</td>
+          <td>Yes (content-addressed)</td>
+        </tr>
+        <tr>
+          <th>Hetero-TP mechanism</th>
+          <td><code>tp_mapping.compute_tp_mapping</code></td>
+          <td><code>_get_tp_ratio</code> + region expansion</td>
+          <td>candidate-key lookup with dedup</td>
+        </tr>
+        <tr>
+          <th>Failure surface</th>
+          <td>Lease expiry on P; per-handle xfer state on D</td>
+          <td>Request timeout on D; per-request response</td>
+          <td>Store pressure (<code>NO_AVAILABLE_HANDLE</code>); skip-and-retry</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>How these docs relate</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">Concept dependencies</div>
+    <div style="display:grid;grid-template-columns:1fr;gap:14px;margin-top:8px;align-items:start">
+      <div style="text-align:center">
+        <a href="PD_DISAGG.html" style="text-decoration:none">
+          <div style="background:var(--violet-soft);border:2px solid var(--violet);border-radius:8px;padding:10px;font-weight:650;color:var(--violet);max-width:360px;margin:0 auto">
+            PD_DISAGG
+            <div style="font-size:0.78em;color:var(--muted);font-weight:400;margin-top:2px">protocol contract &amp; design choices</div>
+          </div>
+        </a>
+      </div>
+      <div style="font-size:1.3em;color:var(--muted);text-align:center">&darr; specialized by transport &darr;</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+        <a href="NIXL.html" style="text-decoration:none">
+          <div style="background:var(--blue-soft);border:1px solid #a6c8df;border-radius:8px;padding:10px;text-align:center;color:var(--blue)">
+            <strong>NIXL</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">D &xlarr; P (pull)</div>
+          </div>
+        </a>
+        <a href="MOONCAKE_PIPE.html" style="text-decoration:none">
+          <div style="background:var(--green-soft);border:1px solid #abd1bb;border-radius:8px;padding:10px;text-align:center;color:var(--green)">
+            <strong>MOONCAKE_PIPE</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">P &xrarr; D (push)</div>
+          </div>
+        </a>
+        <a href="MOONCAKE_STORE.html" style="text-decoration:none">
+          <div style="background:var(--amber-soft);border:1px solid #e3c88a;border-radius:8px;padding:10px;text-align:center;color:var(--amber)">
+            <strong>MOONCAKE_STORE</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">P &xrarr; Store &xrarr; D</div>
+          </div>
+        </a>
+      </div>
+      <div style="text-align:center;font-size:1.3em;color:var(--muted)">&darr; cuts across all three &darr;</div>
+      <div style="text-align:center">
+        <a href="PARALLELISM.html" style="text-decoration:none">
+          <div style="background:var(--panel);border:2px solid var(--border);border-radius:8px;padding:10px;font-weight:650;max-width:360px;margin:0 auto">
+            PARALLELISM
+            <div style="font-size:0.78em;color:var(--muted);font-weight:400;margin-top:2px">TP / PP / DP across P and D</div>
+          </div>
+        </a>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <strong>Violet tier</strong> establishes the protocol; you can't read the transport docs without it. <strong>Blue/green/amber tier</strong> are sibling transports &mdash; pick the one you'll deploy. <strong>Bottom tier</strong> is the cross-cutting concern: every transport has its own way of reconciling TP<sub>P</sub> &ne; TP<sub>D</sub>, and PARALLELISM compares them.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Companion notes elsewhere in <span class="fileref">kv_cache/</span></strong>
+    <ul>
+      <li>
+        <a href="../connector/BEGINNER_GUIDE.md">connector/BEGINNER_GUIDE.md</a>
+        &mdash; the <code>KVConnectorBase_V1</code> abstraction from a connector author's point of view.
+      </li>
+      <li>
+        <a href="../connector/MOONCAKE.md">connector/MOONCAKE.md</a>
+        &mdash; deep dive on the per-request <code>ReqMeta</code> dataclass that the Mooncake store connector emits each engine step.
+      </li>
+      <li>
+        <a href="../KV_CACHE.html">KV_CACHE.html</a> &mdash; the prefix-cache design.
+        Local prefix cache + connector-based transfer compose: the connector
+        only pulls what isn't already cached locally.
+      </li>
+    </ul>
+  </div>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Code references target the current state of
+    <span class="fileref">vllm/distributed/kv_transfer/kv_connector/v1/</span>.
+    Some line numbers may drift as the codebase evolves but file paths and
+    concepts remain accurate.
+  </p>
+</main>
+</body>
+</html>

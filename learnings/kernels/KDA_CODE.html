@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reading KDA Kernel Code — Annotated Triton Walk-through</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .sk { font-family:"SF Mono",Monaco,monospace; font-size:0.82em; background:var(--code);
+        border-radius:3px; padding:1px 5px; color:var(--violet); }
+  /* annotated code: a code block immediately followed by a note strip */
+  .ann { margin:18px 0; }
+  .ann > pre { margin-bottom:0; border-bottom-left-radius:0; border-bottom-right-radius:0; }
+  .ann > .note { margin-top:0; border:1px solid var(--border); border-top:none;
+    border-left:4px solid var(--green); border-radius:0 0 6px 6px; background:var(--panel);
+    padding:11px 14px; font-size:0.92em; }
+  .ann > .note ol, .ann > .note ul { margin:6px 0; padding-left:20px; }
+  .ann > .note li { margin:4px 0; }
+  .ln { color:var(--muted); }                /* line-number gutter in prose */
+  pre .v  { color: var(--violet); }          /* triton builtin / type */
+  .kbox { background:var(--panel); border:1px solid var(--border); border-left:5px solid var(--blue);
+    border-radius:8px; padding:12px 16px; margin:16px 0; }
+  .kbox h3 { margin-top:0; }
+  .kbox .meta { display:grid; grid-template-columns:max-content 1fr; gap:3px 12px; font-size:0.9em; margin-top:6px; }
+  .kbox .meta .mk { font-family:"SF Mono",Monaco,monospace; color:var(--violet); }
+  .diff-add { color: var(--green); }
+  details.q { border:1px solid var(--border); border-radius:6px; padding:8px 12px; margin:10px 0; background:var(--panel); }
+  details.q summary { cursor:pointer; font-weight:650; color:var(--blue); font-size:0.92em; }
+  details.q[open] summary { margin-bottom:6px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../">&larr; learnings</a> &nbsp;|&nbsp; kernels &nbsp;|&nbsp;
+    companion to <a href="KDA.html">KDA.html</a> (the math) &nbsp;|&nbsp;
+    source: <span class="fileref">fla/ops/{fused_recurrent,kda}.py</span>
+  </div>
+
+  <h1>Reading KDA Kernel Code</h1>
+  <p class="subtitle">
+    An annotated, line-by-line Triton walk-through. <a href="KDA.html">KDA.html</a> explained <em>what</em>
+    the kernel computes; this page teaches you to <em>read the actual code</em> — the idioms first, then
+    three real kernels from easiest to hardest.
+  </p>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    A Triton <code>@triton.jit</code> function is the body of <em>one program</em> in a grid of thousands.
+    You read it in four moves: <b>(1)</b> what does <code>tl.program_id</code> slice this program to?
+    <b>(2)</b> what tile does each <code>make_block_ptr</code> / pointer load? <b>(3)</b> what's the math on
+    those tiles? <b>(4)</b> where does it store? Master those and every kernel below reads the same way.
+  </div>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#model">1. The Triton mental model</a></li>
+      <li><a href="#idioms">2. Idiom glossary (read this once)</a></li>
+      <li><a href="#k1">3. Kernel 1 — the decode recurrence (easy)</a></li>
+      <li><a href="#k2">4. Kernel 2 — the gate cumsum (a trick)</a></li>
+      <li><a href="#k3">5. Kernel 3 — the K·Kᵀ Gram matrix (hard)</a></li>
+      <li><a href="#approach">6. How to attack an unfamiliar kernel</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="model">1. The Triton mental model</h2>
+
+  <p>
+    A CUDA kernel is written from the viewpoint of one <em>thread</em>. A <b>Triton</b> kernel is written from
+    the viewpoint of one <em>program</em> (≈ one CUDA block) that operates on whole <b>tiles</b> (small arrays)
+    at once. Triton handles the threads-within-a-block for you; you think in <code>[BT, BK]</code>-shaped blocks
+    and write what looks like NumPy. The compiler turns <code>tl.dot</code>, <code>tl.load</code> etc. into
+    tensor-core and vectorized memory ops.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>The launch grid</h3>
+      <p>The host launches <code>kernel[grid](...)</code> where <code>grid</code> is a tuple like
+      <code>(NT, NC*NC, B*H)</code>. Triton runs the function once for <b>every</b> point in that 3-D grid,
+      in parallel. Inside, <code>tl.program_id(0..2)</code> tells a program <em>which</em> point it is — and
+      therefore which slice of the tensors it owns.</p>
+    </div>
+    <div class="box">
+      <h3><code>constexpr</code> vs runtime</h3>
+      <p>Arguments typed <code>tl.constexpr</code> (e.g. <code>BT</code>, <code>K</code>, <code>IS_VARLEN</code>)
+      are compile-time constants — Triton generates a specialized kernel per distinct value, so
+      <code>if IS_VARLEN:</code> costs nothing at runtime. Plain args (pointers, <code>T</code>) are runtime.</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Everything is a flat pointer + strides</strong>
+    A tensor <span class="sk">q: [B, T, H, K]</span> arrives as a bare pointer to element 0. To read element
+    <code>(b,t,h,k)</code> you compute the offset yourself: <code>((b*T + t)*H + h)*K + k</code>. The "stride"
+    between consecutive tokens is <code>H*K</code>, between heads is <code>K</code>, etc. Half of kernel-reading
+    is just <em>decoding these offset expressions back into indices</em>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="idioms">2. Idiom glossary (read this once)</h2>
+
+  <table>
+    <thead><tr><th>You'll see</th><th>It means</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">i_t = tl.program_id(0)</td><td>"which grid point am I?" — the program's coordinates. Decode these against the launch <code>grid=(...)</code> tuple.</td></tr>
+      <tr><td class="mono">X: tl.constexpr</td><td>compile-time constant; enables zero-cost <code>if</code>/loops specialized per value.</td></tr>
+      <tr><td class="mono">tl.arange(0, BK)</td><td>a vector <code>[0,1,…,BK-1]</code> used to build per-lane offsets into a tile.</td></tr>
+      <tr><td class="mono">p = base + (tok*H + h)*K + o_k</td><td>raw pointer arithmetic to a <code>[BK]</code> row. <code>o_k=arange(0,BK)</code> spreads across the K dim.</td></tr>
+      <tr><td class="mono">tl.make_block_ptr(base, shape, strides, offset, block, order)</td>
+          <td>the structured way to point at a 2-D tile. <code>shape/strides</code> describe the full tensor; <code>offset</code> is the tile's top-left; <code>block</code> is the tile size; <code>order</code> is memory layout (usually <code>(1,0)</code>). Loads/stores against it are bounds-checked.</td></tr>
+      <tr><td class="mono">tl.load(p, boundary_check=(0,1))</td><td>read the tile; <code>boundary_check</code> masks out-of-range rows/cols (returns 0) so ragged edges are safe.</td></tr>
+      <tr><td class="mono">mask = o_k &lt; K; tl.load(p, mask=mask, other=0)</td><td>the manual equivalent for raw pointers: only load lanes where the mask is true.</td></tr>
+      <tr><td class="mono">tl.dot(a, b)</td><td>tile matmul on tensor cores. The big lever — kernels are organized to express work as <code>dot</code>s.</td></tr>
+      <tr><td class="mono">tl.sum(x, axis)</td><td>reduce a tile along one axis (e.g. the K dimension of the state).</td></tr>
+      <tr><td class="mono">x[:, None] / x[None, :]</td><td>broadcast a <code>[N]</code> vector to a column / row of an <code>[N,M]</code> tile — exactly like NumPy.</td></tr>
+      <tr><td class="mono">tl.exp2(x)</td><td>fast base-2 exponential. KDA pre-scales decays by <code>1/ln2</code> so <code>exp2</code> reproduces <code>exp</code> (see <a href="KDA.html#exp2">KDA.html §9</a>).</td></tr>
+      <tr><td class="mono">@triton.autotune(configs=[...], key=[...])</td><td>benchmark several <code>BK/BV/num_warps</code> settings, cache the best per <code>key</code> shape. <b>Skip on first read.</b></td></tr>
+      <tr><td class="mono">@triton.heuristics({...})</td><td>derive a <code>constexpr</code> flag from the args, e.g. <code>IS_VARLEN = cu_seqlens is not None</code>.</td></tr>
+      <tr><td class="mono">bos, eos = cu_seqlens[i_n], cu_seqlens[i_n+1]</td><td>start/end token of sequence <code>i_n</code> inside the packed <code>T</code> axis (continuous batching). <code>T = eos - bos</code> rebinds T to <em>this</em> sequence's length.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="k1">3. Kernel 1 — the decode recurrence</h2>
+
+  <div class="kbox">
+    <h3><code>fused_recurrent_gated_delta_rule_fwd_kernel</code> &nbsp;<span class="tag">easy</span></h3>
+    <p>The token-by-token recurrence. Best first kernel: raw pointers (no block_ptr), and it maps 1:1 to the
+    4-line math. <span class="fileref">fla/ops/fused_recurrent.py:27</span></p>
+    <div class="meta">
+      <span class="mk">grid</span><span>(NK=1, NV, N·HV) — one program per (sequence, value-block, head)</span>
+      <span class="mk">owns</span><span>a <span class="sk">[BV=8, BK=128]</span> tile of the state <code>S</code></span>
+      <span class="mk">loops</span><span>over the sequence's <code>T</code> tokens</span>
+    </div>
+  </div>
+
+  <h4>3.1 — Figure out who you are</h4>
+  <div class="ann">
+<pre><code>i_k, i_v, i_nh = tl.<span class="v">program_id</span>(0), tl.<span class="v">program_id</span>(1), tl.<span class="v">program_id</span>(2)
+i_n, i_hv = i_nh // HV, i_nh % HV       <span class="c"># sequence index, value-head index</span>
+i_h = i_hv // (HV // H)                 <span class="c"># map value-head → key-head (GQA). KDA: HV==H ⇒ i_h==i_hv</span></code></pre>
+    <div class="note">
+      The 3rd grid axis packs <em>both</em> sequence and head into one number; these two lines unpack it.
+      <code>HV</code> is the number of value heads, <code>H</code> the number of key/query heads — they differ
+      only under grouped-query attention. KDA uses neither (HV = H = 32), so <code>i_h == i_hv</code>.
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code><span class="k">if</span> IS_VARLEN:
+    bos, eos = tl.<span class="v">load</span>(cu_seqlens + i_n), tl.<span class="v">load</span>(cu_seqlens + i_n + 1)
+    all = T
+    T = eos - bos                       <span class="c"># T now means THIS sequence's length</span>
+<span class="k">else</span>:
+    bos, eos = i_n * T, i_n * T + T
+    all = B * T
+<span class="k">if</span> T == 0: <span class="k">return</span>                       <span class="c"># empty sequence ⇒ nothing to do</span></code></pre>
+    <div class="note">
+      Standard continuous-batching preamble. After this, all token indexing is relative to <code>bos</code>.
+      <code>all</code> (total tokens across the batch) is only used later to stride the output tensor.
+    </div>
+  </div>
+
+  <h4>3.2 — Build pointers to this program's data</h4>
+  <div class="ann">
+<pre><code>o_k = i_k * BK + tl.<span class="v">arange</span>(0, BK)     <span class="c"># [128] the K indices  (i_k=0, BK=128)</span>
+o_v = i_v * BV + tl.<span class="v">arange</span>(0, BV)     <span class="c"># [8]   the V indices this program owns</span>
+
+p_q = q + (bos * H  + i_h ) * K + o_k    <span class="c"># → q[bos, i_h, :]   shape [BK]</span>
+p_k = k + (bos * H  + i_h ) * K + o_k
+p_v = v + (bos * HV + i_hv) * V + o_v    <span class="c"># → v[bos, i_hv, :]  shape [BV]</span>
+p_beta = beta + bos * HV + i_hv          <span class="c"># scalar per (token, head) — KDA beta is [.,.,H]</span>
+p_gk = g + (bos * HV + i_hv) * K + o_k   <span class="c"># IS_KDA: per-CHANNEL gate, shape [BK]</span>
+p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v</code></pre>
+    <div class="note">
+      <p>Each <code>p_*</code> points at the <em>first token</em>'s slice for this head. Note the strides baked
+      into the offsets: tokens are <code>H*K</code> apart for q/k, <code>HV*V</code> apart for v/o,
+      <code>HV*K</code> for the per-channel gate. We'll advance by exactly those at the bottom of the loop.</p>
+      <p>The <code>if not IS_KDA: p_g = g + bos*HV + i_hv</code> branch (a <em>scalar</em> gate) is the
+      Gated-DeltaNet sibling. <code>IS_KDA=True</code> takes the per-channel <code>p_gk</code> branch — that single
+      flag is the entire KDA-vs-GDN difference in this kernel.</p>
+    </div>
+  </div>
+
+  <h4>3.3 — Load the carried state</h4>
+  <div class="ann">
+<pre><code>b_h = tl.<span class="v">zeros</span>([BV, BK], dtype=tl.float32)   <span class="c"># the state tile S[v, k]</span>
+<span class="k">if</span> USE_INITIAL_STATE:
+    <span class="k">if</span> IS_CONTINUOUS_BATCHING:
+        i_t = (tl.<span class="v">load</span>(num_accepted_tokens + i_n) - 1) <span class="k">if</span> IS_SPEC_DECODING <span class="k">else</span> 0
+        state_idx = tl.<span class="v">load</span>(ssm_state_indices + i_n * stride_indices_seq + i_t)
+        <span class="k">if</span> state_idx &lt;= 0: <span class="k">return</span>               <span class="c"># NULL_BLOCK_ID ⇒ no state slot</span>
+        p_h0 = h0 + state_idx * stride_init_state_token
+    <span class="k">else</span>:
+        p_h0 = h0 + bos * HV * V * K
+    p_h0 += i_hv * V * K + o_v[:, <span class="k">None</span>] * K + o_k[<span class="k">None</span>, :]   <span class="c"># [BV, BK] tile</span>
+    b_h += tl.<span class="v">load</span>(p_h0, mask=mask_h, other=0).to(tl.float32)</code></pre>
+    <div class="note">
+      The state lives in a <b>paged cache</b>: <code>ssm_state_indices</code> maps a sequence to a physical slot
+      (like a KV-cache block table). <code>state_idx ≤ 0</code> means "no slot" → bail. For speculative decoding,
+      <code>i_t = num_accepted_tokens − 1</code> seeds from the state <em>after the last accepted token</em>, so
+      rejected draft tokens never poison the recurrence. The last line materializes the <code>[BV, BK]</code> tile
+      via 2-D broadcast offsets.
+    </div>
+  </div>
+
+  <h4>3.4 — The recurrence (the 4 lines)</h4>
+  <div class="ann">
+<pre><code><span class="k">for</span> i_t <span class="k">in</span> range(0, T):
+    b_q = tl.<span class="v">load</span>(p_q, mask=mask_k, other=0).to(tl.float32)
+    b_k = tl.<span class="v">load</span>(p_k, mask=mask_k, other=0).to(tl.float32)
+    b_v = tl.<span class="v">load</span>(p_v, mask=mask_v, other=0).to(tl.float32)
+
+    <span class="k">if</span> USE_QK_L2NORM_IN_KERNEL:                       <span class="c"># fused L2 norm</span>
+        b_q = b_q / tl.<span class="v">sqrt</span>(tl.<span class="v">sum</span>(b_q * b_q) + 1e-6)
+        b_k = b_k / tl.<span class="v">sqrt</span>(tl.<span class="v">sum</span>(b_k * b_k) + 1e-6)
+    b_q = b_q * scale
+
+    b_gk = tl.<span class="v">load</span>(p_gk).to(tl.float32)              <span class="c"># [BK] per-channel decay</span>
+    b_h *= <span class="v">exp</span>(b_gk[<span class="k">None</span>, :])                       <span class="c"># (a) decay each K-column of S</span>
+    b_v -= tl.<span class="v">sum</span>(b_h * b_k[<span class="k">None</span>, :], 1)            <span class="c"># (b) v − S·k   (reduce over K)</span>
+    b_beta = tl.<span class="v">load</span>(p_beta).to(tl.float32)
+    b_v *= b_beta                                     <span class="c"># (b) × β</span>
+    b_h += b_v[:, <span class="k">None</span>] * b_k[<span class="k">None</span>, :]             <span class="c"># (c) S += u ⊗ k</span>
+    b_o = tl.<span class="v">sum</span>(b_h * b_q[<span class="k">None</span>, :], 1)             <span class="c"># (d) o = S·q</span>
+    tl.<span class="v">store</span>(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)</code></pre>
+    <div class="note">
+      This is the heart, and it's exactly the math from <a href="KDA.html#math">KDA.html §4</a>. Things to notice
+      as a reader:
+      <ul>
+        <li><code>b_h</code> is <code>[BV, BK] = [V, K]</code>, so <code>b_k[None,:]</code> broadcasts along V and
+          <code>tl.sum(..., 1)</code> reduces along K. Getting the axis right is the whole game.</li>
+        <li>All compute is <code>float32</code> (<code>.to(tl.float32)</code> on every load) even though storage is
+          bf16 — linear-attention states are numerically touchy.</li>
+        <li>The gate is applied to the <em>state</em>, not to k or v. That's the "gated" in gated delta rule.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h4>3.5 — Write back &amp; advance</h4>
+  <div class="ann">
+<pre><code>    <span class="k">if</span> INPLACE_FINAL_STATE:
+        final_state_idx = tl.<span class="v">load</span>(ssm_state_indices + i_n * stride_indices_seq + i_t)
+        <span class="k">if</span> final_state_idx &gt; 0:
+            p_ht = ht + final_state_idx * stride_final_state_token + i_hv*V*K + o_v[:,<span class="k">None</span>]*K + o_k[<span class="k">None</span>,:]
+            tl.<span class="v">store</span>(p_ht, b_h, mask=mask_h)            <span class="c"># persist S after THIS token</span>
+
+    p_q += H * K;  p_k += H * K          <span class="c"># advance one token (the strides from §3.2)</span>
+    p_v += HV * V; p_o += HV * V
+    p_gk += HV * K
+    p_beta += HV</code></pre>
+    <div class="note">
+      The state is written <em>every</em> token (not just at the end) because a single decode step may carry
+      several tokens (speculative decoding), and each needs its own checkpoint. Then the pointers step forward by
+      exactly the per-token strides we identified in §3.2 — a tidy way to walk the sequence without recomputing
+      offsets.
+    </div>
+  </div>
+
+  <details class="q">
+    <summary>Check yourself: why is <code>BV</code> capped at 8 here but 32 in the generic GDN kernel?</summary>
+    Each program holds <code>b_h: [BV, BK] = [BV, 128]</code> in registers <em>plus</em> the per-channel gate
+    vector. The per-channel gate adds register pressure the scalar-gate GDN path doesn't have, so KDA shrinks the
+    value tile to 8 rows (<code>BV = min(next_power_of_2(V), 8)</code> in <code>fused_recurrent_kda_fwd</code>) to
+    avoid spilling. NV = 128/8 = 16 programs cover the V dimension per head.
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="k2">4. Kernel 2 — the gate cumsum (a trick worth stealing)</h2>
+
+  <div class="kbox">
+    <h3><code>kda_gate_cumsum_fwd_kernel</code> &nbsp;<span class="tag">medium</span></h3>
+    <p>Used only on the prefill path. Computes the per-channel decay <em>and</em> its within-chunk cumulative sum
+    in one launch. Teaches two things: <code>make_block_ptr</code> tiles, and the "cumsum as a matmul" trick.
+    <span class="fileref">fla/ops/kda.py:1182</span></p>
+    <div class="meta">
+      <span class="mk">grid</span><span>(⌈D/BD⌉, NT, B·H) — one program per (channel-block, chunk, head)</span>
+      <span class="mk">in</span><span>raw gate <code>g</code> <span class="sk">[B,T,H,D]</span>, per-head base <code>A_log</code>, <code>g_bias</code></span>
+      <span class="mk">out</span><span>cumulative log-decay <code>y</code> <span class="sk">[B,T,H,D]</span>, scaled by 1/ln2</span>
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>p_g = tl.<span class="v">make_block_ptr</span>(g + (bos*H + i_h)*D, (T, D), (H*D, 1),
+                       (i_t*BT, i_d*BD), (BT, BD), (1, 0))
+b_g = tl.<span class="v">load</span>(p_g, boundary_check=(0, 1)).to(tl.float32)    <span class="c"># [BT, BD] one chunk × channel-block</span>
+<span class="k">if</span> HAS_BIAS:
+    b_g += b_bias[<span class="k">None</span>, :]                                     <span class="c"># per-channel bias, broadcast over time</span></code></pre>
+    <div class="note">
+      First real <code>make_block_ptr</code>. Decode its 6 arguments:
+      <ol>
+        <li><code>g + (bos*H + i_h)*D</code> — base, advanced to this sequence+head.</li>
+        <li><code>(T, D)</code> — the logical 2-D shape this pointer indexes (time × channels).</li>
+        <li><code>(H*D, 1)</code> — strides: stepping one token skips <code>H*D</code> elements; one channel skips 1.</li>
+        <li><code>(i_t*BT, i_d*BD)</code> — the tile's top-left corner (chunk <code>i_t</code>, channel-block <code>i_d</code>).</li>
+        <li><code>(BT, BD)</code> — tile size: 64 tokens × <code>BD</code> channels.</li>
+        <li><code>(1, 0)</code> — memory order (last dim contiguous).</li>
+      </ol>
+      <code>boundary_check=(0,1)</code> zero-fills the ragged last chunk. So <code>b_g</code> is a clean
+      <code>[64, BD]</code> tile regardless of where the sequence ends.
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>b_a = -tl.<span class="v">exp</span>(tl.<span class="v">load</span>(A + i_h).to(tl.float32))       <span class="c"># per-head NEGATIVE base decay</span>
+b_g_scaled = b_g * beta
+b_softplus = tl.<span class="v">where</span>(b_g_scaled &gt; threshold,        <span class="c"># softplus(g) with linear tail for stability</span>
+                      b_g,
+                      (1.0 / beta) * <span class="v">log</span>(1.0 + tl.<span class="v">exp</span>(b_g_scaled)))
+b_gate = b_a * b_softplus                          <span class="c"># [BT, BD] per-token, per-channel log-decay ≤ 0</span></code></pre>
+    <div class="note">
+      The gate construction from <a href="KDA.html#gate">KDA.html §6</a>: <code>g = −exp(A_log)·softplus(raw)</code>.
+      <code>−exp(...)</code> guarantees a negative decay; <code>softplus ≥ 0</code> is the per-channel timestep.
+      The <code>tl.where</code> swaps in the linear approximation <code>softplus(x)≈x</code> once
+      <code>x &gt; 20</code> to dodge <code>exp</code> overflow. Nothing is summed yet — <code>b_gate</code> is the
+      raw per-token decay.
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>o_t = tl.<span class="v">arange</span>(0, BT)
+m_cumsum = tl.<span class="v">where</span>(o_t[:, <span class="k">None</span>] &gt;= o_t[<span class="k">None</span>, :], 1.0, 0.0)   <span class="c"># lower-triangular ONES [BT, BT]</span>
+b_y = tl.<span class="v">dot</span>(m_cumsum, b_gate, allow_tf32=<span class="k">False</span>) * cumsum_scale  <span class="c"># cumulative sum!  × RCP_LN2</span>
+tl.<span class="v">store</span>(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))</code></pre>
+    <div class="note">
+      <strong>The trick.</strong> A prefix-sum along time is a matrix multiply by a lower-triangular matrix of
+      ones: row <code>i</code> of <code>m_cumsum @ b_gate</code> equals <code>Σ<sub>j≤i</sub> b_gate[j]</code>.
+      So one <code>tl.dot</code> on the tensor cores produces the within-chunk cumulative decay for all 64 tokens
+      and all channels at once. The trailing <code>* cumsum_scale</code> (= <code>RCP_LN2 ≈ 1.4427</code>) bakes in
+      the natural-log→log2 conversion so every downstream kernel can use the fast <code>exp2</code> and still get
+      <code>exp</code>. Reading kernels well = recognizing when a "non-matmul" op (cumsum) has been recast as a
+      matmul to hit the tensor cores.
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="k3">5. Kernel 3 — the K·Kᵀ Gram matrix (the hard one)</h2>
+
+  <div class="kbox">
+    <h3><code>chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter</code> &nbsp;<span class="tag">hard</span></h3>
+    <p>Builds the within-chunk key–key (<code>A</code>) and query–key (<code>Aqk</code>) matrices that feed the
+    triangular solve. This is "real" Triton: 2-D tiling, transposed block pointers, and a clever gate
+    factorization. <span class="fileref">fla/ops/kda.py:521</span></p>
+    <div class="meta">
+      <span class="mk">grid</span><span>(NT, NC·NC, B·H) — one program per (chunk, sub-chunk pair, head)</span>
+      <span class="mk">sizes</span><span>BT=64 (chunk), BC=16 (sub-chunk), NC=4, BK=128 (K loop runs once)</span>
+      <span class="mk">out</span><span>two <span class="sk">64×64</span> matrices per chunk, gate-weighted, β-scaled</span>
+    </div>
+  </div>
+
+  <p>
+    Why sub-chunks? A 64×64 matrix is split into a 4×4 grid of 16×16 blocks. This kernel fills the
+    <b>strictly-lower-triangular</b> off-diagonal blocks (row sub-chunk <code>i_i</code> below col sub-chunk
+    <code>i_j</code>); a sibling kernel (<code>…_intra_sub_intra</code>) fills the diagonal blocks. Splitting the
+    work this way keeps each program's tiles tiny and lets the triangular structure skip half the blocks.
+  </p>
+
+  <div class="ann">
+<pre><code>i_t, i_c, i_bh = tl.<span class="v">program_id</span>(0), tl.<span class="v">program_id</span>(1), tl.<span class="v">program_id</span>(2)
+i_b, i_h = i_bh // H, i_bh % H
+i_i, i_j = i_c // NC, i_c % NC          <span class="c"># row sub-chunk, col sub-chunk (each in 0..NC-1)</span>
+... varlen remap of i_t, bos, eos, T ...
+<span class="k">if</span> i_t * BT + i_i * BC &gt;= T: <span class="k">return</span>     <span class="c"># row sub-chunk past end of sequence</span>
+<span class="k">if</span> i_i &lt;= i_j: <span class="k">return</span>                    <span class="c"># keep only STRICTLY-lower blocks (i_i &gt; i_j)</span></code></pre>
+    <div class="note">
+      The two <code>return</code>s are how Triton expresses "this program has no work": ragged-edge programs and
+      upper-triangular blocks simply exit. The grid is launched dense (<code>NC*NC</code> pairs) and the kernel
+      prunes itself — common pattern, and the first thing to check when a program seems to compute nothing.
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>b_b = tl.<span class="v">load</span>(p_b)          <span class="c"># [BC] beta for the 16 ROW tokens</span>
+b_A = tl.<span class="v">zeros</span>([BC, BC], tl.float32)     <span class="c"># 16×16 key–key accumulator</span>
+b_Aqk = tl.<span class="v">zeros</span>([BC, BC], tl.float32)   <span class="c"># 16×16 query–key accumulator</span>
+<span class="k">for</span> i_k <span class="k">in</span> range(tl.<span class="v">cdiv</span>(K, BK)):       <span class="c"># tile over K (for K=128, BK=128 ⇒ one pass)</span></code></pre>
+    <div class="note">
+      The accumulators are 16×16 (one off-diagonal block of the 64×64 matrix). The <code>for i_k</code> loop tiles
+      the contraction (K) dimension — here it runs once, but the structure is what lets the same kernel handle
+      <code>K &gt; 128</code>.
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>    p_q  = block_ptr → q[ROW tokens, K-tile]     <span class="c"># [BC, BK]</span>
+    p_k  = block_ptr → k[ROW tokens, K-tile]     <span class="c"># [BC, BK]</span>
+    p_g  = block_ptr → g[ROW tokens, K-tile]     <span class="c"># [BC, BK]  cumulative gate</span>
+    b_kt = block_ptr → k[COL tokens, K-tile]ᵀ    <span class="c"># [BK, BC]  note: shape (K, T), TRANSPOSED</span>
+    p_gk = block_ptr → g[COL tokens, K-tile]ᵀ    <span class="c"># [BK, BC]</span>
+
+    o_k = i_k*BK + tl.<span class="v">arange</span>(0, BK); m_k = o_k &lt; K
+    b_gn = tl.<span class="v">load</span>(g + (i_t*BT + i_i*BC)*H*K + o_k, mask=m_k)  <span class="c"># [BK] gate at ROW sub-chunk's FIRST token = "anchor"</span></code></pre>
+    <div class="note">
+      <p>Two pointer styles in play. <code>p_q/p_k/p_g</code> are normal <code>[BC, BK]</code> tiles for the
+      <em>row</em> tokens. <code>b_kt/p_gk</code> use a transposed block pointer — created with shape
+      <code>(K, T)</code> and strides <code>(1, H*K)</code> — so the <em>column</em> tokens land as
+      <code>[BK, BC]</code>, ready to be the right-hand side of a <code>dot</code>.</p>
+      <p><code>b_gn</code> is the key idea: the cumulative gate at the <b>first token of the row sub-chunk</b>,
+      used as a shared <em>anchor</em>. Hold that thought.</p>
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>    b_g = tl.<span class="v">load</span>(p_g)
+    b_k = tl.<span class="v">load</span>(p_k) * <span class="v">exp2</span>(b_g - b_gn[<span class="k">None</span>, :])     <span class="c"># row key × decay(anchor→row token)</span>
+    b_gk = tl.<span class="v">load</span>(p_gk)
+    b_kt = tl.<span class="v">load</span>(b_kt)
+    b_ktg = b_kt * <span class="v">exp2</span>(b_gn[:, <span class="k">None</span>] - b_gk)            <span class="c"># col key × decay(col token→anchor)</span>
+    b_A += tl.<span class="v">dot</span>(b_k, b_ktg)                              <span class="c"># [BC,BC] gate-weighted Kᵢ·Kⱼᵀ</span>
+
+    b_q = tl.<span class="v">load</span>(p_q)
+    b_qg = b_q * <span class="v">exp2</span>(b_g - b_gn[<span class="k">None</span>, :]) * scale
+    b_Aqk += tl.<span class="v">dot</span>(b_qg, b_ktg)                            <span class="c"># [BC,BC] gate-weighted Qᵢ·Kⱼᵀ</span></code></pre>
+    <div class="note">
+      <p><strong>The gate factorization — the cleverest line in the kernel.</strong> The decay weighting a pair
+      (row token <code>i</code>, col token <code>j</code>) needs is <code>exp2(g[i] − g[j])</code>. Computing that
+      as an <code>[BC,BC]</code> matrix would break the matmul. Instead they split it through the anchor:</p>
+      <div class="eq">exp2(g[i] − g[j]) = <b>exp2(g[i] − g<sub>anchor</sub>)</b> · <b>exp2(g<sub>anchor</sub> − g[j])</b></div>
+      <p>The left factor depends only on the row token → folded into <code>b_k</code>. The right factor depends
+      only on the col token → folded into <code>b_ktg</code>. Now an ordinary <code>tl.dot(b_k, b_ktg)</code> sums
+      over K and the two factors multiply to reconstruct <code>exp2(g[i]−g[j])</code> for every (i,j). The anchor
+      also keeps both exponents near zero, which is numerically safer than <code>exp2</code> of a large
+      cumulative value. <code>Aqk</code> reuses the same <code>b_ktg</code> with the scaled query.</p>
+    </div>
+  </div>
+
+  <div class="ann">
+<pre><code>b_A *= b_b[:, <span class="k">None</span>]                       <span class="c"># scale each ROW by its beta (delta-rule write strength)</span>
+tl.<span class="v">store</span>(p_A,   b_A,   boundary_check=(0,1))  <span class="c"># write the 16×16 block into the 64×64 A</span>
+tl.<span class="v">store</span>(p_Aqk, b_Aqk, boundary_check=(0,1))</code></pre>
+    <div class="note">
+      Finally each row of the key–key block is scaled by <code>β</code> (queries are not β-scaled — only the
+      "write" side is), and the two blocks are stored into their slots of the full <code>[T, BT]</code> matrices.
+      Downstream, <code>solve_tril</code> inverts <code>I + A</code> and <code>Aqk</code> becomes the intra-chunk
+      part of the output — see <a href="KDA.html#chunk">KDA.html §8</a>.
+    </div>
+  </div>
+
+  <details class="q">
+    <summary>Check yourself: where did the per-token decay <code>exp2(g[i]−g[j])</code> actually get computed?</summary>
+    Nowhere as an explicit matrix — that's the point. It's <em>implicit</em> in the dot product: the row factor
+    <code>exp2(g[i]−g<sub>anchor</sub>)</code> rides on <code>b_k</code>, the column factor
+    <code>exp2(g<sub>anchor</sub>−g[j])</code> rides on <code>b_ktg</code>, and <code>tl.dot</code>'s
+    multiply-accumulate over K multiplies them together for each (i,j) pair. Spotting "the weighting is folded
+    into the operands of a matmul" is a core kernel-reading skill.
+  </details>
+
+  <!-- ============================================================ -->
+  <h2 id="approach">6. How to attack an unfamiliar kernel</h2>
+
+  <ol class="steps">
+    <li><b>Read the host wrapper first, not the <code>@triton.jit</code>.</b> The Python function that launches it
+      (e.g. <code>chunk_kda_scaled_dot_kkt_fwd</code>) shows the real tensor shapes, computes the block sizes, and
+      defines <code>grid=(...)</code>. That tuple is your map.</li>
+    <li><b>Decode <code>tl.program_id</code> against the grid.</b> Write down, in indices, exactly what slice this
+      one program owns. Everything else hangs off that.</li>
+    <li><b>Translate every <code>make_block_ptr</code> / pointer into "tile of tensor X at [rows, cols]".</b>
+      Ignore the stride arithmetic once you've confirmed it matches the tensor's logical shape.</li>
+    <li><b>Find the accumulator and the <code>tl.dot</code>s.</b> The matmuls are the load-bearing math; the
+      <code>exp2</code>/<code>where</code>/broadcast around them are weighting and masking.</li>
+    <li><b>Mentally collapse <code>constexpr</code> branches.</b> Pick your case (<code>IS_VARLEN=True</code>,
+      <code>IS_KDA=True</code>, …) and read only that path.</li>
+    <li><b>Check the <code>return</code>s and masks.</b> They tell you which programs do nothing and how ragged
+      edges are handled — easy to mistake for missing logic.</li>
+    <li><b>Save autotune/heuristics for last.</b> They only choose tile sizes and warp counts; they never change
+      what's computed.</li>
+  </ol>
+
+  <div class="callout good">
+    <strong>The recurring KDA idioms, in one place</strong>
+    <ul>
+      <li><b>State as a tile:</b> <code>b_h: [BV, BK]</code>; broadcast a vector over one axis, <code>tl.sum</code> over the other.</li>
+      <li><b>Gate via cumsum + difference:</b> decay from j→i is <code>exp2(g[i]−g[j])</code>, and that difference is
+        often <em>factored through an anchor</em> so it rides on the operands of a <code>dot</code>.</li>
+      <li><b>exp2 everywhere on the chunk path</b> because gates were pre-scaled by <code>RCP_LN2</code>; plain
+        <code>exp</code> on the decode path because it doesn't cumsum.</li>
+      <li><b>Cumsum / prefix ops = multiply by a triangular-ones matrix</b> to use tensor cores.</li>
+      <li><b>One <code>constexpr</code> flag</b> (<code>IS_KDA</code>) switches the scalar GDN gate to KDA's
+        per-channel gate.</li>
+    </ul>
+  </div>
+
+  <div class="callout warn">
+    <strong>Verification</strong>
+    Code excerpts are lightly reformatted (elided varlen boilerplate, inlined some pointers) for readability;
+    the logic and line references match vLLM on branch <code>dao/understand</code> at the time of writing. Read
+    the real files alongside — <span class="fileref">fla/ops/fused_recurrent.py</span> and
+    <span class="fileref">fla/ops/kda.py</span> — since line numbers drift.
+  </div>
+
+  <div class="foot">
+    Companion to <a href="KDA.html">KDA.html</a> · kernels annotated:
+    <span class="mono">fused_recurrent_gated_delta_rule_fwd_kernel</span>,
+    <span class="mono">kda_gate_cumsum_fwd_kernel</span>,
+    <span class="mono">chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter</span>.
+  </div>
+</main>
+</body>
+</html>

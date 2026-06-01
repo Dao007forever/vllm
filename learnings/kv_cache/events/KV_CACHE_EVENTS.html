@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vLLM KV Cache Events &amp; Nvidia Dynamo Integration</title>
+<link rel="stylesheet" href="../../_shared.css" />
+<style>
+  .evt-card { border-left: 4px solid var(--blue); }
+  .evt-card.removed { border-left-color: var(--red); }
+  .evt-card.cleared { border-left-color: var(--amber); }
+  .schema th:first-child, .schema td:first-child { white-space: nowrap; font-family: "SF Mono", Monaco, monospace; font-size: 0.92em; }
+  .pill { display:inline-block; border-radius: 10px; padding: 1px 9px; font-size: 0.74em; font-weight: 650; }
+  .pill.gpu { background: var(--blue-soft); color: var(--blue); border:1px solid #a6c8df; }
+  .pill.cpu { background: var(--amber-soft); color: var(--amber); border:1px solid #e3c88a; }
+  .map-table td { vertical-align: middle; }
+  .map-table .arrow { text-align:center; color: var(--muted); font-size:1.2em; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../../index.html">learnings</a> ›
+    <a href="../index.html">kv_cache</a> ›
+    events › KV_CACHE_EVENTS
+  </div>
+
+  <h1>KV Cache Events &mdash; vLLM, MooncakeStore &amp; Nvidia Dynamo</h1>
+  <p class="subtitle">
+    What vLLM emits when a KV block is cached or evicted, what the
+    MooncakeStore connector adds on top, and the concrete wiring it takes
+    to feed those events into Nvidia Dynamo's KV-cache-aware router.
+    Code references target the tree at <span class="fileref">vllm/distributed/kv_events.py</span>
+    and <span class="fileref">.../mooncake/store/</span>.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      vLLM emits exactly <strong>three</strong> KV-cache event types &mdash;
+      <code>BlockStored</code>, <code>BlockRemoved</code>,
+      <code>AllBlocksCleared</code> &mdash; from the <code>BlockPool</code>,
+      batched per engine step and published over a ZMQ <code>PUB</code> socket
+      (default <code>tcp://*:5557</code>) as msgpack.
+    </p>
+    <p>
+      The <strong>MooncakeStore</strong> connector reuses the same
+      <code>BlockStored</code> struct but tags it <code>medium="cpu"</code>,
+      aggregates per-worker events into <em>common</em> events, and merges them
+      into the same publish stream. It emits stores only &mdash; no removes.
+    </p>
+    <p>
+      <strong>Dynamo integration is mostly already done for you:</strong> vLLM's
+      event schema was contributed by the Dynamo team, so its three event types
+      map 1:1 onto Dynamo's. The cleanest path is Dynamo's
+      <code>KvEventPublisher</code> in <strong>ZMQ-relay mode</strong>, pointed at
+      vLLM's <code>:5557</code>. The one knob that matters:
+      <code>block_hashes</code> must be cumulative <em>sequence</em> hashes as
+      signed <code>i64</code> &mdash; which vLLM already does by default via
+      <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1</code>.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#part1">Part 1 &mdash; vLLM's native KV cache events</a>
+        <ol>
+          <li><a href="#types">The three event types</a></li>
+          <li><a href="#emit">Where they are emitted</a></li>
+          <li><a href="#pipeline">Collection &rarr; batch &rarr; publish</a></li>
+          <li><a href="#wire">Wire format &amp; config</a></li>
+          <li><a href="#hashes">The block-hash subtlety</a></li>
+          <li><a href="#agg">Multi-worker aggregation</a></li>
+        </ol>
+      </li>
+      <li><a href="#part2">Part 2 &mdash; MooncakeStore events</a></li>
+      <li><a href="#part3">Part 3 &mdash; Integrating with Nvidia Dynamo</a>
+        <ol>
+          <li><a href="#dynamo-needs">What the KV router needs</a></li>
+          <li><a href="#dynamo-map">Event mapping (1:1)</a></li>
+          <li><a href="#dynamo-modes">Two integration modes</a></li>
+          <li><a href="#dynamo-checklist">What it actually takes</a></li>
+          <li><a href="#dynamo-gaps">Gaps &amp; gotchas</a></li>
+        </ol>
+      </li>
+    </ol>
+  </nav>
+
+  <!-- ================= PART 1 ================= -->
+  <h2 id="part1">Part 1 &mdash; vLLM's native KV cache events</h2>
+
+  <p>
+    KV-cache events are an <em>observability / external-indexing</em> side channel.
+    They do nothing for vLLM's own correctness &mdash; the prefix cache works
+    whether or not events are enabled. Their job is to tell an <strong>external
+    consumer</strong> (a router, a global prefix index, a metrics sink) which
+    content-addressed blocks each engine currently holds, so that consumer can
+    route a new request to the engine that already has the longest matching
+    prefix.
+  </p>
+
+  <div class="callout info">
+    <strong>One source of truth</strong>
+    All three event types are defined in
+    <span class="fileref">vllm/distributed/kv_events.py</span>. They are
+    <code>msgspec.Struct</code> subclasses with <code>array_like=True</code> and
+    <code>tag=True</code> &mdash; so on the wire each event is a compact
+    <em>tagged array</em>, not a JSON object. The class name is the tag.
+  </div>
+
+  <h3 id="types">1.1 The three event types</h3>
+
+  <div class="grid">
+    <div class="box evt-card">
+      <h3><code>BlockStored</code></h3>
+      <p>Emitted when one or more <em>full</em> blocks become cached (content-addressable). Carries everything an external indexer needs to reconstruct the block key.</p>
+      <span class="pill gpu">medium = "GPU"</span>
+    </div>
+    <div class="box evt-card removed">
+      <h3><code>BlockRemoved</code></h3>
+      <p>Emitted when a cached block is <em>evicted</em> from the pool (LRU reuse). Only the block hashes + group are needed &mdash; the consumer already knows the content.</p>
+      <span class="pill gpu">medium = "GPU"</span>
+    </div>
+    <div class="box evt-card cleared">
+      <h3><code>AllBlocksCleared</code></h3>
+      <p>Emitted on a full prefix-cache reset. An empty struct &mdash; "drop everything you think I have." Consumer wipes its index for this worker.</p>
+    </div>
+  </div>
+
+  <h4>BlockStored schema</h4>
+  <table class="schema">
+    <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>block_hashes</td><td>list[bytes|int]</td><td><strong>Cumulative sequence hashes</strong>, one per new block. Each hash folds in <em>all</em> tokens from the start of the sequence up to and including that block &mdash; this is what makes cross-request prefix matching work.</td></tr>
+      <tr><td>parent_block_hash</td><td>bytes|int | None</td><td>Hash of the preceding block in the chain. <code>None</code> for the first block in the sequence.</td></tr>
+      <tr><td>token_ids</td><td>list[int]</td><td>The actual token IDs covered by the new blocks (range <code>num_cached_blocks*bs : num_full_blocks*bs</code>).</td></tr>
+      <tr><td>block_size</td><td>int</td><td>Tokens per block.</td></tr>
+      <tr><td>lora_id / lora_name</td><td>int|str|None</td><td>LoRA adapter identity folded into the hash (so adapters never alias the base model). <code>lora_id</code> is deprecated in favor of <code>lora_name</code>.</td></tr>
+      <tr><td>medium</td><td>str|None</td><td><code>"GPU"</code> for native events; <code>"cpu"</code> for MooncakeStore. Lets a consumer classify by tier.</td></tr>
+      <tr><td>extra_keys</td><td>list[tuple|None]|None</td><td>Per-block extra hash inputs (MM identifiers, cache_salt, prompt-embedding hashes…) so external consumers can <em>reconstruct</em> the block hash themselves.</td></tr>
+      <tr><td>group_idx</td><td>int|None</td><td>KV-cache group (hybrid models: full-attn vs sliding-window vs Mamba groups hash into different namespaces).</td></tr>
+      <tr><td>kv_cache_spec_kind / _sliding_window</td><td>str|int|None</td><td>Cache-spec metadata so a consumer can filter/classify groups as it learns them. Store events carry it; remove events don't need it.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>BlockRemoved</code> is just <code>{ block_hashes, medium, group_idx }</code>;
+    <code>AllBlocksCleared</code> has no fields. All three define <code>__hash__</code>
+    so they can be counted by the aggregator (see <a href="#agg">§1.6</a>).
+  </p>
+
+  <h3 id="emit">1.2 Where they are emitted</h3>
+
+  <p>
+    Every event originates in the <code>BlockPool</code>
+    (<span class="fileref">vllm/v1/core/block_pool.py</span>), gated behind
+    <code>enable_kv_cache_events</code>. The pool appends to an internal
+    <code>kv_event_queue</code> list; nothing is published from here.
+  </p>
+
+  <table>
+    <thead><tr><th>Event</th><th>Trigger site</th><th>What just happened</th></tr></thead>
+    <tbody>
+      <tr><td><code>BlockStored</code></td><td><code>cache_full_blocks()</code> &mdash; <span class="fileref">block_pool.py:315</span></td><td>One or more freshly-filled blocks got inserted into <code>cached_block_hash_to_block</code>. The event records the new hashes, parent, token range, and per-block extra keys.</td></tr>
+      <tr><td><code>BlockRemoved</code></td><td><code>_maybe_evict_cached_block()</code> &mdash; <span class="fileref">block_pool.py:392</span></td><td>A block was popped off the free queue for reuse and its old hash had to be unregistered. The eviction <em>is</em> the removal.</td></tr>
+      <tr><td><code>AllBlocksCleared</code></td><td><code>reset_prefix_cache()</code> &mdash; <span class="fileref">block_pool.py:485</span></td><td>Every block hash was reset (admin reset / cache flush).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Eviction ≈ removal, lazily</strong>
+    A <code>BlockRemoved</code> is only produced when a block is <em>recycled</em>
+    (<code>get_new_blocks</code> → <code>_maybe_evict_cached_block</code>), not the
+    instant a request frees it. A freed-but-still-cached block stays in the index
+    (and is still reusable) until pressure forces its reuse. Consumers must not
+    assume "request finished" implies "blocks removed."
+  </div>
+
+  <h3 id="pipeline">1.3 Collection &rarr; batch &rarr; publish</h3>
+
+  <p>
+    The <code>Scheduler</code> drains the queue once per engine step and publishes
+    a single batch. The hop chain:
+  </p>
+
+  <div class="trace">
+    <span class="step">1</span> <b>BlockPool</b> appends to <code>self.kv_event_queue</code> &nbsp;<span class="c"># during alloc/evict/reset</span><br>
+    <span class="step">2</span> <b>KVCacheManager.take_events()</b> &rarr; <code>block_pool.take_events()</code> &nbsp;<span class="c"># atomically drains + clears — kv_cache_manager.py:510</span><br>
+    <span class="step">3</span> <b>Scheduler.update_from_output()</b> &nbsp;<span class="c"># scheduler.py:1554</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>events = kv_cache_manager.take_events()</code><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>events += connector.take_events()</code> &nbsp;<span class="c"># merge MooncakeStore / connector events — scheduler.py:1558</span><br>
+    <span class="step">4</span> <code>batch = KVEventBatch(ts=now, events=events)</code> &nbsp;<span class="c"># scheduler.py:1567</span><br>
+    <span class="step">5</span> <b>ZmqEventPublisher.publish(batch)</b> &rarr; queue &rarr; background thread &rarr; ZMQ <code>PUB</code><br>
+  </div>
+
+  <p>
+    The publisher is created once in the scheduler from <code>KVEventsConfig</code>
+    (<span class="fileref">scheduler.py:137</span>), via
+    <code>EventPublisherFactory.create()</code>. If events are disabled the factory
+    returns a <code>NullEventPublisher</code> (a no-op), so the
+    <code>take_events()</code> calls all short-circuit.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Per-step event flow (events enabled)</div>
+    <div class="flow">
+      <div class="flow-step b"><div class="num">alloc / evict / reset</div>BlockPool.kv_event_queue</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step b"><div class="num">drain</div>KVCacheManager.take_events()</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step a"><div class="num">merge connector</div>+ connector.take_events()</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><div class="num">batch</div>KVEventBatch(ts, events)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><div class="num">async thread</div>ZmqEventPublisher → PUB :5557</div>
+    </div>
+  </div>
+
+  <h3 id="wire">1.4 Wire format &amp; config</h3>
+
+  <p>
+    <code>ZmqEventPublisher</code> (<span class="fileref">kv_events.py:274</span>)
+    runs a daemon thread that pulls batches off an in-memory queue, msgpack-encodes
+    them, and sends a 3-frame multipart message:
+  </p>
+
+  <div class="eq">
+    <b>frame 0</b> &nbsp; topic &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="c"># default "" (subscribe-all)</span><br>
+    <b>frame 1</b> &nbsp; seq &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="c"># monotonic uint64, 8 bytes big-endian — for gap detection</span><br>
+    <b>frame 2</b> &nbsp; payload &nbsp;&nbsp;&nbsp;<span class="c"># msgpack of EventBatch = [ts, [events…], data_parallel_rank]</span>
+  </div>
+
+  <ul>
+    <li><strong>Reliability:</strong> at-least-once with monotonic <code>seq</code>. A
+      <code>ROUTER</code> <em>replay</em> socket (optional <code>replay_endpoint</code>,
+      default <code>:5558</code>) keeps the last <code>buffer_steps</code> batches in a
+      <code>deque</code>; a subscriber that detects a gap requests missed batches by
+      starting sequence number.</li>
+    <li><strong>Back-pressure:</strong> a high-water mark (<code>hwm=100k</code>) and bounded
+      queue (<code>max_queue_size=100k</code>) &mdash; if a consumer can't keep up, events
+      <em>drop</em> rather than blocking the engine.</li>
+    <li><strong>Data parallelism:</strong> each DP rank runs its own publisher and stamps
+      <code>data_parallel_rank</code> on every batch; the endpoint port is offset by the rank
+      (<code>offset_endpoint_port</code>), so rank <em>k</em> publishes on <code>5557+k</code>.</li>
+  </ul>
+
+  <p>Config lives in <span class="fileref">vllm/config/kv_events.py</span> (<code>KVEventsConfig</code>):</p>
+  <pre><span class="c"># Enable + publish over ZMQ</span>
+<span class="k">--kv-events-config</span> <span class="s">'{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5557"}'</span></pre>
+  <p>
+    When <code>enable_kv_cache_events</code> is true and <code>publisher</code> is unset,
+    <code>__post_init__</code> defaults it to <code>"zmq"</code>; otherwise <code>"null"</code>.
+  </p>
+
+  <h3 id="hashes">1.5 The block-hash subtlety (this is what makes routing work)</h3>
+
+  <p>
+    The single most important field for any external router is
+    <code>block_hashes</code>. Two properties make it usable:
+  </p>
+  <ol>
+    <li><strong>Cumulative / chained.</strong> A block's hash folds in its parent's hash,
+      so identical <em>prefixes</em> across two different requests produce identical block
+      hashes &mdash; that's the whole basis for prefix-overlap routing.</li>
+    <li><strong>Reproducible across processes.</strong> So that worker A and worker B
+      compute the <em>same</em> hash for the same prefix. This requires a shared seed.</li>
+  </ol>
+
+  <p>
+    <code>ExternalBlockHash</code> is <code>bytes | int</code>
+    (<span class="fileref">kv_cache_utils.py:52</span>).
+    <code>maybe_convert_block_hash()</code> (<span class="fileref">:77</span>) decides which:
+  </p>
+  <pre><span class="k">def</span> <span class="fn">maybe_convert_block_hash</span>(hash_bytes):
+    <span class="k">if not</span> envs.VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES:
+        <span class="k">return</span> hash_bytes              <span class="c"># raw 32-byte sha256</span>
+    <span class="k">return</span> int.from_bytes(hash_bytes, <span class="s">"big"</span>) & ((<span class="n">1</span> &lt;&lt; <span class="n">64</span>) - <span class="n">1</span>)  <span class="c"># unsigned 64-bit</span></pre>
+
+  <div class="callout good">
+    <strong>Default is already Dynamo-friendly</strong>
+    <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code> defaults to <strong>1 / True</strong>
+    (<span class="fileref">vllm/envs.py:240</span>). So out of the box vLLM emits a
+    truncated unsigned 64-bit int, whose bit pattern is exactly the signed
+    <code>i64</code> a radix-tree indexer wants. <em>You do not normally have to set
+    anything here.</em>
+  </div>
+
+  <div class="callout warn">
+    <strong>PYTHONHASHSEED across workers</strong>
+    The chain is seeded by <code>NONE_HASH</code>, initialized in
+    <code>init_none_hash()</code> (<span class="fileref">kv_cache_utils.py:97</span>).
+    If <code>PYTHONHASHSEED</code> is unset, the seed is <code>os.urandom(32)</code> &mdash;
+    <em>different per process</em>, so two workers will hash the same prefix differently
+    and the router's cross-worker matching breaks. For multi-worker routing every engine
+    must run with the same fixed <code>PYTHONHASHSEED</code> (and identical model / config).
+  </div>
+
+  <h3 id="agg">1.6 Multi-worker aggregation</h3>
+
+  <p>
+    Under TP/PP a "block" is sharded across N workers, so N workers each emit the
+    "same" store event. <code>KVEventAggregator</code>
+    (<span class="fileref">kv_events.py:116</span>) counts events by their
+    <code>__hash__</code> and exposes <code>get_common_events()</code> &mdash; events
+    seen from <em>all</em> workers &mdash; so a downstream index records each logical
+    block once. This is the machinery the MooncakeStore connector reuses.
+  </p>
+
+  <!-- ================= PART 2 ================= -->
+  <h2 id="part2">Part 2 &mdash; What MooncakeStore emits</h2>
+
+  <p>
+    The <code>MooncakeStoreConnector</code>
+    (<span class="fileref">.../mooncake/store/connector.py</span>) uses
+    <code>MooncakeDistributedStore</code> as a <em>shared, off-GPU</em> KV pool. When
+    a request's blocks are written to the store, the connector emits its own
+    <code>BlockStored</code> events so an external index knows the prefix is also
+    available in the shared tier &mdash; not just on a single GPU.
+  </p>
+
+  <h3>What it emits, and what it doesn't</h3>
+  <div class="grid">
+    <div class="box">
+      <h3>✓ Emits</h3>
+      <ul>
+        <li><code>BlockStored</code> with <span class="pill cpu">medium = "cpu"</span></li>
+        <li>Built in the worker during <code>batch_put</code> &mdash; <span class="fileref">store/worker.py:562</span></li>
+        <li><code>parent_block_hash</code> chained <em>within</em> a group (<code>prev_key_per_group</code>), matching native semantics</li>
+        <li><code>block_size = original_block_size</code>, token IDs for the range</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>✗ Does <em>not</em> emit</h3>
+      <ul>
+        <li>No <code>BlockRemoved</code> &mdash; eviction from the store is internal to
+          Mooncake (CPU/disk tiering) and not surfaced to vLLM.</li>
+        <li>No <code>AllBlocksCleared</code>.</li>
+        <li>No <code>extra_keys</code> / <code>group_idx</code> / spec metadata
+          (the store-side struct is the minimal form).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>The aggregation path is different from native</h3>
+
+  <p>
+    Native GPU events come straight off the <code>BlockPool</code>. Connector events
+    take a longer road because they originate on the <em>worker</em> side and must be
+    funneled back to the scheduler and deduplicated across workers:
+  </p>
+
+  <div class="trace">
+    <span class="step">1</span> <b>Worker</b> writes blocks → builds <code>BlockStored(medium="cpu")</code>, buffers via <code>update_kv_event()</code> &nbsp;<span class="c"># worker.py:619</span><br>
+    <span class="step">2</span> <code>get_kv_connector_kv_cache_events()</code> wraps them in a <b>MooncakeStoreKVEvents</b> (num_workers=1) &nbsp;<span class="c"># connector.py:266</span><br>
+    <span class="step">3</span> Events ride back in <code>KVConnectorOutput</code> → scheduler-side <code>update_connector_output()</code> &nbsp;<span class="c"># connector.py:196</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="c"># merges per-worker batches, increments the worker count</span><br>
+    <span class="step">4</span> <b>connector.take_events()</b> calls <code>.aggregate()</code> → keeps only events seen by <em>all</em> workers &nbsp;<span class="c"># connector.py:211</span><br>
+    <span class="step">5</span> Scheduler appends them to the same <code>KVEventBatch</code> as GPU events → same ZMQ socket<br>
+  </div>
+
+  <p>
+    <code>MooncakeStoreKVEvents</code> (<span class="fileref">connector.py:47</span>) is a
+    thin <code>KVConnectorKVEvents</code> wrapper around the same
+    <code>KVEventAggregator</code>. So the end result is a <em>single, unified</em>
+    event stream on <code>:5557</code> in which a consumer distinguishes tiers by the
+    <code>medium</code> field: <span class="pill gpu">GPU</span> = on this engine's HBM,
+    <span class="pill cpu">cpu</span> = in the shared Mooncake pool.
+  </p>
+
+  <div class="callout info">
+    <strong>Why "common events"?</strong>
+    A block is only truly "stored in the shared pool" once every shard has written its
+    slice. Counting and keeping only events emitted by all workers prevents the index
+    from advertising a prefix that's only partially persisted.
+  </div>
+
+  <!-- ================= PART 3 ================= -->
+  <h2 id="part3">Part 3 &mdash; Integrating with Nvidia Dynamo KV-cache-aware routing</h2>
+
+  <div class="callout good">
+    <strong>The punchline first</strong>
+    vLLM's KV-event infrastructure was <em>contributed by the Nvidia Dynamo team</em>.
+    The three event types, the ZMQ multipart framing, and the
+    <code>[ts, [events], dp_rank]</code> msgpack payload were designed to be exactly
+    what Dynamo's router consumes. So "integration" is mostly <strong>configuration and
+    a relay</strong>, not new code in vLLM.
+  </div>
+
+  <h3 id="dynamo-needs">3.1 What Dynamo's KV router needs</h3>
+
+  <p>
+    Dynamo's KV router picks the worker with the best <em>prefix overlap</em> for an
+    incoming request, trading that against decode load. Its cost function is roughly
+    <code>cost = overlap_score_weight · prefill_blocks + decode_blocks</code>. To compute
+    overlap it maintains a <strong><code>KvIndexer</code></strong> backed by a
+    <strong>radix / prefix tree</strong> of cached blocks, keyed by block hash, one
+    branch per worker. To keep that tree current it consumes a live store/remove event
+    stream from every worker:
+  </p>
+  <ul>
+    <li><strong>Store</strong> events → insert <code>(parent_hash → block_hash)</code> edges into the tree under that worker.</li>
+    <li><strong>Remove</strong> events → prune those nodes.</li>
+    <li><strong>Cleared</strong> → drop the worker's whole branch.</li>
+  </ul>
+  <p>
+    Block hashes must be <em>cumulative sequence hashes</em> (so a shared prefix lands on
+    a shared path) and <em>deterministic across workers</em>. vLLM satisfies both, as
+    covered in <a href="#hashes">§1.5</a>.
+  </p>
+
+  <h3 id="dynamo-map">3.2 Event mapping is 1:1</h3>
+
+  <table class="map-table">
+    <thead><tr><th>vLLM</th><th class="arrow"></th><th>Dynamo</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>BlockStored</code></td><td class="arrow">→</td><td><code>BlockStored</code> / <code>KvCacheStoreData</code></td><td>Dynamo reads <code>block_hashes</code>, <code>parent_block_hash</code>, <code>token_ids</code>, <code>block_size</code>, <code>lora_name</code>.</td></tr>
+      <tr><td><code>BlockRemoved</code></td><td class="arrow">→</td><td><code>BlockRemoved</code></td><td>Just <code>block_hashes</code>.</td></tr>
+      <tr><td><code>AllBlocksCleared</code></td><td class="arrow">→</td><td><code>AllBlocksCleared</code></td><td>Empty.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Dynamo even documents the ZMQ wire format as "compatible with SGLang / vLLM": the same 3 frames (topic, 8-byte big-endian seq, msgpack <code>[ts, [events], dp_rank]</code>), each event tagged by type.</p>
+
+  <div class="callout warn">
+    <strong>One real serialization nuance</strong>
+    vLLM's structs are <code>array_like=True, tag=True</code>, so each event is actually a
+    <em>tagged array</em> (<code>[tag, field0, field1, …]</code>), not a
+    <code>{"type": …}</code> dict &mdash; Dynamo's docs describe the logical dict form. The
+    Dynamo relay decoder is built against vLLM's exact field order, so this works in
+    practice; just don't expect to hand-parse the payload as JSON objects.
+  </div>
+
+  <h3 id="dynamo-modes">3.3 Two integration modes</h3>
+
+  <div class="compare">
+    <div class="side right">
+      <strong>A. ZMQ relay &mdash; recommended for vLLM</strong>
+      <p>Dynamo's <code>KvEventPublisher</code> runs in <em>relay mode</em>: it
+      <em>subscribes</em> to vLLM's existing PUB socket and forwards events onto the
+      Dynamo event plane (NATS or ZMQ) → <code>KvIndexer</code>. No engine code changes.</p>
+<pre><span class="k">from</span> dynamo.llm <span class="k">import</span> KvEventPublisher
+KvEventPublisher(
+    component=component,
+    kv_block_size=<span class="n">16</span>,          <span class="c"># must match vLLM block size</span>
+    zmq_endpoint=<span class="s">"tcp://127.0.0.1:5557"</span>,
+    zmq_topic=<span class="s">""</span>,              <span class="c"># all topics</span>
+)</pre>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side left">
+      <strong>B. Direct publishing</strong>
+      <p>For a custom engine with no ZMQ event system: call
+      <code>publish_stored()</code> / <code>publish_removed()</code> yourself. <em>Not
+      needed for vLLM</em> &mdash; vLLM already has the ZMQ publisher, so relay is strictly
+      less work and avoids duplicating the hashing logic.</p>
+    </div>
+  </div>
+
+  <p>
+    There is also a higher-level path used by Dynamo's own vLLM backend:
+    <code>DynamoStatLoggerPublisher</code> (in <code>components/src/dynamo/vllm/publisher.py</code>),
+    which hooks vLLM's <code>StatLoggerBase</code> to pull KV updates. The ZMQ relay is the
+    decoupled, lower-overhead choice when you just want routing.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">End-to-end: vLLM events → Dynamo router</div>
+    <div class="flow">
+      <div class="flow-step b"><div class="num">vLLM engine</div>BlockPool + Mooncake connector events</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step b"><div class="num">PUB :5557</div>ZmqEventPublisher (msgpack)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><div class="num">SUB (relay)</div>Dynamo KvEventPublisher</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><div class="num">event plane</div>NATS / ZMQ kv-events topic</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step a"><div class="num">router</div>KvIndexer (RadixTree) → overlap score</div>
+    </div>
+  </div>
+
+  <h3 id="dynamo-checklist">3.4 What it actually takes &mdash; checklist</h3>
+
+  <ol class="steps">
+    <li><strong>Enable events in vLLM.</strong>
+      <code>--kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5557"}'</code>.</li>
+    <li><strong>Keep int block hashes (default).</strong> Leave
+      <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1</code> so hashes are <code>i64</code>, not 32-byte blobs.</li>
+    <li><strong>Pin a shared <code>PYTHONHASHSEED</code></strong> on every engine, with identical model
+      and config, so cross-worker prefix hashes line up (<a href="#hashes">§1.5</a>).</li>
+    <li><strong>Match block size.</strong> Pass Dynamo <code>kv_block_size</code> /
+      <code>--kv-cache-block-size</code> equal to vLLM's block size; mismatched block sizes make the
+      radix tree meaningless.</li>
+    <li><strong>Point Dynamo's relay</strong> <code>KvEventPublisher(zmq_endpoint=…:5557)</code> at each
+      engine, one per <code>dp_rank</code> (remember the <code>5557+rank</code> offset).</li>
+    <li><strong>Run the router in KV mode.</strong> <code>--router-mode kv</code> (or
+      <code>DYN_ROUTER_MODE=kv</code>); tune <code>--router-kv-overlap-score-weight</code>.</li>
+    <li><strong>(Optional) handle gaps.</strong> vLLM exposes a replay <code>ROUTER</code> socket; Dynamo's
+      indexer does its own gap detection (<code>last_recovered_event_id</code> + tree dump), so durable
+      replay is available but not required.</li>
+  </ol>
+
+  <h3 id="dynamo-gaps">3.5 Gaps &amp; gotchas</h3>
+
+  <table>
+    <thead><tr><th>Issue</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td><strong><code>medium</code> / <code>group_idx</code> not in Dynamo's core schema</strong></td><td>Dynamo's radix tree is fundamentally a per-worker, GPU-prefix model. vLLM's <code>medium="cpu"</code> (Mooncake) and hybrid <code>group_idx</code> are extra dimensions Dynamo's basic indexer doesn't natively branch on &mdash; a shared-pool prefix may be treated like any other cached prefix for that worker. Verify behavior before relying on tiered routing.</td></tr>
+      <tr><td><strong>No store-side <code>BlockRemoved</code></strong></td><td>MooncakeStore never emits removes (§2). The router's view of the shared tier only grows from vLLM's perspective; stale entries rely on Dynamo's own TTL/eviction, not vLLM signals.</td></tr>
+      <tr><td><strong>Lossy transport</strong></td><td>PUB/SUB is fire-and-forget with an HWM that drops under back-pressure. A slow router silently loses events → index drift. Use the replay socket or Dynamo's recovery, and watch the publisher's queue.</td></tr>
+      <tr><td><strong>Eviction lag</strong></td><td><code>BlockRemoved</code> fires on <em>reuse</em>, not on free (§1.2). The router can briefly believe a worker holds a prefix it has logically released &mdash; usually harmless (overlap is a hint, not a guarantee) but worth knowing when debugging "why did it route there."</td></tr>
+      <tr><td><strong>Hash-seed drift</strong></td><td>The most common silent failure: forgetting <code>PYTHONHASHSEED</code> on one worker. No error &mdash; just zero cross-worker overlap and round-robin-like routing.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="foot">
+    <p><strong>Primary sources (verified against this tree):</strong></p>
+    <ul>
+      <li><span class="fileref">vllm/distributed/kv_events.py</span> &mdash; event structs, <code>ZmqEventPublisher</code>, <code>KVEventAggregator</code>, <code>EventPublisherFactory</code></li>
+      <li><span class="fileref">vllm/v1/core/block_pool.py</span> &mdash; emission sites (315 / 392 / 485), <code>take_events</code> (510)</li>
+      <li><span class="fileref">vllm/v1/core/sched/scheduler.py</span> &mdash; publisher creation (137), batch + publish (1554–1568)</li>
+      <li><span class="fileref">vllm/v1/core/kv_cache_utils.py</span> &mdash; <code>ExternalBlockHash</code>, <code>maybe_convert_block_hash</code>, <code>init_none_hash</code></li>
+      <li><span class="fileref">vllm/config/kv_events.py</span> &amp; <span class="fileref">vllm/envs.py:240</span> &mdash; config + <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code></li>
+      <li><span class="fileref">.../mooncake/store/connector.py</span> &amp; <span class="fileref">.../store/worker.py</span> &mdash; <code>MooncakeStoreKVEvents</code>, store-side <code>BlockStored</code></li>
+    </ul>
+    <p><strong>External (Nvidia Dynamo docs):</strong>
+      <a href="https://docs.nvidia.com/dynamo/user-guides/kv-cache-aware-routing">KV-Cache-Aware Routing</a> ·
+      <a href="https://docs.nvidia.com/dynamo/components/router/kv-event-replay-dynamo-vs-v-llm">KV Event Replay — Dynamo vs vLLM</a> ·
+      <a href="https://github.com/ai-dynamo/dynamo/blob/main/docs/integrations/kv-events-custom-engines.md">KV Events for Custom Engines</a>
+    </p>
+    <p>Dynamo struct/field names are taken from Dynamo's public docs and may differ from its internal Rust definitions. vLLM line numbers may drift; file paths and semantics are current as of this tree.</p>
+  </div>
+</main>
+</body>
+</html>

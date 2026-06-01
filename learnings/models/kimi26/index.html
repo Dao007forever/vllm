@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kimi-K2.6 in vLLM — Architecture, Blackwell Kernels &amp; MLA KV Cache</title>
+<link rel="stylesheet" href="../../_shared.css">
+</head>
+<body>
+<main>
+
+  <div class="crumb"><a href="../../index.md">learnings</a> / <a href="../">models</a> / kimi26</div>
+
+  <h1>Kimi-K2.6 in vLLM</h1>
+  <p class="subtitle">A DeepSeek-V3-architecture text MoE model: MLA attention, fine-grained fp8 MoE, the kernels it runs on NVIDIA Blackwell (sm_100), tensor dtypes, and the (tiny) MLA KV-cache per token.</p>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    Kimi-K2.6 has <em>no</em> dedicated model file in vLLM. It is a <b>DeepSeek-V3-architecture</b> text MoE model
+    (Multi-head Latent Attention + sigmoid/noaux_tc MoE) served through <code>DeepseekV2ForCausalLM</code>
+    (<span class="fileref">deepseek_v2.py</span>). ~64 decoder layers, 384 routed experts (top-8) + 1 shared, run at TP=8.
+    On Blackwell the default attention is <b>FlashInfer MLA</b> (trtllm-gen) with optional fp8 KV; experts are
+    <b>block-wise fp8</b> (DeepGEMM grouped GEMM, UE8M0 packed scales). MLA caches a single
+    <b>576-dim latent per token per layer</b> → <b>≈72&nbsp;KiB/token</b> (bf16) or <b>≈36&nbsp;KiB/token</b> (fp8) over 64 layers —
+    roughly <b>71×</b> smaller than the equivalent multi-head cache.
+  </div>
+
+  <div class="callout warn">
+    <strong>Scoping note — "Kimi-K2.6" is not a distinct module here.</strong>
+    There is no <code>kimi_k26.py</code>. The latest dedicated Kimi model in this tree is the VL model
+    <span class="fileref">kimi_k25.py</span>, whose text backbone is itself <code>DeepseekV2ForCausalLM</code>.
+    Kimi-K2.6 is referenced only as a deep-MoE/TP workload:
+    <a href="../../../vllm/env_override.py#L774">env_override.py:774</a> ("Kimi-K2.6 at TP=8 … hundreds of layers deep")
+    and <a href="../../../tests/compile/test_inductor_fallback_allow_list_patch.py#L210">test_inductor_fallback_allow_list_patch.py:210</a>
+    ("Kimi-K2.6 has ~64 decoder layers per replica"). Everything below documents the <b>DeepSeek-V3 MLA+MoE backbone</b> it
+    runs on; concrete hyper-parameters are checkpoint-driven and cited from in-repo tests. Re-verify against the checkpoint
+    config before relying on exact counts.
+  </div>
+
+  <nav class="nav">
+    <ol>
+      <li><a href="#arch">Model architecture</a></li>
+      <li><a href="#mla">MLA attention (latent KV)</a></li>
+      <li><a href="#moe">MoE &amp; dense MLP</a></li>
+      <li><a href="#kernels">Blackwell kernels &amp; dtypes</a></li>
+      <li><a href="#dtype">Dtype flow end-to-end</a></li>
+      <li><a href="#kv">MLA KV cache per token</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="arch">1 · Model architecture</h2>
+
+  <p>The registry has no Kimi-K2 text entry — a Kimi-K2/K2.6 checkpoint declares <code>architectures:
+  ["DeepseekV3ForCausalLM"]</code>, which in vLLM is a bare <code>pass</code> subclass of
+  <code>DeepseekV2ForCausalLM</code> <a href="../../../vllm/model_executor/models/deepseek_v2.py#L1746">deepseek_v2.py:1746</a>.
+  All behaviour lives in the V2 classes; the V3 path is selected purely by config fields (sigmoid scoring, noaux_tc routing).</p>
+
+  <div class="diagram">
+    <div class="diagram-title">Decoder stack — ~64 layers</div>
+    <div class="cell-row"><div class="cell label">embed</div><div class="cell used wide">VocabParallelEmbedding → 7168</div></div>
+    <div class="cell-row"><div class="cell label">layers 0…D-1</div><div class="cell full-grp wide">MLA attention + <b>dense</b> MLP (SiluAndMul)</div><div class="cell sm">×<code>first_k_dense_replace</code></div></div>
+    <div class="cell-row"><div class="cell label">layers D…63</div><div class="cell mamba-grp wide">MLA attention + <b>MoE</b> (384 experts, top-8 + 1 shared)</div><div class="cell sm">rest</div></div>
+    <div class="cell-row"><div class="cell label">norm</div><div class="cell used wide">final RMSNorm</div></div>
+    <div class="cell-row"><div class="cell label">lm_head</div><div class="cell used wide">ParallelLMHead → LogitsProcessor (untied)</div></div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--blue-soft);border-color:#a6c8df"></span>dense-FFN layer</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--amber-soft);border-color:#e3c88a"></span>MoE layer</span>
+    </div>
+    <div class="diagram-caption">Every layer uses MLA attention. "Dense" refers only to the <b>FFN</b> — the first
+      <code>first_k_dense_replace</code> layers use a plain MLP, the rest use MoE
+      <a href="../../../vllm/model_executor/models/deepseek_v2.py#L1144">deepseek_v2.py:1144</a>.</div>
+  </div>
+
+  <h3>Key geometry (DeepSeek-V3 / Kimi-K2)</h3>
+  <p>Numbers below are cited from in-repo tests that explicitly model Kimi-K2 geometry; per-head dims (128) are the standard
+  DeepSeek-V3 values used by the MLA backend.</p>
+  <table>
+    <tr><th>Field</th><th>Value</th><th>Field</th><th>Value</th></tr>
+    <tr><td><code>hidden_size</code></td><td>7168</td><td><code>num_hidden_layers</code></td><td>~64 (K2.6) / 61 (DSV3)</td></tr>
+    <tr><td><code>num_attention_heads</code></td><td>128</td><td><code>q_lora_rank</code></td><td>1536</td></tr>
+    <tr><td><code>kv_lora_rank</code></td><td>512</td><td><code>qk_rope_head_dim</code></td><td>64</td></tr>
+    <tr><td><code>qk_nope_head_dim</code></td><td>128</td><td><code>v_head_dim</code></td><td>128</td></tr>
+    <tr><td><code>n_routed_experts</code></td><td>384</td><td><code>num_experts_per_tok</code></td><td>8 + 1 shared</td></tr>
+    <tr><td><code>n_group</code> / <code>topk_group</code></td><td>1 / 1</td><td><code>routed_scaling_factor</code></td><td>2.827</td></tr>
+    <tr><td><code>scoring_func</code></td><td>sigmoid</td><td><code>topk_method</code></td><td>noaux_tc (routed bias)</td></tr>
+    <tr><td>activation</td><td>SiluAndMul (SwiGLU)</td><td>weights</td><td>block-wise fp8 (128×128)</td></tr>
+  </table>
+  <div class="callout code-ref">
+    <strong>Sources for these numbers</strong>
+    MLA geometry (q_lora 1536, kv_lora 512, qk_rope 64, hidden 7168):
+    <a href="../../../tests/compile/passes/test_fuse_mla_dual_rms_norm.py#L27">test_fuse_mla_dual_rms_norm.py:27</a>.
+    Routing (384 experts, top-8, n_group 1, topk_group 1, scaling 2.827, sigmoid, noaux_tc) "from Kimi-K2-Thinking config.json":
+    <a href="../../../tests/kernels/moe/test_marlin_vs_trtllm_mxint4.py#L142">test_marlin_vs_trtllm_mxint4.py:142</a>.
+    EP=8 / 384 experts: <a href="../../../tests/model_executor/model_loader/test_ep_weight_filter.py#L104">test_ep_weight_filter.py:104</a>.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="mla">2 · MLA attention (latent KV)</h2>
+
+  <p>MLA is the whole point of the architecture: instead of caching K and V per head, it caches a single
+  <b>compressed latent</b> per token and reconstructs K/V on the fly by <em>absorbing</em> the up-projection weights into the
+  attention kernel. Kimi-K2.6 uses the dense MLA path — <code>DeepseekV2MLAAttention</code> →
+  <code>MultiHeadLatentAttentionWrapper</code> → the <code>MLAAttention</code> backend
+  (<code>is_sparse=False</code>, no DeepSeek-V3.2 indexer)
+  <a href="../../../vllm/model_executor/models/deepseek_v2.py#L878">deepseek_v2.py:878</a>.</p>
+
+  <div class="diagram">
+    <div class="diagram-title">MLA forward — what gets projected, what gets cached</div>
+    <div class="flow">
+      <div class="flow-step b"><div class="num">1 · fused A-GEMM</div><code>fused_qkv_a_proj</code><br>7168 → [1536 | 576]</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><div class="num">2 · q path</div>split 1536 → <code>q_a_layernorm</code> → <code>q_b_proj</code> → 128 heads × 192</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><div class="num">3 · latent split</div>576 → [<b>kv_c</b> 512 | <b>k_pe</b> 64]<br><code>kv_a_layernorm</code> on kv_c</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step a"><div class="num">4 · RoPE</div>partial rope on the 64-dim <code>q_pe</code> / <code>k_pe</code> (YaRN)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step r"><div class="num">5 · cache + attend</div>store [kv_c 512 | k_pe 64] = <b>576</b>/token; <code>kv_b_proj</code> absorbed into kernel</div>
+    </div>
+    <div class="diagram-caption">The KV cache holds only the normalized latent <code>kv_c</code> (512) plus the rope key
+      <code>k_pe</code> (64) — one 576-dim vector per token, <code>num_kv_heads=1</code>. <code>kv_b_proj</code> (which would
+      expand it to 128 heads of K/V) is handed to the backend and folded into the attention math via bf16 BMMs.</div>
+  </div>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Projections</h3>
+      <ul>
+        <li><code>fused_qkv_a_proj</code> — one GEMM emits <code>[q_lora 1536 | kv_lora+rope 576]</code> (the <code>[2112, 7168]</code> shape has a bf16 fast-path on SM90/SM100) <a href="../../../vllm/model_executor/models/deepseek_v2.py#L928">:928</a></li>
+        <li><code>q_a_layernorm</code> (RMSNorm 1536) → <code>q_b_proj</code> → 128 × (128+64)</li>
+        <li><code>kv_a_layernorm</code> (RMSNorm 512); <code>kv_b_proj</code> 512 → 128 × (128+128) is <b>absorbed</b></li>
+        <li><code>o_proj</code>: 128 × 128 → 7168 (RowParallel)</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Weight absorption</h3>
+      <ul>
+        <li><code>kv_b_proj</code> is split into <code>W_UK</code> / <code>W_UV</code> and stored as bf16 copies <a href="../../../vllm/model_executor/layers/attention/mla_attention.py#L839">mla_attention.py:839</a></li>
+        <li>Decode: <code>q_nope·W_UK_T</code> maps the query into the 512-dim latent space, then attend against the cached latent (a single 576-dim "head")</li>
+        <li>Output is mapped back with <code>·W_UV</code></li>
+        <li>Both BMMs run in <b>bf16</b> — "no quantized bmm's for W_UV/W_UK_T" <a href="../../../vllm/model_executor/layers/attention/mla_attention.py#L836">:836</a></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="moe">3 · MoE &amp; dense MLP</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>MoE block (DeepseekV2MoE)</h3>
+      <ul>
+        <li><b>Router</b> <code>GateLinear</code>: <b>sigmoid</b> scoring, <code>noaux_tc</code> with an fp32 <code>e_score_correction_bias</code> <a href="../../../vllm/model_executor/models/deepseek_v2.py#L274">:274</a></li>
+        <li><b>Grouped top-k</b>: <code>use_grouped_topk</code>, <code>n_group=1</code>, <code>topk_group=1</code>; <code>renormalize=False</code> (DSV3 doesn't renormalize)</li>
+        <li>384 routed experts, <b>top-8</b>, <code>routed_scaling_factor=2.827</code> applied to the output</li>
+        <li><b>1 shared expert</b> (always-on MLP, <code>reduce_results=False</code>, fused into the FusedMoE call)</li>
+        <li>Activation <code>SiluAndMul</code></li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Dense MLP (first layers)</h3>
+      <ul>
+        <li><code>MergedColumnParallelLinear</code> gate_up → <code>RowParallelLinear</code> down, no bias <a href="../../../vllm/model_executor/models/deepseek_v2.py#L199">:199</a></li>
+        <li><code>intermediate_size</code> (config), <code>SiluAndMul</code></li>
+        <li>Used for the first <code>first_k_dense_replace</code> layers; the rest are MoE</li>
+        <li>These layers still run full <b>MLA attention</b> — only the FFN is dense</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="kernels">4 · Blackwell kernels &amp; their dtypes</h2>
+
+  <p>Production weights are <b>block-wise fp8</b> (<code>weight_block_size=[128,128]</code>, <code>fp8_e4m3fn</code> values
+  with fp32 / UE8M0 scales) supplied via <code>QuantizationConfig</code>. The split on Blackwell: <b>attention runs in bf16</b>
+  (the absorbed latent BMMs are 16-bit; KV may be bf16 or fp8), while <b>MoE and dense projections are fp8</b> GEMMs with fp32
+  accumulation.</p>
+
+  <table>
+    <tr><th>Kernel / op</th><th>Computes</th><th>In → Out dtype</th><th>Blackwell-gated</th></tr>
+    <tr>
+      <td><b>FlashInfer MLA decode</b> (trtllm-gen)<br><span class="mono" style="font-size:.8em;color:var(--muted)">trtllm_batch_decode_with_kv_cache_mla · <b>default</b></span></td>
+      <td>MQA decode over the compressed latent KV</td>
+      <td>q bf16/fp8_e4m3, KV bf16/<b>fp8</b> → bf16</td>
+      <td>yes — <code>major==10</code></td>
+    </tr>
+    <tr>
+      <td><b>TOKENSPEED_MLA decode</b> (CuTe DSL)<br><span class="mono" style="font-size:.8em;color:var(--muted)">PR #41778 · wins at higher batch</span></td>
+      <td>MQA decode, FP8-Q + FP8-KV only, R1 dims</td>
+      <td>q <b>fp8_e4m3</b>, KV fp8 → bf16</td>
+      <td>yes — <code>major==10</code></td>
+    </tr>
+    <tr>
+      <td><b>CUTLASS MLA decode</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">sm100_cutlass_mla_decode</span></td>
+      <td>MQA decode (SM100 CUTLASS), block 128</td>
+      <td>q fp16/bf16/fp8, KV bf16/fp8 → bf16</td>
+      <td>yes — <code>major==10</code></td>
+    </tr>
+    <tr>
+      <td><b>FlashMLA decode</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">flash_mla_with_kvcache(_fp8)</span></td>
+      <td>MQA decode (Hopper + Blackwell)</td>
+      <td>q bf16/fp16, KV bf16/fp8 → bf16</td>
+      <td>partial — <code>major∈{9,10}</code></td>
+    </tr>
+    <tr>
+      <td><b>MLA prefill</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">FlashAttn-MLA → TRTLLM_RAGGED → FlashInfer → TOKENSPEED</span></td>
+      <td>Full attention over new + context tokens</td>
+      <td>bf16 (fp8 for trtllm/tokenspeed) → bf16</td>
+      <td>priority list gated <code>major==10</code></td>
+    </tr>
+    <tr>
+      <td><b>Weight-absorption BMMs</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">W_UK_T, W_UV (torch.bmm)</span></td>
+      <td>q→latent and attn-out→v projections</td>
+      <td>bf16 → bf16 (deliberately 16-bit)</td>
+      <td>no</td>
+    </tr>
+    <tr>
+      <td><b>RoPE</b> (DeepseekScaling / YaRN)<br><span class="mono" style="font-size:.8em;color:var(--muted)">rotary_embedding</span></td>
+      <td>Rotate the 64-dim q_pe / k_pe</td>
+      <td>bf16 (fp32 cos/sin) → bf16</td>
+      <td>no (FlashInfer if present)</td>
+    </tr>
+    <tr>
+      <td><b>DeepGEMM blockwise fp8 grouped GEMM</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">m_grouped_fp8_gemm_nt_* · MoE experts</span></td>
+      <td>Expert gate_up (w13) &amp; down (w2) GEMMs</td>
+      <td>fp8_e4m3 + block scales → bf16 (fp32 acc)</td>
+      <td>UE8M0 packed scales on <code>family 100</code></td>
+    </tr>
+    <tr>
+      <td><b>TRTLLM / FlashInfer fused MoE</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">TrtLlmFp8Experts · DeepEP v2</span></td>
+      <td>Alternate fused MoE expert path</td>
+      <td>fp8_e4m3 + block scales → bf16</td>
+      <td>yes — <code>family 100</code></td>
+    </tr>
+    <tr>
+      <td><b>fp8 activation quant</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">silu_mul_quant_fp8_*</span></td>
+      <td>Fused SiLU(gate)·up + group quantize</td>
+      <td>bf16 → fp8_e4m3 + fp32/UE8M0 scales</td>
+      <td>UE8M0 packed path sm100</td>
+    </tr>
+    <tr>
+      <td><b>Grouped-topk routing</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">_moe_C.grouped_topk</span></td>
+      <td>Sigmoid + group-limited top-k + noaux_tc bias</td>
+      <td>bf16/fp32 logits + fp32 bias → fp32 / int32</td>
+      <td>no</td>
+    </tr>
+    <tr>
+      <td><b>Block-fp8 dense Linear</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">fp8_gemm_nt / w8a8_block_scaled_mm</span></td>
+      <td>q_a/q_b/kv_a/kv_b/o_proj projections</td>
+      <td>fp8_e4m3 + block scales → bf16 (fp32 acc)</td>
+      <td>UE8M0 sm100</td>
+    </tr>
+    <tr>
+      <td><b>RMSNorm / fused_add_rms_norm</b></td>
+      <td>input / q_a / kv_a / post-attn / final norms</td>
+      <td>bf16 (fp32 internal) → bf16</td>
+      <td>no</td>
+    </tr>
+    <tr>
+      <td><b>AllReduce + RMSNorm fusion</b><br><span class="mono" style="font-size:.8em;color:var(--muted)">FlashInfer trtllm · TP=8</span></td>
+      <td>TP collective + residual + norm (+opt NVFP4)</td>
+      <td>bf16 → bf16 (or NVFP4)</td>
+      <td>NVFP4 patterns <code>has_device_capability(100)</code></td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <strong>Backend selection on sm100.</strong> For dense MLA the decode priority is
+    <code>FLASHINFER_MLA → TOKENSPEED_MLA → CUTLASS_MLA → FLASH_ATTN_MLA → FLASHMLA → TRITON_MLA</code>
+    <a href="../../../vllm/platforms/cuda.py#L111">cuda.py:111</a>. <b>FlashInfer MLA</b> (trtllm-gen) is the default;
+    <b>TOKENSPEED_MLA</b> (fp8-Q + fp8-KV, R1 dims only) overtakes it past batch≈8.
+  </div>
+
+  <div class="callout bad">
+    <strong>Not on the Blackwell path.</strong> The <code>fuse_mla_dual_rms_norm</code> pass (which would fuse the
+    <code>q_a_layernorm</code> + <code>kv_a_layernorm</code> pair) is <b>ROCm/AITER-only</b> and is force-disabled on
+    non-ROCm <a href="../../../vllm/config/compilation.py#L277">compilation.py:277</a>. On Blackwell those two RMSNorms run as
+    separate kernels; the Blackwell-relevant fusion is AllReduce+RMSNorm for the TP=8 collectives.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="dtype">5 · Dtype flow end-to-end</h2>
+
+  <table>
+    <tr><th>Stage</th><th>Dtype</th><th>Notes</th></tr>
+    <tr><td>Token embeddings &amp; residual stream</td><td>bf16</td><td>model compute dtype; fp16 supported with overflow guards</td></tr>
+    <tr><td>MLA A/B/O projections (q/kv/o)</td><td>fp8_e4m3 → bf16</td><td>block-wise fp8 GEMMs, fp32 accumulate</td></tr>
+    <tr><td>Latent BMMs (W_UK_T, W_UV)</td><td>bf16</td><td>weight absorption — deliberately 16-bit, no quantized BMM</td></tr>
+    <tr><td>MLA KV cache (latent)</td><td>bf16 · opt fp8</td><td><code>auto</code>=bf16; <code>--kv-cache-dtype fp8</code> needs the FlashMLA/FlashInfer backend</td></tr>
+    <tr><td>MoE router (gate + bias)</td><td>fp32</td><td>sigmoid logits + fp32 correction bias, grouped top-k</td></tr>
+    <tr><td>MoE expert GEMMs</td><td>fp8_e4m3 → bf16</td><td>DeepGEMM block GEMM, UE8M0 packed scales on sm100, fp32 acc</td></tr>
+    <tr><td>Final logits</td><td>fp32</td><td>LogitsProcessor over the untied lm_head</td></tr>
+  </table>
+
+  <!-- ============================================================ -->
+  <h2 id="kv">6 · MLA KV cache per token</h2>
+
+  <p>MLA registers an <code>MLAAttentionSpec</code> with <code>num_kv_heads=1</code> and
+  <code>head_size = kv_lora_rank + qk_rope_head_dim</code> — "only one vector instead of K + V"
+  <a href="../../../vllm/model_executor/layers/attention/mla_attention.py#L960">mla_attention.py:960</a>. There is no
+  <code>2×</code> (K+V) factor and no per-head multiplication, unlike a standard attention spec
+  <a href="../../../vllm/v1/kv_cache_interface.py#L369">kv_cache_interface.py:369</a>.</p>
+
+  <div class="eq">
+    head_size = kv_lora_rank + qk_rope_head_dim = <b>512 + 64 = 576</b><br>
+    bytes / token / layer = num_kv_heads(1) × head_size(576) × dtype_bytes<br>
+    &nbsp;&nbsp;• bf16 → 576 × 2 = <b>1152 B</b>&nbsp;&nbsp;&nbsp;• fp8 → 576 × 1 = <b>576 B</b><br>
+    <br>
+    total (64 layers) → bf16 = 64 × 1152 = <b>73,728 B ≈ 72 KiB</b><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;fp8&nbsp; = 64 × 576&nbsp; = <b>36,864 B ≈ 36 KiB</b>
+  </div>
+
+  <p>Every layer contributes the MLA cache — the leading dense-FFN layers still run MLA attention
+  <a href="../../../vllm/model_executor/models/deepseek_v2.py#L1085">deepseek_v2.py:1085</a>. (DeepSeek-V3's 61-layer default
+  gives 70,272 B bf16 / 35,136 B fp8.)</p>
+
+  <div class="diagram">
+    <div class="diagram-title">Per-token KV cache — MLA vs the multi-head equivalent (per layer, bf16)</div>
+    <div class="bar-stack">
+      <div class="bar-row">
+        <div class="bar-label">MLA latent (fp8)</div>
+        <div class="bar-track"><div class="bar-fill green" style="width:0.7%">576 B</div></div>
+        <div class="bar-num">576 B</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">MLA latent (bf16)</div>
+        <div class="bar-track"><div class="bar-fill" style="width:1.4%">1,152 B</div></div>
+        <div class="bar-num">1,152 B</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">naïve MHA (bf16)</div>
+        <div class="bar-track"><div class="bar-fill red" style="width:100%">128 heads × (192+128) × 2 = 81,920 B</div></div>
+        <div class="bar-num">81,920 B</div>
+      </div>
+    </div>
+    <div class="diagram-caption">Storing one 576-dim latent instead of 128 heads of K and V yields a
+      <b>≈71×</b> per-layer compression — the reason MLA models hold enormous contexts on modest KV budgets.</div>
+  </div>
+
+  <div class="callout info">
+    <strong>TP=8 duplication &amp; DCP.</strong> Because MLA has <code>num_kv_heads=1</code>, the single latent can't be sharded
+    across attention heads — every tensor-parallel rank duplicates the full per-token cache (8× at TP=8). Adding
+    <code>-dcp 8</code> shards along the <em>token</em> dimension instead, removing the duplication without extra GPUs
+    <a href="../../../docs/serving/context_parallel_deployment.md#L37">context_parallel_deployment.md:37</a>.
+  </div>
+
+  <div class="callout good">
+    <strong>Versus MiniMax M3.</strong> M3's lightning-indexer sparse attention costs ≈134 KiB/token (bf16) over 60 layers
+    because it keeps a full GQA K/V cache <em>plus</em> an indexer cache. Kimi-K2.6's MLA holds only a 576-dim latent, landing
+    at ≈72 KiB/token (bf16) over <em>more</em> layers — about half the footprint. See
+    <a href="../minimaxm3/index.html">the M3 walkthrough</a> for the contrast.
+  </div>
+
+  <div class="foot">
+    Sources (grep-verified against the working tree, branch <code>dao/understand</code>):
+    architecture &amp; MoE <a href="../../../vllm/model_executor/models/deepseek_v2.py">deepseek_v2.py</a>;
+    MLA wrapper <a href="../../../vllm/model_executor/layers/mla.py">layers/mla.py</a>,
+    <a href="../../../vllm/model_executor/layers/attention/mla_attention.py">attention/mla_attention.py</a>;
+    MLA backends <a href="../../../vllm/v1/attention/backends/mla/">v1/attention/backends/mla/</a>,
+    selection <a href="../../../vllm/platforms/cuda.py">platforms/cuda.py</a>;
+    KV byte formula <a href="../../../vllm/v1/kv_cache_interface.py">v1/kv_cache_interface.py</a>;
+    geometry/routing tests
+    <a href="../../../tests/compile/passes/test_fuse_mla_dual_rms_norm.py">test_fuse_mla_dual_rms_norm.py</a>,
+    <a href="../../../tests/kernels/moe/test_marlin_vs_trtllm_mxint4.py">test_marlin_vs_trtllm_mxint4.py</a>;
+    K2.6 references <a href="../../../vllm/env_override.py#L774">env_override.py:774</a>,
+    <a href="../../../tests/compile/test_inductor_fallback_allow_list_patch.py#L210">test_inductor_fallback_allow_list_patch.py:210</a>.
+    Kimi-K2.6 has no K2.6-specific code — this documents the DeepSeek-V3 backbone it runs on. KB summaries can drift; re-verify against source before acting.
+  </div>
+
+</main>
+</body>
+</html>

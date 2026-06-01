@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mooncake State Transitions &mdash; The CQE-Orphan Wedge</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">KV Cache</a> &middot;
+    <a href="index.html">Transfer</a> &middot;
+    <span>MOONCAKE-STATE</span>
+  </div>
+
+  <h1>Mooncake State Transitions &mdash; The CQE-Orphan Wedge</h1>
+  <p class="subtitle">
+    Post-mortem of the 2026-06-10 decode-worker wedge
+    (<code>minimax-m3-vllmdecodeworker-&hellip;-5r4qw</code>, dynamo-prod), traced to
+    QP/slice/task state-machine holes in Mooncake. Verified against the deployed
+    fork commit <code>25e44ac</code> (log line numbers
+    <span class="fileref">multi_transport.cpp:211</span>,
+    <span class="fileref">client_service.cpp:1145</span>,
+    <span class="fileref">worker_pool.cpp:307</span> all match).
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      A rolling update (<code>maxUnavailable: 3, maxSurge: 0</code>) killed decode-worker
+      pods mid-transfer &mdash; a routine event for a distributed KV cache. But surviving
+      workers wedged for 40+ minutes (KV pinned 85&ndash;98%, Running&rarr;0, Waiting
+      17&rarr;106) instead of recovering in seconds. The chain: handshake/reconnect logic
+      calls <code>resetConnection()</code> which moves QPs to <b>RESET</b> &mdash; silently
+      discarding outstanding WRs (only <b>ERR</b> flushes them as CQEs). The orphaned
+      slices stay <code>POSTED</code> forever. The 5s slice watchdog flags them
+      <code>TIMEOUT</code>, but that status is an advisory observation no layer acts on.
+      The only honored timer is the store&rsquo;s 60s deadline &mdash; so every poisoned
+      load burns 60s in a <em>single serial recv thread</em> (drain 1/min vs arrival
+      3/min), deferred requests pin KV blocks, and the scheduler starves. Not a fabric
+      fault; not a vLLM fault; an ownership hole in the QP-teardown path.
+    </p>
+  </section>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#incident">1. The incident in one screen</a></li>
+      <li><a href="#qp">2. QP state machine: two disposal semantics</a></li>
+      <li><a href="#slice">3. Slice lifecycle &amp; where it strands</a></li>
+      <li><a href="#enum">4. Task status enum: facts vs observations</a></li>
+      <li><a href="#ladder">5. The timeout ladder (why exactly 60s)</a></li>
+      <li><a href="#callers">6. Who calls <code>resetConnection</code></a></li>
+      <li><a href="#ownership">7. The ownership inversion</a></li>
+      <li><a href="#queueing">8. Queueing collapse arithmetic</a></li>
+      <li><a href="#rollout">9. Why the rollout never recovered</a></li>
+      <li><a href="#fixes">10. Fixes &mdash; safe, rejected, and why</a></li>
+      <li><a href="#evidence">11. Evidence appendix</a></li>
+    </ol>
+  </div>
+
+  <h2 id="incident">1. The incident in one screen</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">2026-06-10 UTC &mdash; pod 5r4qw (times to scale within each row)</div>
+    <div class="timeline">
+      <div class="timeline-label">05:40</div>
+      <div class="timeline-track"><div class="timeline-seg violet" style="left:0%;width:30%">rollout starts (567697b494 &rarr; 794c6cc4ff)</div></div>
+      <div class="timeline-label">05:42:40</div>
+      <div class="timeline-track"><div class="timeline-seg red" style="left:4%;width:42%">batch 1 killed &rarr; fleet-wide ack-timeouts (14/16 nodes, same second)</div></div>
+      <div class="timeline-label">06:04:11</div>
+      <div class="timeline-track"><div class="timeline-seg red" style="left:36%;width:30%">batch 2 killed (peer xck6v) &rarr; retry-exceeded CQEs + EINVAL warnings</div></div>
+      <div class="timeline-label">06:04&ndash;06:12</div>
+      <div class="timeline-track"><div class="timeline-seg amber" style="left:36%;width:14%">Deferred 1&rarr;19, KV 19%&rarr;98%</div></div>
+      <div class="timeline-label">06:12&ndash;06:47</div>
+      <div class="timeline-track"><div class="timeline-seg muted" style="left:50%;width:48%">Running 0, Waiting 26&rarr;106, drain &asymp; 1/min</div></div>
+      <div class="timeline-label">06:47:31</div>
+      <div class="timeline-track"><div class="timeline-seg red" style="left:96%;width:4%">killed</div></div>
+    </div>
+    <div class="diagram-caption">
+      The pod never self-recovered. It died wedged when the rollout reached it, redistributing
+      105 queued requests onto pods undergoing the same cycle (t8nhp logged 154M lines and
+      re-wedged at 07:10 and 08:20 &mdash; each &ldquo;fabric flap&rdquo; was the next rollout batch).
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The reframe that unlocked the diagnosis</strong>
+    The NIC counters looked like a switch-fabric fault (14 nodes erroring simultaneously)
+    until read carefully: <em>requester-side only</em> (<code>local_ack_timeout_errors</code>,
+    <code>req_cqes_flush_errors</code>), with <code>resp_cqes_errors=0</code> and
+    <code>link_downed=0</code> fleet-wide. Requester-only errors + healthy links =
+    <b>the remote peer processes died</b>. The synchronized waves track the rollout&rsquo;s
+    kill batches, not a provider event. Check for a concurrent rollout before blaming
+    the fabric.
+  </div>
+
+  <h2 id="qp">2. QP state machine: two disposal semantics</h2>
+
+  <p>
+    An RC queue pair is hardware state on each NIC with <em>no liveness protocol</em>
+    between peers &mdash; no FIN/RST equivalent. When a peer pod dies, the surviving QP
+    receives no signal; an idle QP to a corpse looks healthy forever. Failure is only
+    <em>inferred</em> by sending work and timing out. That makes the state-transition
+    choices below load-bearing: they decide whether in-flight work is returned with
+    proof or silently destroyed.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">ibv_qp state transitions as Mooncake uses them</div>
+    <svg class="diagram-svg" viewBox="0 0 880 330" font-family="SF Mono, Monaco, monospace" font-size="13">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#62645f"/>
+        </marker>
+        <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#286a46"/>
+        </marker>
+        <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d5f8f"/>
+        </marker>
+        <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#a8342d"/>
+        </marker>
+      </defs>
+
+      <!-- state boxes: top row -->
+      <rect x="30"  y="40" width="110" height="44" rx="8" fill="#fff" stroke="#191919" stroke-width="1.5"/>
+      <text x="85"  y="67" text-anchor="middle" font-weight="700">RESET</text>
+      <rect x="230" y="40" width="110" height="44" rx="8" fill="#fff" stroke="#d8d9d2" stroke-width="1.5"/>
+      <text x="285" y="67" text-anchor="middle">INIT</text>
+      <rect x="430" y="40" width="110" height="44" rx="8" fill="#fff" stroke="#d8d9d2" stroke-width="1.5"/>
+      <text x="485" y="67" text-anchor="middle">RTR</text>
+      <rect x="630" y="40" width="110" height="44" rx="8" fill="#e8f4ed" stroke="#286a46" stroke-width="1.5"/>
+      <text x="685" y="67" text-anchor="middle" font-weight="700" fill="#286a46">RTS</text>
+      <!-- ERR box bottom -->
+      <rect x="430" y="230" width="110" height="44" rx="8" fill="#e8f2fa" stroke="#1d5f8f" stroke-width="1.5"/>
+      <text x="485" y="257" text-anchor="middle" font-weight="700" fill="#1d5f8f">ERR</text>
+
+      <!-- setup chain (green): RESET->INIT->RTR->RTS -->
+      <line x1="140" y1="62" x2="226" y2="62" stroke="#286a46" stroke-width="1.6" marker-end="url(#arrg)"/>
+      <line x1="340" y1="62" x2="426" y2="62" stroke="#286a46" stroke-width="1.6" marker-end="url(#arrg)"/>
+      <line x1="540" y1="62" x2="626" y2="62" stroke="#286a46" stroke-width="1.6" marker-end="url(#arrg)"/>
+      <text x="385" y="30" text-anchor="middle" fill="#286a46" font-size="12">doSetupConnection(): handshake path (always begins &ldquo;any &rarr; RESET&rdquo;)</text>
+
+      <!-- RTS -> ERR (blue, good disposal) -->
+      <line x1="660" y1="84" x2="545" y2="240" stroke="#1d5f8f" stroke-width="1.8" marker-end="url(#arrb)"/>
+      <text x="668" y="160" fill="#1d5f8f" font-size="12">beginDestroy(): modify&rarr;ERR</text>
+      <text x="668" y="178" fill="#1d5f8f" font-size="12">HW auto on completion error</text>
+      <text x="668" y="200" fill="#1d5f8f" font-size="12.5" font-weight="700">WRs FLUSH as error CQEs</text>
+      <text x="668" y="218" fill="#1d5f8f" font-size="12">ownership returned with proof</text>
+
+      <!-- RTS -> RESET (red, the bug) -->
+      <path d="M 660 40 C 600 -8 170 -8 95 36" fill="none" stroke="#a8342d" stroke-width="2" marker-end="url(#arrr)"/>
+      <text x="375" y="0" text-anchor="middle" fill="#a8342d" font-size="12.5" font-weight="700" dy="10">disconnectUnlocked(): modify&rarr;RESET &mdash; WRs SILENTLY DISCARDED (no CQEs, ever) &larr; the orphan generator</text>
+
+      <!-- ERR -> RESET (valid, used at next setup) -->
+      <path d="M 430 252 C 230 252 110 180 85 88" fill="none" stroke="#62645f" stroke-width="1.4" stroke-dasharray="none" marker-end="url(#arr)"/>
+      <text x="185" y="218" fill="#62645f" font-size="12">ERR &rarr; RESET: valid, done by next</text>
+      <text x="185" y="234" fill="#62645f" font-size="12">doSetupConnection anyway</text>
+
+      <!-- RESET -> ERR INVALID -->
+      <path d="M 110 84 C 180 170 320 230 426 248" fill="none" stroke="#a8342d" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#arrr)"/>
+      <text x="200" y="130" fill="#a8342d" font-size="12.5" font-weight="700">RESET &rarr; ERR: INVALID transition</text>
+      <text x="200" y="148" fill="#a8342d" font-size="12">&rArr; ibv_modify_qp = EINVAL [22]</text>
+      <text x="200" y="166" fill="#a8342d" font-size="12">(the warning seen in the incident logs)</text>
+    </svg>
+    <div class="diagram-caption">
+      The two disposal semantics: <b>ERR flushes</b> every outstanding WR to the CQ as an
+      error completion (the contract that returns buffer ownership);
+      <b>RESET discards</b> them with no completion. <code>disconnectUnlocked()</code>
+      picks RESET. The later EINVAL from <code>beginDestroy()</code> is a tombstone, not the
+      cause &mdash; by then the WRs are already gone.
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>The code, condensed</strong>
+    <span class="fileref">rdma_endpoint.cpp &mdash; disconnectUnlocked()</span>
+    <pre><code>attr.qp_state = IBV_QPS_RESET;                <span class="c">// RTS &rarr; RESET, directly</span>
+ibv_modify_qp(qp_list_[i], &amp;attr, IBV_QP_STATE);
+<span class="c">// After resetting QP, the wr_depth_list_ won't change</span>
+if (wr_depth_list_[i] != 0) {
+    LOG(WARNING) &lt;&lt; "Outstanding work requests found, "
+                    "CQ will not be generated";   <span class="c">// &larr; it KNOWS</span>
+    __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
+    wr_depth_list_[i] = 0;        <span class="c">// fixes the COUNTERS, abandons the SLICES</span>
+}</code></pre>
+    The endpoint repairs its own books and moves on. It cannot repair the slices even
+    if it wanted to: at this layer there is no list of posted slices &mdash; only a count.
+    The <code>Slice*</code> pointers live solely in the hardware send queue&rsquo;s
+    <code>wr_id</code>s, which the RESET just erased.
+  </div>
+
+  <div class="callout bad">
+    <strong>Correction (verified post-publication): the build never runs this path via
+    <code>resetConnection</code></strong>
+    <p>
+      Upstream PR #323 (May 2025, a cmake dedup refactor) hoisted
+      <code>add_definitions(-DCONFIG_ERDMA)</code> &mdash; an Alibaba-eRDMA-specific
+      define &mdash; unconditionally into <span class="fileref">mooncake-common/common.cmake:47</span>.
+      No <code>option()</code> guard exists; verified in <code>compile_commands.json</code>
+      and behaviorally (a passive re-establish produced 0 ERR / 11 RESET transitions).
+      So in <b>every build of this tree, including the production binary</b>,
+      <code>resetConnection()</code> takes the <code>#ifdef CONFIG_ERDMA</code> branch:
+      <code>reconstruct()</code> = <code>deconstructLocked()</code>
+      (<code>ibv_destroy_qp</code> with WRs outstanding) + fresh <code>construct()</code>.
+    </p>
+    <p>
+      The disposal semantics are unchanged &mdash; destroying a QP discards outstanding
+      WRs without CQEs, exactly like RESET &mdash; but the orphan instruction is
+      <b>QP destroy in <code>deconstructLocked</code></b>, whose
+      <i>&ldquo;Outstanding work requests found, CQ will not be generated&rdquo;</i>
+      warnings (9&times; on the wedged pod) <em>are</em> the orphaning moments. The
+      RESET&rarr;ERR EINVAL tombstones come from <code>beginDestroy</code> hitting the
+      <em>freshly created</em> QPs, which are born in RESET. <code>disconnectUnlocked</code>
+      still runs only via its 4 direct call sites (handshake validation failures).
+      Fix implications: synthesizing FAILED for tracked slices after the destroy
+      (quiesce-then-synthesize) is the primary, build-flag-independent fix; an
+      ERR-not-RESET patch to <code>disconnectUnlocked</code> alone is dead code for the
+      dominant paths; and <code>CONFIG_ERDMA</code> should be an opt-in cmake option
+      (upstream issue material). Reconstruct-per-reset also mints new
+      <code>qp_num</code>s every reset, forcing full re-handshakes during exactly the
+      churn windows that trigger resets.
+    </p>
+  </div>
+
+  <h2 id="slice">3. Slice lifecycle &amp; where it strands</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">One slice, four fates (peer pod killed at T0)</div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">SUBMIT</span>slice created, dispatched to worker pool<br/><code>ts = 0</code></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step b"><span class="num">POST</span><code>ibv_post_send</code><br/><code>ts</code> stamped, status <code>POSTED</code><br/><span class="fileref">rdma_endpoint.cpp:636</span></div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g"><span class="num">CQE</span>SUCCESS, or error &rarr; software retry (<code>MC_RETRY_CNT</code>) &rarr; <code>FAILED</code> terminal</div>
+    </div>
+    <div class="diagram-caption">The healthy path. Every escape from POSTED requires a CQE.</div>
+  </div>
+
+  <table>
+    <tr><th>Fate</th><th>Mechanism</th><th>Latency to terminal</th><th>Worked in the incident?</th></tr>
+    <tr>
+      <td><b>A. In-flight at kill</b></td>
+      <td>HCA retransmits: ack timeout 4.096&micro;s &times; 2<sup>14</sup> &asymp; 67ms,
+          &times; <code>RETRY_CNT=7</code> (hardware, hardcoded
+          <span class="fileref">rdma_endpoint.cpp:34-35</span>) &rarr; CQE
+          <i>&ldquo;transport retry counter exceeded&rdquo;</i> &rarr; one software retry
+          (<code>MC_RETRY_CNT=1</code>) &rarr; FAILED</td>
+      <td class="mono">~0.5&ndash;1s</td>
+      <td>&#9989; yes &mdash; these recomputed fine</td>
+    </tr>
+    <tr>
+      <td><b>B. Flushed by successful teardown</b></td>
+      <td><code>beginDestroy()</code> moves QP&rarr;ERR &rarr; flush CQEs
+          (the 42k <code>req_cqes_flush_errors</code>)</td>
+      <td class="mono">ms</td>
+      <td>&#9989; yes</td>
+    </tr>
+    <tr>
+      <td><b>C. Orphaned by reset/destroy</b></td>
+      <td><code>resetConnection()</code> &rarr; (this build: <code>reconstruct()</code>
+          &rarr; <code>deconstructLocked()</code> <code>ibv_destroy_qp</code>; see
+          CONFIG_ERDMA correction in &sect;2) or <code>disconnectUnlocked()</code>
+          QP&rarr;RESET &mdash; either way WRs discarded with <b>no CQE, ever</b>.
+          Slice stays <code>POSTED</code>, <code>ts &gt; 0</code>; later
+          <code>beginDestroy</code> EINVALs (fresh QPs born in RESET; RESET&rarr;ERR
+          invalid)</td>
+      <td class="mono">never (60s store deadline rescues the <i>waiter</i>, not the slice)</td>
+      <td>&#10060; the wedge</td>
+    </tr>
+    <tr>
+      <td><b>D. Stuck pre-post</b></td>
+      <td>Queued behind a QP handshake = blocking TCP <code>connect()</code> to the dead
+          pod IP with <b>no connect timeout</b>
+          (<span class="fileref">transfer_metadata_plugin.cpp doConnect()</span>, only
+          <code>SO_RCVTIMEO=60s</code> is set) &rarr; SYN black-hole &asymp; 130s.
+          <code>ts == 0</code> &rarr; <b>invisible even to the slice watchdog</b>
+          (<code>checkSliceTimeout</code> skips <code>ts==0</code>)</td>
+      <td class="mono">~130s (kernel tcp_syn_retries)</td>
+      <td>&#10060; the wedge</td>
+    </tr>
+  </table>
+
+  <h2 id="enum">4. Task status enum: facts vs observations</h2>
+
+  <p>
+    <code>TransferStatusEnum</code> mixes two kinds of values in one type:
+    <b>facts about buffer ownership</b> (COMPLETED, FAILED: hardware provably done,
+    buffers returned) and <b>advisory observations</b> (WAITING, TIMEOUT: how long
+    things are taking). Each consumer then guessed differently:
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <strong>Metrics code &mdash; semantically loose</strong>
+      <p><span class="fileref">transfer_engine_impl.h:254-258</span> counts
+      <code>TIMEOUT</code> (and <code>CANCELED</code> &mdash; which the RDMA transport
+      <em>never produces</em>; only the nvmeof transport does) as terminal.
+      Convenient for accounting; wrong about ownership.</p>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <strong>Store <code>check_task_status</code> &mdash; correct, but inert</strong>
+      <p><span class="fileref">transfer_task.cpp:725-742</span> routes
+      <code>TIMEOUT</code> to <code>default:</code> = &ldquo;still in progress&rdquo;.
+      This is the <em>defensible</em> behavior: it protects <code>freeBatchID</code>
+      and buffer ownership. But since nothing acts on the observation, it decays
+      into the 60s purgatory.</p>
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>The actual bug</strong>
+    <code>TIMEOUT</code> is an observation that <em>demands an action</em> &mdash; probe
+    the peer, cancel via QP&rarr;ERR, flush &mdash; and no layer ever acts on it. There is
+    no cancel API on the engine; nothing wires the watchdog to
+    <code>beginDestroy</code> or <code>probePeerAliveByID</code> (which exists, public,
+    unused in this flow). The observation is computed at 5s and discarded.
+  </div>
+
+  <h2 id="ladder">5. The timeout ladder (why exactly 60s)</h2>
+
+  <p>
+    Four timers notice the problem before 60s; the 60s one is the first that both
+    notices <em>and is allowed to act</em>:
+  </p>
+
+  <table>
+    <tr><th>T</th><th>Timer</th><th>Notices?</th><th>Acts?</th></tr>
+    <tr><td class="mono">~0.5s</td><td>HW retry budget (67ms &times; 7) &mdash; <code>attr.timeout=14, retry_cnt=7</code>, compile-time, not <code>MC_*</code>-tunable</td><td>Fate A only</td><td>&#9989; fails those slices</td></tr>
+    <tr><td class="mono">~1s</td><td><code>MC_RETRY_CNT=1</code> software re-post</td><td>Fate A only</td><td>&#9989; terminal FAILED</td></tr>
+    <tr><td class="mono"><b>5s</b></td><td><code>MC_SLICE_TIMEOUT</code> watchdog &rarr; status <code>TIMEOUT</code> <span class="fileref">multi_transport.cpp:202-233</span></td><td>&#9989; sees the orphans</td><td>&#10060; observation discarded</td></tr>
+    <tr><td class="mono">30s</td><td><code>kFinishDestroyTimeoutSec</code> &rarr; force-destroy QP, <i>&ldquo;CQ will not be generated&rdquo;</i></td><td>&#9989; knows WRs are stranded</td><td>&#10060; destroys QP, abandons slices</td></tr>
+    <tr><td class="mono"><b>60s</b></td><td>store <code>wait_for_completion</code> deadline <span class="fileref">transfer_task.cpp:789</span></td><td>&#9989;</td><td>&#9989; <b>first to escape</b> (TRANSFER_FAIL &rarr; recompute)</td></tr>
+    <tr><td class="mono">~130s</td><td>kernel TCP SYN retries (handshake connect)</td><td>(would)</td><td>moot &mdash; 60s already fired</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <strong>Why you can&rsquo;t just shrink the 60s</strong>
+    The deadline-return is ownership abandonment: it sets <code>TRANSFER_FAIL</code>
+    while WRs may still be outstanding, then the destructor frees the batch. It is
+    <em>accidentally safe</em> only because of an unwritten ordering:
+    <span class="mono">5s observe &lt; 30s force-destroy (HW quiesced) &lt; 60s abandon</span>.
+    By 60s every involved QP has completed, flushed, or been destroyed &mdash; no late DMA
+    is possible. Cut the deadline below ~35&ndash;40s and a QP that failed its ERR
+    transition can still be in RTS retrying, with a late RDMA-READ response able to DMA
+    into memory vLLM already reused: you trade a visible wedge for rare, unattributable
+    KV corruption. And the safe end (40s &rarr; drain 1.5/min) still loses to the
+    ~2.4&ndash;3/min arrival rate. The helpful range isn&rsquo;t safe; the safe range
+    doesn&rsquo;t help.
+  </div>
+
+  <p>
+    Side effect of the gap: <code>wait_for_completion</code>&rsquo;s polling path
+    (build has <code>USE_EVENT_DRIVEN_COMPLETION=OFF</code>) is a
+    <code>while(true)</code> <b>busy-spin with no sleep</b>, re-logging
+    <i>&ldquo;Slice timeout detected&rdquo;</i> per stuck task per iteration &mdash;
+    4&ndash;16M log lines/min (&times;4 TP ranks), one core burned per stuck batch.
+    The 26.7M-line log hour was this loop, not traffic.
+  </p>
+
+  <h2 id="callers">6. Who calls <code>resetConnection</code></h2>
+
+  <p>
+    All nine call sites live inside the endpoint&rsquo;s own handshake machinery
+    (<code>setupConnectionsByActive</code> / <code>setupConnectionsByPassive</code>).
+    Every one of them fires during a peer rollout:
+  </p>
+
+  <table>
+    <tr><th>Trigger</th><th>Site</th><th>When it fires during a rollout</th></tr>
+    <tr>
+      <td>Stuck handshake (another thread)</td>
+      <td><span class="fileref">rdma_endpoint.cpp:327</span></td>
+      <td>Thread A is mid-handshake to the dead peer &mdash; blocked in the no-timeout
+          TCP <code>connect()</code>. Thread B wants the same endpoint, waits
+          <code>kWaitExistingHandshakeTimeout</code>, gives up, and resets the endpoint
+          <b>out from under A</b></td>
+    </tr>
+    <tr>
+      <td>Handshake RPC failure</td>
+      <td><span class="fileref">:351</span></td>
+      <td>The handshake to the dead pod eventually fails &rarr; reset
+          &ldquo;to be safe&rdquo; (comment admits: <i>&ldquo;we&rsquo;re not sure whether
+          the peer needs a connection re-establishment&rdquo;</i>)</td>
+    </tr>
+    <tr>
+      <td>Peer restarted (active side)</td>
+      <td><span class="fileref">:375</span></td>
+      <td>Handshake succeeds but returns QP numbers that don&rsquo;t match ours &rarr;
+          peer is a new incarnation &rarr; reset the connected endpoint</td>
+    </tr>
+    <tr>
+      <td>Peer restarted (passive side)</td>
+      <td><span class="fileref">:444</span></td>
+      <td>The <b>replacement pod</b> handshakes us while we&rsquo;re still
+          &ldquo;connected&rdquo; to its dead predecessor &mdash;
+          <i>&ldquo;Different peer (e.g., peer restarted)&rdquo;</i> &rarr; reset.
+          The recovery action destroys the in-flight work of the failure it&rsquo;s
+          recovering from</td>
+    </tr>
+    <tr>
+      <td>Setup failed midway</td>
+      <td><span class="fileref">:402, :414, :486, :499</span></td>
+      <td><code>doSetupConnection</code> state machine fails partway &rarr; reset cleanup
+          (plus direct <code>disconnectUnlocked()</code> calls on handshake validation
+          failures)</td>
+    </tr>
+  </table>
+
+  <h2 id="ownership">7. The ownership inversion</h2>
+
+  <ol class="steps">
+    <li><b><code>resetConnection</code> has one legitimate job:</b> return QPs to a state
+        from which a fresh INIT&rarr;RTR&rarr;RTS can be built. IB requires passing
+        through RESET for that &mdash; the <em>connection state machine</em> part is correct.</li>
+    <li><b>But a QP is two things at once:</b> connection state, <em>and</em> a container
+        of posted work. Each WR&rsquo;s <code>wr_id</code> is a raw <code>Slice*</code>
+        borrowed from a task, which belongs to a batch, which a
+        <code>TransferFuture</code> waits on, which a Python recv thread is blocked
+        inside. <b>The only protocol for returning the borrowed slice is a CQE.</b></li>
+    <li><b>RESET burns the loan record without returning the collateral.</b> The code
+        fixes the only thing visible at its layer (the counters) and logs a warning.
+        Upstream, every waiter is left waiting for a completion that can never come,
+        until the 60s deadline expires the wait.</li>
+    <li><b>Blast-radius mismatch:</b> the decision to reset is control-plane (stuck
+        handshake, failed RPC, restarted peer); the cost lands on the data plane
+        (whatever transfers were in flight). During a peer death these are not
+        independent: the same condition that makes handshakes fail (dead peer)
+        guarantees in-flight WRs exist (the peer died mid-service). The orphaning is
+        the <em>common case</em> during a rollout, not a rare race.</li>
+    <li><b>Fairness note:</b> discarding those WRs is defensible <em>in intent</em> &mdash;
+        any WR outstanding at reconnect time targets a connection that no longer exists;
+        it&rsquo;s doomed regardless. The bug is choosing silent discard (RESET) over
+        flush-with-proof (ERR) for disposing of doomed work, in the codepath that runs
+        precisely when the layers above have the most work in flight.</li>
+  </ol>
+
+  <h2 id="queueing">8. Queueing collapse arithmetic</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>The rates</h3>
+      <ul>
+        <li><b>Arrival:</b> ~2.4&ndash;3 req/min (frontend has no readiness signal to stop
+            routing; measured from Deferred slope 1&rarr;13 in 4 min and Waiting slope
+            26&rarr;106 in 34 min)</li>
+        <li><b>Drain:</b> 1 poisoned req/min &mdash; each burns the full 60s, and
+            <code>KVCacheStoreRecvingThread</code> is <b>one thread, serial queue</b>
+            (<span class="fileref">worker.py:388-399</span>: <code>while True:
+            queue.get(); _handle_request()</code>). No pool, no executor.</li>
+        <li><b>Cost per stuck request:</b> long-context loads hold ~4&ndash;15% of KV
+            each (sample request: 5,752 keys &asymp; 39GB) the entire time they wait.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Where the parallelism is (and isn&rsquo;t)</h3>
+      <ul>
+        <li><b>Within one batch call:</b> all keys submitted concurrently, futures waited
+            with overlapping deadlines &rarr; 60s per <em>call</em>, not per key &#9989;</li>
+        <li><b>Across TP ranks:</b> 4 recv threads, but loading shards of the <em>same</em>
+            requests in lockstep &mdash; no request-level speedup (just &times;4 log flood)</li>
+        <li><b>Across requests: none.</b> <code>load_async</code> decouples
+            scheduler&harr;loader, not load&harr;load. Async &ne; concurrent.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">3 in, 1 out &mdash; then the feedback loop</div>
+    <div class="flow">
+      <div class="flow-step r"><span class="num">06:04</span>peers killed &rarr; loads poisoned</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step a"><span class="num">+4 min</span>Deferred 13, each holding KV blocks (load_async allocates up front)</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step r"><span class="num">+8 min</span>KV 98% &rarr; scheduler can&rsquo;t allocate for <em>anything</em> &mdash; including recomputes</div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step r"><span class="num">point of no return</span>drain &rarr; ~0; Running 0; Waiting grows unbounded</div>
+    </div>
+    <div class="diagram-caption">
+      Slow drain &rarr; more deferred &rarr; more pinned KV &rarr; slower drain. Compounded by:
+      failed loads convert to recomputes that re-enter the starved queue; <code>kv_both</code>
+      means recomputed KV then queues a <em>put</em> through the equally serial, equally
+      poisoned send thread; and the rollout re-poisons every ~10 min.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Counterfactuals</strong>
+    With the 5s fail-fast honored: drain ~12/min &raquo; arrival &rarr; each kill wave is a
+    5&ndash;10s blip, Deferred never exceeds 1&ndash;2, KV never pins. With only a parallel
+    recv pool (N&ge;4): steady-state pinned KV &asymp; 3/min &times; 1min &times; ~5%
+    &asymp; 15% &mdash; survivable, but every affected request still eats a 60s TTFT
+    penalty. The 40-minute wedge is the gap between 5s and 60s passed through two
+    amplifiers: a serial queue, then KV-block exhaustion.
+  </div>
+
+  <h2 id="rollout">9. Why the rollout never recovered</h2>
+
+  <table>
+    <tr><th>Layer</th><th>Hole</th><th>Consequence</th></tr>
+    <tr>
+      <td>K8s / Dynamo</td>
+      <td><code>VllmDecodeWorker</code> has <b>no liveness or readiness probe</b>
+          (the frontend has a tuned one; the worker none)</td>
+      <td>Wedged pods never restart; new pods count &ldquo;available&rdquo; the instant
+          the container starts, so the rollout marches on, replacing wedged-old with
+          wedged-new</td>
+    </tr>
+    <tr>
+      <td>Rollout strategy</td>
+      <td><code>maxSurge: 0</code> (GPUs can&rsquo;t surge), <code>maxUnavailable: 3</code></td>
+      <td>Old pods torn down before replacements exist; each batch kill re-poisons the
+          survivors; fresh pods come up into the storm and re-wedge
+          (t8nhp: 154M log lines, served ~1 min)</td>
+    </tr>
+    <tr>
+      <td>Mooncake master</td>
+      <td><code>client_live_ttl_sec</code> default 10s &mdash; actually fine</td>
+      <td>Dead segments evict quickly; the per-kill poison window is short. The damage
+          is done by the loads already in flight / already resolved &mdash; at 60s each</td>
+    </tr>
+    <tr>
+      <td>Mooncake client</td>
+      <td>Everything in &sect;2&ndash;&sect;7</td>
+      <td>60s per poisoned load, serial; the wedge</td>
+    </tr>
+  </table>
+
+  <p>
+    Recovery only ever happened when a pod process restarted <em>into a calm window</em>
+    between rollout batches. The &ldquo;fabric flapping&rdquo; through 08:50 was the
+    rollout itself progressing.
+  </p>
+
+  <h2 id="fixes">10. Fixes &mdash; safe, rejected, and why</h2>
+
+  <h3>Rejected</h3>
+  <table>
+    <tr><th>Candidate</th><th>Why rejected</th></tr>
+    <tr>
+      <td>One-line: add <code>case TIMEOUT:</code> to the failed cases in
+          <code>check_task_status()</code></td>
+      <td><b>Unsafe.</b> RDMA has no per-WR cancel; a TIMEOUT slice may still be owned by
+          the HCA, and a late RDMA-READ response can still DMA into the destination
+          buffer. Declaring it terminal lets <code>freeBatchID</code> free bookkeeping
+          under live hardware: use-after-free on the slice (late CQE carries a dangling
+          <code>wr_id</code>) + silent corruption of reused buffers. The store&rsquo;s
+          conservatism is the correct behavior.</td>
+    </tr>
+    <tr>
+      <td>Reduce the 60s deadline</td>
+      <td>Same abandonment, more often. Safe only above the 30s force-destroy quiesce
+          point (&sect;5); the safe range (&ge;~40s &rarr; 1.5/min) still drains slower
+          than arrival. Wrong knob.</td>
+    </tr>
+    <tr>
+      <td>Lower the HW retry budget (<code>RETRY_CNT=7</code> &rarr; 1)</td>
+      <td>~0.5s detection was never the problem (Fate A worked); a budget of 1 converts
+          transient RoCE congestion into hard failures and spurious recomputes.</td>
+    </tr>
+  </table>
+
+  <h3>The fix stack (in leverage order)</h3>
+  <ol class="steps">
+    <li><b>Flush, don&rsquo;t discard.</b> Change <code>disconnectUnlocked()</code>&rsquo;s
+        target state from <code>RESET</code> to <b><code>ERR</code></b> and delete the
+        counter-zeroing block. Flush CQEs arrive in microseconds; the worker pool&rsquo;s
+        normal completion path fails each slice; counters decrement organically; tasks
+        terminate in ms instead of 60s. Natural because <code>status_ =
+        UNCONNECTED</code> already blocks new posts, and the next
+        <code>doSetupConnection</code> <em>already starts with &ldquo;any state &rarr;
+        RESET&rdquo;</em> (ERR&rarr;RESET is valid) &mdash; deferring the RESET to
+        reconnect time costs nothing.</li>
+    <li><b>Act on the observation.</b> Wire the 5s watchdog to the QP owner: slice
+        timeout &rarr; <code>probePeerAliveByID</code> &rarr; if unresponsive,
+        <code>beginDestroy()</code> the endpoints to that peer &rarr; flush &rarr;
+        organic FAILED in ~5&ndash;7s with ownership provably returned. (The collateral
+        &mdash; co-resident batches on those QPs flush too &mdash; is correct: if the peer
+        is dead, every transfer on the endpoint is doomed.)</li>
+    <li><b>Synthesize completions where quiescence is guaranteed.</b> Track posted slices
+        per QP (append on post, remove on CQE &mdash; today only a <em>count</em> exists).
+        After <code>modify(RESET)</code> or <code>ibv_destroy_qp</code> succeeds, the HCA
+        is quiesced &mdash; then and only then, walk the tracked orphans and mark them
+        FAILED in software. Closes the hole no matter which path strands them.</li>
+    <li><b>State-aware <code>beginDestroy</code>.</b> On <code>modify(ERR)</code> EINVAL,
+        <code>ibv_query_qp</code>: already-ERR (HW auto-transitioned) &rarr; harmless,
+        flushes coming; RESET &rarr; invoke fix-3 synthesis immediately instead of the
+        30s abandon.</li>
+    <li><b>Handshake deadline.</b> Non-blocking <code>connect()</code> + poll with a
+        few-second timeout in <code>SocketHandShakePlugin</code>; fail pre-post slices
+        (<code>ts==0</code>, no HW state &mdash; software-cancel is safe here) on the same
+        deadline.</li>
+    <li><b>Bounded recv concurrency</b> in the vLLM connector so one poisoned load
+        can&rsquo;t head-of-line block the queue; plus sleep/backoff (or
+        <code>USE_EVENT_DRIVEN_COMPLETION=ON</code>) for the poll spin.</li>
+    <li><b>Defense in depth (k8s):</b> KV-transfer-aware readiness probe (auto-restarts
+        wedged pods <em>and</em> halts a rollout marching into a broken state); gate
+        worker rollouts on the previous batch actually serving.</li>
+  </ol>
+
+  <h2 id="evidence">11. Evidence appendix</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Log fingerprints (Datadog, us5)</h3>
+      <ul>
+        <li><code>Slice timeout detected</code> <span class="fileref">multi_transport.cpp:211</span>
+            &mdash; 4&ndash;16M/min bursts; the busy-spin, one line per stuck task per poll</li>
+        <li><code>Process failed for slice (&hellip; retry_cnt: 0): transport retry counter
+            exceeded</code> <span class="fileref">worker_pool.cpp:307</span> &mdash; Fate A;
+            software counter and HW verdict in one line</li>
+        <li><code>Failed to modify QP to ERR during beginDestroy: Invalid argument [22]</code>
+            <span class="fileref">rdma_endpoint.cpp:185</span> &mdash; tombstone of an earlier
+            RESET; 06:04:11 wave</li>
+        <li><code>Outstanding work requests found, CQ will not be generated</code>
+            <span class="fileref">rdma_endpoint.cpp:138</span> &mdash; 9 hits on 5r4qw from
+            06:05:11 (= kill wave + 30s force-destroy), every ~4&ndash;5 min</li>
+        <li><code>Failed to complete transfers after 60000 milliseconds</code> /
+            <code>Transfer failed for key: &hellip;</code>
+            <span class="fileref">client_service.cpp:1145</span> &mdash; the 60s escape firing</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>NIC counters (node_exporter &rarr; Datadog)</h3>
+      <ul>
+        <li><code>node_infiniband_local_ack_timeout_errors</code>: 14/16 nodes, onset
+            <b>05:42:40 same second</b> (rollout batch 1)</li>
+        <li><code>node_infiniband_req_cqes_flush_errors</code> &asymp;
+            <code>req_cqes_errors</code> (~43k): QPs moved to ERR flushing &mdash; the
+            disposal path that works</li>
+        <li><code>resp_cqes_errors = 0</code> fleet-wide; <code>link_downed = 0</code>;
+            no congestion counters &rarr; peers died, fabric fine</li>
+        <li>Host tag gotcha: <code>host:&lt;node&gt;-digital-ocean</code> (suffix required;
+            pod-log <code>host</code> attr has none)</li>
+      </ul>
+      <h3>Config at incident</h3>
+      <ul>
+        <li><code>MC_SLICE_TIMEOUT=5</code>, <code>MC_RETRY_CNT=1</code>,
+            <code>kv_load_failure_policy: recompute</code>, <code>load_async: true</code>,
+            <code>kv_role: kv_both</code></li>
+        <li>HW QP attrs (hardcoded): <code>timeout=14</code> (&asymp;67ms),
+            <code>retry_cnt=7</code>, <code>rnr_retry=7</code></li>
+        <li><code>kFinishDestroyTimeoutSec=30</code>;
+            store deadline 60s; master <code>client_live_ttl_sec=10</code> (default)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">
+    Written 2026-06-10 from the live incident investigation. Source verified against the
+    deployed Mooncake fork commit <code>25e44ac</code> and
+    <code>vllm-dao</code> (<code>metrics</code> branch) Mooncake store connector.
+    Related: <a href="MOONCAKE_STORE.html">MOONCAKE_STORE.html</a> (connector
+    architecture), <a href="PD_DISAGG.html">PD_DISAGG.html</a>.
+  </div>
+</main>
+</body>
+</html>

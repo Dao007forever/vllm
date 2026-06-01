@@ -1,0 +1,1999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Parallelism Across P and D &mdash; vLLM Learning Notes</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">KV Cache</a> &middot;
+    <a href="index.html">Transfer</a> &middot;
+    <span>PARALLELISM</span>
+  </div>
+
+  <h1>TP, PP, DP Across P and D</h1>
+  <p class="subtitle">
+    How NIXL, the direct Mooncake pipe, and the Mooncake store each
+    handle heterogeneous tensor parallelism between prefill and decode.
+    Head-dimension splitting, GQA dedup, MLA replication, Mamba's
+    three-projection conv state. PP and DP mostly fall out for free.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      TP is the hard one. Two TP sizes don't have to match: prefill
+      might run TP=4 on H100s, decode might run TP=2 on smaller GPUs.
+      All three transports support this, but they reach the goal three
+      different ways. NIXL uses a precomputed
+      <code>TPMapping</code> with explicit head-slot indices and rank
+      offsets. The Mooncake pipe computes a
+      <code>_get_tp_ratio</code> and offsets within registered regions.
+      The Mooncake store doesn't precompute at all &mdash; it just asks
+      "which TP shards exist in the store?" and only loads if all of
+      them are there. PP comes for free in all three. DP is "many P
+      groups, many D groups; route at the bootstrap layer."
+    </p>
+  </section>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#problem">1. The problem statement</a></li>
+      <li style="list-style:none; margin-left:-20px; font-style:italic; color:var(--muted)">
+        &rsaquo; <a href="#terminology">Sidebar: block-length variables (referenced by every worked example)</a>
+      </li>
+      <li>
+        <a href="#nixl-tp">2. NIXL: precomputed TPMapping</a>
+        &mdash; <a href="#nixl-tp" style="font-size:0.92em">worked example below</a>
+      </li>
+      <li>
+        <a href="#pipe-tp">3. Mooncake pipe: tp_ratio + region offsets</a>
+        &mdash; <a href="#pipe-tp" style="font-size:0.92em">worked example below</a>
+      </li>
+      <li>
+        <a href="#store-tp">4. Mooncake store: candidate-key lookup</a>
+        &mdash; <a href="#store-tp" style="font-size:0.92em">worked example below</a>
+      </li>
+      <li><a href="#mla">5. MLA: replicated cache short-circuit</a></li>
+      <li><a href="#gqa">6. GQA: deduplicate redundant shards</a></li>
+      <li><a href="#mamba">7. Mamba: three-projection conv state</a></li>
+      <li><a href="#pp">8. PP across P and D</a></li>
+      <li><a href="#dp">9. DP and engine routing</a></li>
+      <li><a href="#cheat">10. Cheat sheet</a></li>
+    </ol>
+  </div>
+
+  <h2 id="problem">1. The problem statement</h2>
+
+  <p>
+    Prefill and decode get to run on different hardware, with different
+    parallelism strategies. Typical asymmetries:
+  </p>
+
+  <ul>
+    <li>
+      <strong>TP<sub>P</sub> &gt; TP<sub>D</sub>:</strong> P sharded across
+      4 GPUs, D across 2. Each D rank must <em>gather</em> from multiple
+      P ranks.
+    </li>
+    <li>
+      <strong>TP<sub>P</sub> &lt; TP<sub>D</sub>:</strong> P sharded across
+      2 GPUs, D across 4. Each P rank produces KV for multiple D ranks
+      &mdash; or, equivalently, each D rank takes a <em>fraction of one
+      P rank's</em> KV. This requires head-dimension splitting.
+    </li>
+    <li>
+      <strong>TP<sub>P</sub> = TP<sub>D</sub>:</strong> the easy case &mdash;
+      1:1 mapping. Often still needs validation that the per-rank
+      layout matches.
+    </li>
+  </ul>
+
+  <p>
+    The KV cache for a layer is laid out as
+    <code>[num_blocks, block_size, num_kv_heads / tp_size, head_dim]</code>
+    (FlashAttention HND) or a similar permutation. Splitting along
+    <code>num_kv_heads / tp_size</code> is what TP does; the connectors
+    must reverse the same split when P and D disagree.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Hetero TP example: TP<sub>P</sub>=2, TP<sub>D</sub>=4</div>
+<pre>
+P rank 0 holds:   heads [0, 1, 2, 3]      (half of all KV heads)
+P rank 1 holds:   heads [4, 5, 6, 7]      (other half)
+
+D rank 0 wants:   heads [0, 1]            (quarter)
+D rank 1 wants:   heads [2, 3]            (quarter)
+D rank 2 wants:   heads [4, 5]            (quarter)
+D rank 3 wants:   heads [6, 7]            (quarter)
+
+So:    D0  &lt;-- read 1st half of P0's heads
+       D1  &lt;-- read 2nd half of P0's heads
+       D2  &lt;-- read 1st half of P1's heads
+       D3  &lt;-- read 2nd half of P1's heads
+</pre>
+  </div>
+
+  <div class="diagram" id="terminology">
+    <div class="diagram-title">Sidebar &mdash; block-length variables in the worked examples</div>
+
+    <p>
+      Two variables, <code>local_kv_block_len</code> and
+      <code>remote_kv_block_len</code>, show up in every worked example
+      below. The concept is simple (bytes per KV block per rank), but
+      the names mislead in two ways. This is the single place that
+      explains both.
+    </p>
+
+    <h4>1. The concept: bytes per KV block per rank</h4>
+
+    <p>
+      For a KV cache tensor of shape
+      <code>[num_blocks, block_size, num_kv_heads/tp_size, head_dim]</code>,
+      one block on one rank is:
+    </p>
+
+<pre><code>local_kv_block_len = block_size &times; (num_kv_heads / tp_size) &times; head_dim &times; element_size
+                                    &darr;
+                                    per-rank head count</code></pre>
+
+    <p>
+      Per layer; multiply by <code>num_layers</code> for the full
+      payload per block per rank. Concrete numbers for Llama-3-70B
+      (<code>num_kv=8</code>, <code>head_dim=128</code>, fp16,
+      <code>block_size=16</code>):
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>tp_size</th>
+          <th>num_kv_heads / tp_size</th>
+          <th>local_kv_block_len (per layer)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>2</td>
+          <td>4 heads / rank</td>
+          <td>16 &times; 4 &times; 128 &times; 2 = <strong>16 KB</strong></td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>2 heads / rank</td>
+          <td>16 &times; 2 &times; 128 &times; 2 = <strong>8 KB</strong></td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td>1 head / rank</td>
+          <td>16 &times; 1 &times; 128 &times; 2 = <strong>4 KB</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      With 80 layers (Llama-3-70B), the per-block payload that crosses
+      the wire is <code>80 &times; local_kv_block_len</code>. At TP=2
+      that's 1.28 MB per block per rank.
+    </p>
+
+    <h4>2. K and V layout: <code>kv_block_len</code> may be half of <code>block_len</code></h4>
+
+    <p>
+      If K and V share a single tensor (blocks-first layout, e.g.,
+      FlashInfer), the registered
+      <code>TransferRegion.block_len</code> covers both halves;
+      <code>kv_block_len = block_len // 2</code> is one half
+      (<span class="fileref">mooncake_connector.py:121</span>). With
+      FlashAttention's K/V-first layout, K and V live in separate
+      tensors and <code>kv_block_len == block_len</code>. The planning
+      functions consume <code>kv_block_len</code>, so they don't care
+      which layout the model uses.
+    </p>
+
+    <h4>3. The "local" naming trap</h4>
+
+    <p>
+      "Local" means <em>the side that's computing the plan</em>, which
+      is <strong>not the same side across connectors</strong>:
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Function</th>
+          <th>"local" is</th>
+          <th>"remote" is</th>
+          <th>Where</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>NIXL <code>_build_fa_remote</code></td>
+          <td>D (reader of the <code>READ</code>)</td>
+          <td>P (target of the <code>READ</code>)</td>
+          <td><span class="fileref">nixl/worker.py:1135</span></td>
+        </tr>
+        <tr>
+          <td>Mooncake <code>_compute_sender_transfer_plan</code></td>
+          <td>P (sender of the <code>WRITE</code>)</td>
+          <td>D (target of the <code>WRITE</code>)</td>
+          <td><span class="fileref">mooncake_connector.py:140</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      So <code>local_kv_block_len</code> refers to a different
+      concrete value depending on which connector you're reading.
+      Concretely, across the four worked examples (Llama-3-70B
+      sizing):
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Example</th>
+          <th>TP layout</th>
+          <th><code>local_kv_block_len</code> is&hellip;</th>
+          <th>Value / layer</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><a href="#nixl-tp">&sect;2.1 NIXL</a></td>
+          <td>TP<sub>P</sub>=4, TP<sub>D</sub>=2</td>
+          <td>D's block (4 heads), divided by <code>num_attn_reads=2</code> per READ &rarr; 2 heads on the wire</td>
+          <td>16 KB &rarr; <strong>8 KB per READ</strong></td>
+        </tr>
+        <tr>
+          <td><a href="#nixl-tp">&sect;2.2 NIXL</a></td>
+          <td>TP<sub>P</sub>=2, TP<sub>D</sub>=4</td>
+          <td>D's block (2 heads); only one READ per rank, no division</td>
+          <td><strong>8 KB</strong> (= <code>r</code> in the example)</td>
+        </tr>
+        <tr>
+          <td><a href="#pipe-tp">&sect;3.1 Mooncake pipe</a></td>
+          <td>TP<sub>P</sub>=2, TP<sub>D</sub>=4</td>
+          <td>P's block (4 heads); D's slice is <code>remote_kv_block_len</code> = 2 heads = <code>r</code></td>
+          <td>P: 16 KB &nbsp; D: <strong>8 KB</strong></td>
+        </tr>
+        <tr>
+          <td><a href="#pipe-tp">&sect;3.2 Mooncake pipe</a></td>
+          <td>TP<sub>P</sub>=4, TP<sub>D</sub>=2</td>
+          <td>P's block (2 heads) = <code>r</code>; D is <code>remote_kv_block_len</code> (4 heads)</td>
+          <td>P: <strong>8 KB</strong> &nbsp; D: 16 KB</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      Notice that in &sect;2.2 and &sect;3.1 &mdash; <em>same TP
+      layout</em>, TP<sub>P</sub>=2, TP<sub>D</sub>=4 &mdash;
+      <code>local_kv_block_len</code> means 8 KB in the NIXL doc but
+      16 KB in the Mooncake doc. "Local" flipped sides; the bytes
+      stayed put.
+    </p>
+
+    <h4>4. The extra NIXL quirk: <code>remote_kv_block_len</code> is also slice-sized</h4>
+
+    <p>
+      In NIXL specifically, <code>remote_kv_block_len</code> is
+      <em>not</em> P's full block. It's set to
+      <code>local_block_len // block_size_ratio</code>
+      (<span class="fileref">nixl/worker.py:1154</span>). When P and D
+      agree on <code>block_size</code> (the usual case,
+      <code>block_size_ratio == 1</code>), this collapses to "D's
+      block size" &mdash; the slice size used per READ, not P's full
+      block. That's why in &sect;2.2,
+      <code>rank_offset = rank_offset_factor &times; remote_kv_block_len</code>
+      moves D1 to offset <code>r</code> (8 KB), not <code>2r</code> (16
+      KB), inside P0's larger block. The variable is mis-named; treat
+      it as "transfer slice size" rather than "P's block size."
+    </p>
+
+    <div class="callout info">
+      <strong>One-line takeaway</strong>
+      <p>
+        Both variables mean "bytes per KV block per rank,"
+        <code>local_*</code> for whichever side is computing the plan
+        and <code>remote_*</code> for the other side &mdash; with
+        NIXL additionally normalizing <code>remote_kv_block_len</code>
+        to the per-transfer slice size, not the peer's full block.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="nixl-tp">2. NIXL: precomputed <code>TPMapping</code></h2>
+
+  <p>
+    NIXL's solution lives in
+    <span class="fileref">vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py</span>.
+    For each remote engine, on first handshake, D computes a complete
+    plan:
+  </p>
+
+<pre><code>@dataclass(frozen=True)
+class TPMapping:
+    source_ranks_per_group: tuple[tuple[int, ...], ...]
+    all_source_ranks: tuple[int, ...]
+    rank_to_attention_slot: dict[int, int]   # which head-slot does each remote rank fill?
+    rank_offset_factor: int                  # offset into remote KV when D_TP &gt; P_TP
+</code></pre>
+
+  <p>
+    The decision tree in <code>compute_tp_mapping</code>
+    (<span class="fileref">nixl/tp_mapping.py:65-142</span>):
+  </p>
+
+  <ol>
+    <li>
+      <strong>TP<sub>D</sub> &ge; TP<sub>P</sub> (or MLA)</strong>: each local
+      rank reads from exactly one remote rank. Source rank =
+      <code>tp_rank * remote_tp_size // tp_size</code>.
+    </li>
+    <li>
+      <strong>TP<sub>D</sub> &lt; TP<sub>P</sub></strong>: each local rank
+      reads from multiple remote ranks. Source ranks =
+      <code>[tp_rank * abs_tp .. tp_rank * abs_tp + abs_tp]</code> where
+      <code>abs_tp = remote_tp_size // tp_size</code>. Then GQA dedup
+      collapses ranks that hold the same heads (see
+      <a href="#gqa">&sect;6</a>).
+    </li>
+  </ol>
+
+  <p>
+    The <code>rank_offset_factor</code> is the head-dimension offset
+    needed when <em>multiple D ranks read from one P rank</em>. Each
+    needs a different slice. Use:
+  </p>
+
+<pre><code># worker.py _build_fa_remote (line 1159-1168)
+local_block_len = local_block_len // num_attn_reads
+rank_offset = plan.rank_offset_factor * remote_kv_block_len
+
+for block_id in range(num_blocks):
+    block_offset = block_id * page_size
+    addr = base_addr + block_offset + rank_offset
+    result.append((addr, local_block_len, nixl_agent_meta.device_id))
+</code></pre>
+
+  <p>
+    What's elegant: NIXL doesn't move data twice. The local descriptor
+    table records "read <code>local_block_len // num_attn_reads</code>
+    bytes starting at <code>base_addr + block_offset + rank_offset</code>".
+    The NIXL <code>READ</code> goes straight from the right slice of P's
+    memory into the right slice of D's memory.
+  </p>
+
+  <h3>2.1 Worked example: TP<sub>P</sub>=4, TP<sub>D</sub>=2, 8 KV heads</h3>
+
+  <div class="callout info">
+    <strong>What "sharded across N GPUs" means here</strong>
+    <p>
+      TP shards <em>every</em> tensor in the model &mdash; Q, K, V, O
+      projections, FFN gate/up/down, layer norms partially. But none
+      of those shardings cross the wire during a KV transfer; they're
+      internal to each rank's forward pass. The only sharding the
+      connector cares about is the <strong>KV cache tensor</strong>
+      itself, whose shape per rank is
+      <code>[num_blocks, block_size, num_kv_heads / tp_size, head_dim]</code>.
+      So when we say "P is sharded across 4 GPUs, 2 KV heads per rank,"
+      we specifically mean each P rank's KV cache holds 2 of the model's
+      8 KV heads (each with the full <code>head_dim=128</code>) &mdash;
+      a contiguous slice along the <code>num_kv_heads</code> axis.
+    </p>
+  </div>
+
+  <p>
+    Llama-3-70B-style: 8 KV heads, <code>head_dim=128</code>. P sharded
+    across 4 GPUs (2 KV heads per rank). D sharded across 2 GPUs (4 KV
+    heads per rank). Walk through what <code>compute_tp_mapping</code>
+    produces for D rank 0:
+  </p>
+
+<pre>
+tp_rank = 0, tp_size = 2 (D), remote_tp_size = 4 (P)
+total_num_kv_heads = 8
+
+&rarr; tp_size (2) &lt; remote_tp_size (4):  "P TP &gt; D TP" branch
+
+abs_tp     = 4 // 2 = 2
+start      = 0 * 2 = 0
+heads      = [0, 1] * 8 // 4 = [0, 2]
+attn_ranks = [0, 1]                # D0 reads from P ranks 0 and 1
+
+head_to_slot[0] = 0                # P0 fills slot 0 of D0's KV (heads 0,1)
+head_to_slot[2] = 1                # P1 fills slot 1 of D0's KV (heads 2,3)
+
+rank_offset_factor = 0             # tp_size &le; remote_tp_size branch
+</pre>
+
+  <p>What goes on the wire for one request on D rank 0:</p>
+
+<pre>
+READ 1:  P0's KV blocks  ----&gt;  D0 KV slot 0 (heads 0, 1)
+READ 2:  P1's KV blocks  ----&gt;  D0 KV slot 1 (heads 2, 3)
+</pre>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;2.1 memory view &mdash; <code>head_to_slot</code> fills D's larger block with multiple P blocks</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>P side</strong> &mdash; TP=4, 2 KV heads / rank, block = <code>r</code> bytes each
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">P blocks:</div>
+      <div class="cell" style="min-width:110px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>P0</strong>
+        <span class="lo">heads 0,1<br>size r</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>P1</strong>
+        <span class="lo">heads 2,3<br>size r</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>P2</strong>
+        <span class="lo">heads 4,5<br>size r</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>P3</strong>
+        <span class="lo">heads 6,7<br>size r</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 16px 0 10px 0; color:var(--muted); font-family:monospace; font-size:1em">
+      &darr; 4 NIXL <code>READ</code>s &mdash; each carries one full P block (<code>r</code> bytes) &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D side</strong> &mdash; TP=2, 4 KV heads / rank, block = <code>2r</code> bytes each
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">D0 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>slot 0</strong>
+        <span class="lo">heads 0,1 &mdash; offset 0..r</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>slot 1</strong>
+        <span class="lo">heads 2,3 &mdash; offset r..2r</span>
+      </div>
+    </div>
+
+    <div class="cell-row" style="margin-top:6px">
+      <div class="cell label" style="min-width:80px">D1 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>slot 0</strong>
+        <span class="lo">heads 4,5 &mdash; offset 0..r</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>slot 1</strong>
+        <span class="lo">heads 6,7 &mdash; offset r..2r</span>
+      </div>
+    </div>
+
+    <div class="diagram-caption">
+      Colors match head-pairs. The slicing is on D's side: each D
+      rank's <code>2r</code>-byte block is divided into two
+      <code>r</code>-byte slots, and <code>head_to_slot</code> tells
+      NIXL which slot each remote P rank fills.
+      <code>local_block_len // num_attn_reads = 2r / 2 = r</code> is
+      the per-READ size; <code>rank_offset</code> on the source side
+      is 0 (each P sends its whole block).
+    </div>
+  </div>
+
+  <p>
+    Two NIXL <code>READ</code>s for D0; D1 issues the symmetric pair
+    reading P2 and P3. Total wire transfers per request across the D
+    pool: 4, all happening in parallel through the NIXL backends.
+    Notice: zero copies. The local descriptor's
+    <code>(addr, len)</code> already points at the correct half-slot of
+    D0's block, so NIXL writes data into its final resting place.
+  </p>
+
+  <h3>2.2 Worked example: TP<sub>P</sub>=2, TP<sub>D</sub>=4, 8 KV heads (the split direction)</h3>
+
+  <p>
+    The inverse layout: P sharded across 2 GPUs (4 KV heads per rank),
+    D across 4 GPUs (2 KV heads per rank) &mdash; same TP layout as the
+    Mooncake pipe example in &sect;3.1, but with pull semantics. Each
+    D rank reads a <em>slice</em> of one P rank's larger block, rather
+    than gathering from two P ranks. Walk
+    <code>compute_tp_mapping</code> for D rank 0:
+  </p>
+
+<pre>
+tp_rank = 0, tp_size = 4 (D), remote_tp_size = 2 (P)
+total_num_kv_heads = 8
+
+&rarr; tp_size (4) &ge; remote_tp_size (2):  "D TP &ge; P TP" branch
+
+attn_ranks = [0 * 2 // 4] = [0]    # D0 reads from P0 only (one rank)
+
+head_to_slot[0 * 8 // 2] = 0       # P0 fills slot 0 of D0's KV
+                                   # (D0 has only one slot &mdash; it reads from
+                                   #  only one P rank)
+
+rank_offset_factor:
+  tp_size (4) &gt; remote_tp_size (2), not MLA      &rarr; not the &equiv; 0 branch
+  tp_size (4) &gt; total_num_kv_heads (8)? No       &rarr; else branch
+  rank_offset_factor = tp_rank % (tp_size // remote_tp_size)
+                     = 0 % (4 // 2)
+                     = 0
+</pre>
+
+  <p>
+    Doing the same for D1, D2, D3, the pairings and offsets come out:
+  </p>
+
+<pre>
+D rank   attn_ranks   rank_offset_factor   reads from
+  0        [0]               0              first half of P0  (heads 0,1)
+  1        [0]               1              second half of P0 (heads 2,3)
+  2        [1]               0              first half of P1  (heads 4,5)
+  3        [1]               1              second half of P1 (heads 6,7)
+</pre>
+
+  <p>What goes on the wire (one <code>READ</code> per D rank):</p>
+
+<pre>
+READ 1:  P0 base + 0  ----&gt;  D0 KV block (heads 0, 1)
+READ 2:  P0 base + r  ----&gt;  D1 KV block (heads 2, 3)
+READ 3:  P1 base + 0  ----&gt;  D2 KV block (heads 4, 5)
+READ 4:  P1 base + r  ----&gt;  D3 KV block (heads 6, 7)
+</pre>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;2.2 memory view &mdash; <code>rank_offset_factor</code> picks the source slice</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>P side</strong> &mdash; TP=2, 4 KV heads / rank, block = <code>2r</code> bytes each
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">P0 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>heads 0,1</strong>
+        <span class="lo">offset 0..r &mdash; rank_off=0</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>heads 2,3</strong>
+        <span class="lo">offset r..2r &mdash; rank_off=r</span>
+      </div>
+    </div>
+
+    <div class="cell-row" style="margin-top:6px">
+      <div class="cell label" style="min-width:80px">P1 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>heads 4,5</strong>
+        <span class="lo">offset 0..r &mdash; rank_off=0</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>heads 6,7</strong>
+        <span class="lo">offset r..2r &mdash; rank_off=r</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 16px 0 10px 0; color:var(--muted); font-family:monospace; font-size:1em">
+      &darr; 4 NIXL <code>READ</code>s &mdash; each carries one half-slice (<code>r</code> bytes) of a P block &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D side</strong> &mdash; TP=4, 2 KV heads / rank, block = <code>r</code> bytes each
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">D blocks:</div>
+      <div class="cell" style="min-width:110px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>D0</strong>
+        <span class="lo">heads 0,1<br>size r</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>D1</strong>
+        <span class="lo">heads 2,3<br>size r</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>D2</strong>
+        <span class="lo">heads 4,5<br>size r</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>D3</strong>
+        <span class="lo">heads 6,7<br>size r</span>
+      </div>
+    </div>
+
+    <div class="diagram-caption">
+      Colors match head-pairs (compare with the &sect;2.1 diagram &mdash;
+      the same colors live on the same heads). The slicing is now on
+      P's side: each P rank's <code>2r</code>-byte block is divided
+      into two <code>r</code>-byte halves, and
+      <code>rank_offset_factor</code> picks which half each D rank
+      reads. Two D ranks point at the same P, but at different
+      offsets, so they receive disjoint head-pairs.
+    </div>
+  </div>
+
+  <p>
+    where <code>r = local_kv_block_len</code> is D's per-block byte
+    size (2 heads worth). The local descriptor that NIXL uses for the
+    READ has its source address computed as
+    <code>P_base + block_offset + rank_offset</code>, where
+    <code>rank_offset = rank_offset_factor * remote_kv_block_len</code>
+    (see <code>_build_fa_remote</code> in
+    <span class="fileref">nixl/worker.py:1159-1168</span>). With
+    <code>rank_offset_factor</code> &isin; &lbrace;0, 1&rbrace; that
+    naturally picks the first or second half of P's 4-head block.
+  </p>
+
+  <p>
+    Notice the inversion against &sect;2.1: there, each D rank issued
+    <em>multiple</em> READs (D0 read from both P0 and P1, filling two
+    half-slots of its own block). Here, each D rank issues
+    <em>exactly one</em> READ but takes only a fraction of P's larger
+    block. The <code>rank_offset_factor</code> is what makes the
+    head-dim split work &mdash; without it, D0 and D1 reading from the
+    same P0 would get identical data and clobber each other's
+    different head ranges.
+  </p>
+
+  <div class="callout info">
+    <strong>Comparison with Mooncake pipe &sect;3.1 (same TP layout)</strong>
+    <p>
+      Both connectors move the same four head-pairs through the same
+      four (P, D) pairs, but with opposite control-plane initiators.
+      NIXL does four D-initiated <code>READ</code>s with
+      <code>rank_offset_factor</code> selecting the source slice of
+      P's block. The Mooncake pipe does four P-initiated
+      <code>WRITE</code>s with <code>src_offset</code> selecting the
+      same source slice. Same byte movement, same final memory layout
+      &mdash; just different sides of the wire holding the pen.
+    </p>
+  </div>
+
+  <h2 id="pipe-tp">3. Mooncake pipe: <code>_get_tp_ratio</code> + region offsets</h2>
+
+  <p>
+    The direct pipe takes the same idea but expresses it in terms of a
+    signed ratio
+    (<span class="fileref">mooncake/mooncake_connector.py:88-106</span>):
+  </p>
+
+<pre><code>def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -&gt; int:
+    if local_tp_size &gt;= remote_tp_size:
+        return local_tp_size // remote_tp_size      # positive
+    return -(remote_tp_size // local_tp_size)       # negative
+</code></pre>
+
+  <p>
+    Positive: one local rank maps into a larger remote region. Negative:
+    one local rank gathers from multiple remote regions. Both are
+    handled by the same planning function
+    (<span class="fileref">mooncake/mooncake_connector.py:140-174</span>):
+  </p>
+
+<pre><code>def _compute_sender_transfer_plan(
+    local_tp_rank, local_tp_size, remote_tp_rank, remote_tp_size,
+    local_kv_block_len, remote_kv_block_len, producer_cache_replicated,
+) -&gt; tuple[bool, int, int, int]:
+    tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
+    if tp_ratio == 1:
+        return True, 0, 0, local_kv_block_len
+    if tp_ratio &gt; 0:
+        if producer_cache_replicated:
+            return local_tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
+        return True, 0, (local_tp_rank % tp_ratio) * local_kv_block_len, local_kv_block_len
+    # tp_ratio &lt; 0
+    if producer_cache_replicated:
+        return True, 0, 0, local_kv_block_len
+    ratio_abs = -tp_ratio
+    return True, (remote_tp_rank % ratio_abs) * remote_kv_block_len, 0, remote_kv_block_len
+</code></pre>
+
+  <p>
+    The returned tuple is <code>(should_send, src_offset, dst_offset,
+    transfer_len)</code>. Read it as: "Should this P rank send to that
+    D rank at all? If so, where in the source region does the copy
+    start, where in the dest, and how big is it?"
+  </p>
+
+  <p>
+    There's also a region-expansion step
+    (<code>_expand_transfer_regions</code>,
+    <span class="fileref">mooncake/mooncake_connector.py:109-137</span>)
+    that splits K and V into separate regions when the layout is
+    blocks-first (FlashAttention) so that the planning logic above can
+    treat them uniformly.
+  </p>
+
+  <p>
+    Validation upfront
+    (<span class="fileref">mooncake/mooncake_connector.py:193-244</span>)
+    confirms that region lengths agree with the TP ratio. Mismatch
+    &rArr; the whole batch errors with a clear message at handshake
+    time, not silent corruption at transfer time.
+  </p>
+
+  <h3>3.1 Worked example: TP<sub>P</sub>=2, TP<sub>D</sub>=4, 8 KV heads</h3>
+
+  <p>
+    Flip the previous scenario: P sharded across 2 GPUs (4 KV heads per
+    rank), D across 4 GPUs (2 KV heads per rank). Each P rank must push
+    KV to <em>two</em> D ranks, splitting along the head dimension. Walk
+    <code>_compute_sender_transfer_plan</code> from P0's view, where
+    <code>r = remote_kv_block_len</code> is D's per-block byte size (2
+    heads worth):
+  </p>
+
+<pre>
+local_tp_size = 2 (P), remote_tp_size = 4 (D)
+&rarr; tp_ratio = -(4 // 2) = -2     (negative: split case)
+
+P0 (local_tp_rank=0) sending to D0 (remote_tp_rank=0):
+  ratio_abs  = 2
+  src_offset = (0 % 2) * r = 0
+  &rarr; (should_send=True, src_offset=0, dst_offset=0, transfer_len=r)
+
+P0 sending to D1 (remote_tp_rank=1):
+  src_offset = (1 % 2) * r = r
+  &rarr; (should_send=True, src_offset=r, dst_offset=0, transfer_len=r)
+</pre>
+
+  <p>What goes on the wire (four <code>batch_transfer_sync_write</code> calls):</p>
+
+<pre>
+P0  --&gt;  D0:  src_offset=0,  dst_offset=0,  len=r   (heads 0, 1)
+P0  --&gt;  D1:  src_offset=r,  dst_offset=0,  len=r   (heads 2, 3)
+P1  --&gt;  D2:  src_offset=0,  dst_offset=0,  len=r   (heads 4, 5)
+P1  --&gt;  D3:  src_offset=r,  dst_offset=0,  len=r   (heads 6, 7)
+</pre>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;3.1 memory view &mdash; same slices as &sect;2.2, but P pushes</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>P side</strong> &mdash; TP=2, 4 KV heads / rank, block = <code>2r</code> bytes each (= <code>local_kv_block_len</code>)
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">P0 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>heads 0,1</strong>
+        <span class="lo">src_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>heads 2,3</strong>
+        <span class="lo">src_offset=r</span>
+      </div>
+    </div>
+
+    <div class="cell-row" style="margin-top:6px">
+      <div class="cell label" style="min-width:80px">P1 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>heads 4,5</strong>
+        <span class="lo">src_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>heads 6,7</strong>
+        <span class="lo">src_offset=r</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 16px 0 10px 0; color:var(--muted); font-family:monospace; font-size:1em">
+      &darr; 4 <code>batch_transfer_sync_write</code> calls &mdash; P pushes one slice (<code>r</code> bytes) each &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D side</strong> &mdash; TP=4, 2 KV heads / rank, block = <code>r</code> bytes each (= <code>remote_kv_block_len</code>)
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">D blocks:</div>
+      <div class="cell" style="min-width:110px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>D0</strong>
+        <span class="lo">heads 0,1<br>dst_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>D1</strong>
+        <span class="lo">heads 2,3<br>dst_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>D2</strong>
+        <span class="lo">heads 4,5<br>dst_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>D3</strong>
+        <span class="lo">heads 6,7<br>dst_offset=0</span>
+      </div>
+    </div>
+
+    <div class="diagram-caption">
+      Compare with the <a href="#nixl-tp">NIXL &sect;2.2 diagram</a>:
+      identical TP layout, identical colors, identical byte movement.
+      Only the arrow direction is different &mdash; here P drives the
+      transfer with <code>src_offset</code> picking the source half;
+      in NIXL D drives with <code>rank_offset_factor</code> picking
+      the same source half. Same wire, opposite ends of the pen.
+    </div>
+  </div>
+
+  <p>
+    P0's KV block is <code>2*r</code> bytes long (4 heads). The two
+    pushes hit the first half (heads 0,1 &rarr; D0) and the second half
+    (heads 2,3 &rarr; D1). D's blocks are <code>r</code> bytes (2 heads),
+    so each push fills a destination block entirely &mdash;
+    <code>dst_offset</code> is always 0 in the negative-ratio case
+    because D is the one being subdivided, not the source.
+  </p>
+
+  <h3>3.2 Worked example: TP<sub>P</sub>=4, TP<sub>D</sub>=2, 8 KV heads (the gather direction)</h3>
+
+  <p>
+    Now the inverse: P sharded across 4 GPUs (2 KV heads per rank), D
+    across 2 GPUs (4 KV heads per rank) &mdash; same setup as the NIXL
+    example in &sect;2.1, but with push semantics. Each D rank
+    <em>gathers</em> from two P ranks. Walk
+    <code>_compute_sender_transfer_plan</code> for the four
+    (P rank, D rank) pairs, where <code>r = local_kv_block_len</code>
+    is now P's per-block byte size (2 heads worth):
+  </p>
+
+<pre>
+local_tp_size = 4 (P), remote_tp_size = 2 (D)
+&rarr; tp_ratio = 4 // 2 = 2     (positive: gather case)
+
+Each P rank pairs with exactly one D rank (remote = local // tp_ratio):
+  P0,P1 &rarr; D0      P2,P3 &rarr; D1
+
+For positive tp_ratio (non-replicated cache), the plan is:
+  src_offset = 0
+  dst_offset = (local_tp_rank % tp_ratio) * r
+  transfer_len = r
+
+P0 (local_tp_rank=0) sending to D0:
+  dst_offset = (0 % 2) * r = 0
+  &rarr; (should_send=True, src_offset=0, dst_offset=0, transfer_len=r)
+
+P1 (local_tp_rank=1) sending to D0:
+  dst_offset = (1 % 2) * r = r
+  &rarr; (should_send=True, src_offset=0, dst_offset=r, transfer_len=r)
+</pre>
+
+  <p>What goes on the wire (four <code>batch_transfer_sync_write</code> calls):</p>
+
+<pre>
+P0  --&gt;  D0:  src_offset=0,  dst_offset=0,  len=r   (heads 0, 1)
+P1  --&gt;  D0:  src_offset=0,  dst_offset=r,  len=r   (heads 2, 3)
+P2  --&gt;  D1:  src_offset=0,  dst_offset=0,  len=r   (heads 4, 5)
+P3  --&gt;  D1:  src_offset=0,  dst_offset=r,  len=r   (heads 6, 7)
+</pre>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;3.2 memory view &mdash; same slots as &sect;2.1, but P pushes</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>P side</strong> &mdash; TP=4, 2 KV heads / rank, block = <code>r</code> bytes each (= <code>local_kv_block_len</code>)
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">P blocks:</div>
+      <div class="cell" style="min-width:110px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>P0</strong>
+        <span class="lo">heads 0,1<br>src_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>P1</strong>
+        <span class="lo">heads 2,3<br>src_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>P2</strong>
+        <span class="lo">heads 4,5<br>src_offset=0</span>
+      </div>
+      <div class="cell" style="min-width:110px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>P3</strong>
+        <span class="lo">heads 6,7<br>src_offset=0</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 16px 0 10px 0; color:var(--muted); font-family:monospace; font-size:1em">
+      &darr; 4 <code>batch_transfer_sync_write</code> calls &mdash; P pushes whole block (<code>r</code> bytes) into half-slots of D &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D side</strong> &mdash; TP=2, 4 KV heads / rank, block = <code>2r</code> bytes each (= <code>remote_kv_block_len</code>)
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">D0 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>heads 0,1</strong>
+        <span class="lo">dst_offset=0 &mdash; from P0</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>heads 2,3</strong>
+        <span class="lo">dst_offset=r &mdash; from P1</span>
+      </div>
+    </div>
+
+    <div class="cell-row" style="margin-top:6px">
+      <div class="cell label" style="min-width:80px">D1 block:</div>
+      <div class="cell" style="min-width:170px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>heads 4,5</strong>
+        <span class="lo">dst_offset=0 &mdash; from P2</span>
+      </div>
+      <div class="cell" style="min-width:170px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>heads 6,7</strong>
+        <span class="lo">dst_offset=r &mdash; from P3</span>
+      </div>
+    </div>
+
+    <div class="diagram-caption">
+      Compare with the <a href="#nixl-tp">NIXL &sect;2.1 diagram</a>
+      &mdash; identical TP layout, identical colors, identical byte
+      movement. Only the arrow direction is different: here P drives
+      with <code>dst_offset</code> picking the destination slot; in
+      NIXL D drives with <code>head_to_slot</code> picking the same
+      destination slot. Two pushes (or two pulls) per D block
+      &mdash; whichever side has the larger block, that's the side
+      with the variable offset.
+    </div>
+  </div>
+
+  <p>
+    Notice the inversion against &sect;3.1: there, <code>src_offset</code>
+    varied (P sliced its own 4-head block into two halves) and
+    <code>dst_offset</code> was always 0. Here it's the opposite &mdash;
+    <code>src_offset</code> is always 0 (each P rank pushes its whole
+    block) and <code>dst_offset</code> varies (two different P ranks
+    write into different halves of D's larger block). That's the
+    geometric signature of the positive vs negative
+    <code>tp_ratio</code> branches: whichever side has the larger
+    block gets the variable offset.
+  </p>
+
+  <div class="callout info">
+    <strong>Comparison with NIXL &sect;2.1 (same TP layout)</strong>
+    <p>
+      Both connectors move the same four head-pairs across the same
+      four (P, D) pairs, but in opposite directions on the wire. NIXL
+      does four <code>READ</code>s issued by D (D pulls 2&times; per
+      rank). The Mooncake pipe does four <code>WRITE</code>s issued by
+      P (P pushes 1&times; per rank). Same byte volume, same final
+      memory layout, different control-plane initiator.
+    </p>
+  </div>
+
+  <h2 id="store-tp">4. Mooncake store: candidate-key lookup</h2>
+
+  <p>
+    Before walking the lookup logic, fix the shape of the store's
+    keyspace in your head &mdash; everything else follows from this.
+    The store is content-addressed; every block lives under a string
+    key built by <code>PoolKey.to_string()</code>
+    (<span class="fileref">mooncake/store/data.py:58-67</span>):
+  </p>
+
+<pre><code>"{model_name}@tp_rank:{tp_rank}@pcp{pcp_rank}@dcp{dcp_rank}@pp_rank:{pp_rank}@group:{group_id}@{chunk_hash}"</code></pre>
+
+  <p>A worked rendering for Llama-3-70B on TP=2, PP=1:</p>
+
+<pre><code>llama-3-70b@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@a3f2c1d4...
+llama-3-70b@tp_rank:1@pcp0@dcp0@pp_rank:0@group:0@a3f2c1d4...
+                ^                              ^      ^
+                |                              |      |
+                |                              |      `--- vLLM prefix-cache block hash
+                |                              |
+                |                              `--- KV cache group id (HMA: full attn,
+                |                                   SWA, Mamba, ...)
+                |
+                `--- NOT the raw TP rank!  This is head_or_tp_rank
+                     (worker.py:826-839):
+                       head_or_tp_rank = tp_rank // put_step
+                                         (when tp_size &gt; num_kv_head)
+                       head_or_tp_rank = tp_rank
+                                         (otherwise)</code></pre>
+
+  <p>
+    The single most important field for hetero-TP is
+    <code>tp_rank</code>, but it's not what the name suggests. The
+    value stored there is the <strong>KV-head index</strong>, not the
+    physical TP rank. When <code>tp_size &gt; num_kv_head</code>
+    (heavy TP under GQA), multiple physical ranks collapse to the same
+    <code>head_or_tp_rank</code> &mdash; the
+    <code>put_step</code> slice on the put path
+    (<span class="fileref">store/worker.py:511</span>) distributes the
+    chunk writes among them so each chunk is stored exactly once per
+    head.
+  </p>
+
+  <p>
+    Concretely, the per-chunk key count in the store is always
+    <code>min(tp_size, num_kv_head) &times; pp_size</code>, regardless
+    of how oversharded the writer was. That's the invariant the
+    consumer-side lookup relies on.
+  </p>
+
+  <p>
+    Now the lookup logic. The store doesn't precompute. There's no
+    "where does P's KV head k live?" because D never asks &mdash;
+    <strong>D asks the store</strong>. The store has keys for every
+    <code>(model, head_or_tp_rank, pp_rank, hash)</code> tuple that P
+    put. D simply iterates over the head indices it cares about:
+  </p>
+
+<pre><code># mooncake/store/worker.py:1210-1236
+tp_count = min(self.tp_size, self.num_kv_head)
+for g_idx, db in enumerate(self.token_dbs):
+    for chunk_id, h in enumerate(group_hashes):
+        for tp in range(tp_count):
+            for pp in range(self.pp_size):
+                md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
+                candidate_keys.append(PoolKey(md, h.hex()).to_string())
+res = self.store.batch_is_exist(candidate_keys)
+</code></pre>
+
+  <p>
+    Then dedup: a chunk hash is "present" iff <em>all</em> expected
+    (tp, pp) shards exist
+    (<span class="fileref">mooncake/store/worker.py:1225-1231</span>):
+  </p>
+
+<pre><code>expected_per_key = max(1, tp_count * self.pp_size)
+present_count: dict[tuple[int, bytes], int] = {}
+for gh, exists in zip(candidate_meta, res, strict=True):
+    if exists == 1:
+        present_count[gh] = present_count.get(gh, 0) + 1
+exists_set = {gh for gh, c in present_count.items() if c &gt;= expected_per_key}
+</code></pre>
+
+  <p>
+    This is a striking design choice. The store doesn't need to know
+    what the producer's TP layout was: it just <em>does</em> the
+    necessary fetches, and if any shard is missing (because the
+    producer never wrote it, or because a TP layout swing leaves a gap),
+    it falls back to recompute. The cost is iterating
+    <code>tp_count &times; pp_size</code> candidate keys per chunk.
+  </p>
+
+  <h3>4.1 Worked example: TP<sub>P</sub>=8, TP<sub>D</sub>=4, 4 KV heads</h3>
+
+  <p>
+    The store's hetero-TP trick lives in <em>how it builds the key</em>
+    on the producer, not in the consumer's lookup logic. Look at the
+    metadata construction
+    (<span class="fileref">mooncake/store/worker.py:826-839</span>):
+  </p>
+
+<pre><code>if self.num_kv_head &lt; self.tp_size:
+    self.put_step = self.tp_size // self.num_kv_head
+    self.head_or_tp_rank = self.tp_rank // self.put_step    # dedup: many ranks &rarr; one key
+else:
+    self.head_or_tp_rank = self.tp_rank
+    self.put_step = 1
+
+self.metadata = KeyMetadata(
+    ...
+    tp_rank=self.head_or_tp_rank,    # key's tp_rank is the *head index*, not the raw rank
+    ...
+)</code></pre>
+
+  <p>
+    The <code>tp_rank</code> field in the key is actually
+    <code>head_or_tp_rank</code> &mdash; it indexes the KV head, not the
+    physical TP rank. When <code>tp_size &gt; num_kv_head</code> (heavy
+    TP under GQA), multiple TP ranks fold into one key. That's what
+    lets P and D talk to the store with different TP sizes: <strong>as
+    long as they agree on <code>num_kv_head</code>, they agree on the
+    key</strong>.
+  </p>
+
+  <p>
+    Setup: <code>num_kv_head=4</code> (GQA), P running TP=8 (heavily
+    oversharded for prefill throughput), D running TP=4 (compact
+    decode pool). Block size 16, system prompt hashes to chunks
+    h<sub>1</sub>, h<sub>2</sub>, h<sub>3</sub>.
+  </p>
+
+  <p><strong>P side</strong> &mdash; how 8 TP ranks become 4 keys per chunk:</p>
+
+<pre>
+num_kv_head=4, tp_size=8  &rarr;  put_step = 8 // 4 = 2
+                                head_or_tp_rank = tp_rank // 2
+
+  P rank 0,1 &rarr; head_or_tp_rank=0   (own KV head 0)
+  P rank 2,3 &rarr; head_or_tp_rank=1   (own KV head 1)
+  P rank 4,5 &rarr; head_or_tp_rank=2   (own KV head 2)
+  P rank 6,7 &rarr; head_or_tp_rank=3   (own KV head 3)
+
+Within each pair, the put_step slice deduplicates work
+(worker.py:511):
+  sl = slice(self.tp_rank % self.put_step, None, self.put_step)
+  &rarr; P0 stores even-index chunks of head 0; P1 stores odd
+  &rarr; P2 stores even-index chunks of head 1; P3 stores odd
+  ... etc.
+
+After all puts complete, store holds 4 keys per chunk hash:
+  "...@tp_rank:0@...@&lt;h&gt;"   (heads sourced from P0,P1)
+  "...@tp_rank:1@...@&lt;h&gt;"   (heads sourced from P2,P3)
+  "...@tp_rank:2@...@&lt;h&gt;"   (heads sourced from P4,P5)
+  "...@tp_rank:3@...@&lt;h&gt;"   (heads sourced from P6,P7)
+</pre>
+
+  <p>
+    <strong>D side</strong> &mdash; lookup matches by KV head index, not raw rank:
+  </p>
+
+<pre>
+num_kv_head=4, tp_size=4  &rarr;  put_step = 1 (4 is not &lt; 4)
+                                head_or_tp_rank = tp_rank
+
+D rank 0 builds candidate keys (worker.py:1200-1213):
+  tp_count = min(self.tp_size=4, num_kv_head=4) = 4
+
+  for chunk in [h1, h2, h3]:
+    for tp in [0, 1, 2, 3]:
+      candidate_keys.append(f"...@tp_rank:{tp}@...@{chunk}")
+  &rarr; 12 candidate keys
+
+batch_is_exist(candidate_keys) returns all 1s.
+
+expected_per_key = max(1, 4 * 1) = 4
+present_count[(g, h)] = 4 for each chunk  &rarr; PRESENT.
+
+D0 then fetches only the @tp_rank:0 keys (its own KV head's data).
+D1 fetches @tp_rank:1, etc.
+</pre>
+
+  <p>
+    Notice what made this work: P doesn't need to know D's TP layout,
+    and D doesn't need to know P's. They communicate through the
+    <em>KV-head index</em> embedded in the key. P's
+    <code>head_or_tp_rank</code> collapses its oversharding to one key
+    per head; D's <code>head_or_tp_rank</code> happens to equal its
+    physical rank (because <code>tp_size == num_kv_head</code> here)
+    and lines up directly.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;4.1 keyspace view &mdash; <code>head_or_tp_rank</code> is the meeting point</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>P side</strong> &mdash; TP=8, <code>put_step=2</code>: pairs collapse to one key per head
+    </div>
+
+    <div class="cell-row" style="flex-wrap:wrap">
+      <div class="cell" style="min-width:62px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">P0</div>
+      <div class="cell" style="min-width:62px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">P1</div>
+      <div class="cell" style="min-width:62px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">P2</div>
+      <div class="cell" style="min-width:62px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">P3</div>
+      <div class="cell" style="min-width:62px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">P4</div>
+      <div class="cell" style="min-width:62px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">P5</div>
+      <div class="cell" style="min-width:62px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">P6</div>
+      <div class="cell" style="min-width:62px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">P7</div>
+    </div>
+
+    <div style="text-align:center; margin: 8px 0 4px 0; color:var(--muted); font-family:monospace; font-size:0.9em">
+      &darr; <code>head_or_tp_rank = tp_rank // put_step</code> &darr;
+    </div>
+
+    <div class="cell-row" style="flex-wrap:wrap">
+      <div class="cell" style="min-width:130px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>head_or_tp_rank=0</strong>
+        <span class="lo">P0,P1 share &mdash; KV head 0</span>
+      </div>
+      <div class="cell" style="min-width:130px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>head_or_tp_rank=1</strong>
+        <span class="lo">P2,P3 share &mdash; KV head 1</span>
+      </div>
+      <div class="cell" style="min-width:130px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>head_or_tp_rank=2</strong>
+        <span class="lo">P4,P5 share &mdash; KV head 2</span>
+      </div>
+      <div class="cell" style="min-width:130px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>head_or_tp_rank=3</strong>
+        <span class="lo">P6,P7 share &mdash; KV head 3</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 10px 0 4px 0; color:var(--muted); font-family:monospace; font-size:0.9em">
+      &darr; <code>batch_put</code> &mdash; <code>put_step</code> slice splits chunks between paired ranks &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>Store</strong> &mdash; <code>min(tp_size, num_kv_head)&nbsp;=&nbsp;4</code> keys per chunk hash <code>h</code>
+    </div>
+
+    <div class="cell-row" style="flex-wrap:wrap">
+      <div class="cell" style="min-width:160px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue); font-family:monospace; font-size:0.78em">
+        ...@tp_rank:0@...@h
+        <span class="lo">payload: 1 head's bytes</span>
+      </div>
+      <div class="cell" style="min-width:160px; background:var(--green-soft); border-color:#abd1bb; color:var(--green); font-family:monospace; font-size:0.78em">
+        ...@tp_rank:1@...@h
+        <span class="lo">payload: 1 head's bytes</span>
+      </div>
+      <div class="cell" style="min-width:160px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber); font-family:monospace; font-size:0.78em">
+        ...@tp_rank:2@...@h
+        <span class="lo">payload: 1 head's bytes</span>
+      </div>
+      <div class="cell" style="min-width:160px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red); font-family:monospace; font-size:0.78em">
+        ...@tp_rank:3@...@h
+        <span class="lo">payload: 1 head's bytes</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 10px 0 4px 0; color:var(--muted); font-family:monospace; font-size:0.9em">
+      &darr; D's <code>batch_get</code>: each D rank fetches one head's key &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D side</strong> &mdash; TP=4, <code>head_or_tp_rank = tp_rank</code>
+    </div>
+
+    <div class="cell-row">
+      <div class="cell" style="min-width:130px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>D0</strong>
+        <span class="lo">tp_rank=0, KV head 0</span>
+      </div>
+      <div class="cell" style="min-width:130px; background:var(--green-soft); border-color:#abd1bb; color:var(--green)">
+        <strong>D1</strong>
+        <span class="lo">tp_rank=1, KV head 1</span>
+      </div>
+      <div class="cell" style="min-width:130px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>D2</strong>
+        <span class="lo">tp_rank=2, KV head 2</span>
+      </div>
+      <div class="cell" style="min-width:130px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red)">
+        <strong>D3</strong>
+        <span class="lo">tp_rank=3, KV head 3</span>
+      </div>
+    </div>
+
+    <div class="diagram-caption">
+      Colors track <strong>KV head index</strong>, not physical TP
+      rank. 8 P ranks collapse to 4 keys via
+      <code>head_or_tp_rank</code>; the store sees a 4-element
+      keyspace; D's 4 ranks each fetch the one key their head index
+      points at. Payload size matches on both sides (1 head's bytes)
+      because both <code>tp_size</code>s are
+      <code>&ge; num_kv_head</code> &mdash; the invariant that makes
+      everything line up.
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>The constraint: <code>num_kv_head</code> must agree</strong>
+    <p>
+      The store handles arbitrary <code>tp_size</code> on either side
+      because of the <code>head_or_tp_rank</code> dedup, but it
+      <em>requires</em> P and D to agree on <code>num_kv_head</code>
+      &mdash; that's the implicit key-space dimension. They also need
+      both <code>tp_size</code>s to be multiples or divisors of
+      <code>num_kv_head</code>, so the
+      <code>head_or_tp_rank</code> calculation lines up on both sides.
+      If your decode cluster runs <code>tp_size=3</code> with
+      <code>num_kv_head=4</code>, the lookup misses keys it should
+      find. Stick to powers of two.
+    </p>
+  </div>
+
+  <p>
+    And as a side benefit, the same content-addressed scheme means
+    <strong>cross-run cache hits work for free</strong>. A second
+    engine process that hashes the same prompt arrives at the same
+    chunk hashes, builds the same candidate keys, and hits the same
+    store entries &mdash; even if it was launched hours later, even if
+    the original P fleet has already exited.
+  </p>
+
+  <h3>4.2 Worked example: TP<sub>P</sub>=8, TP<sub>D</sub>=2, 4 KV heads (lookup passes, fetch mismatches)</h3>
+
+  <p>
+    Now shrink D instead of growing it: keep P heavily oversharded
+    (TP=8) but make D very compact (TP=2). Same
+    <code>num_kv_head=4</code>. This case is the most instructive
+    failure mode &mdash; the lookup actually <em>passes</em>, but the
+    per-key byte sizes don't agree between P and D.
+  </p>
+
+  <p><strong>P side</strong> &mdash; identical to &sect;4.1:</p>
+
+<pre>
+num_kv_head=4, tp_size=8  &rarr;  put_step = 8 // 4 = 2
+                                head_or_tp_rank = tp_rank // 2
+
+  P ranks (0,1)  &rarr;  head_or_tp_rank=0   (one full KV head's bytes)
+  P ranks (2,3)  &rarr;  head_or_tp_rank=1
+  P ranks (4,5)  &rarr;  head_or_tp_rank=2
+  P ranks (6,7)  &rarr;  head_or_tp_rank=3
+
+Store holds 4 keys per chunk, payload size = 1 head's bytes each.
+</pre>
+
+  <p><strong>D side</strong> &mdash; only checks half the keyspace:</p>
+
+<pre>
+num_kv_head=4, tp_size=2  &rarr;  4 &lt; 2 is False, so:
+                                head_or_tp_rank = tp_rank
+                                put_step = 1
+
+  D rank 0 &rarr; head_or_tp_rank=0   (its slot holds KV heads 0 AND 1, packed)
+  D rank 1 &rarr; head_or_tp_rank=1   (its slot holds KV heads 2 AND 3, packed)
+
+D's lookup (worker.py:1200-1213):
+  tp_count = min(self.tp_size=2, num_kv_head=4) = 2     <span style="color:#a8342d">&larr; key bug surface</span>
+
+  for chunk in [h1, h2, h3]:
+    for tp in [0, 1]:                                   <span style="color:#a8342d">&larr; only iterates 2, not 4</span>
+      candidate_keys.append(f"...@tp_rank:{tp}@...@{chunk}")
+  &rarr; 6 candidate keys (NOT 12 &mdash; D never asks about tp=2 or tp=3)
+
+batch_is_exist:
+  tp_rank=0  &rarr;  exists  (P stored 1 head's bytes)
+  tp_rank=1  &rarr;  exists  (P stored 1 head's bytes)
+
+expected_per_key = max(1, 2 * 1) = 2
+present_count[(g, h)] = 2  &gt;= 2  &rarr;  PRESENT
+&rarr; lookup says cache hit; D allocates blocks and proceeds to fetch.
+</pre>
+
+  <p><strong>The problem surfaces in the recv thread</strong>:</p>
+
+<pre>
+D's KVCacheStoreRecvingThread builds keys using db.metadata directly
+(worker.py:673-684), so D0 fetches one key per chunk: "@tp_rank:0".
+
+D's prepare_value computes the size from D's own block_len, which is
+sized for D's per-rank slot:
+  size_D = 2 heads &middot; head_dim &middot; element_size &middot; (chunks)
+
+But P put that key with:
+  size_P = 1 head &middot; head_dim &middot; element_size &middot; (chunks)
+
+batch_get_into_multi_buffers(["@tp_rank:0@...@h1"], [D0_addr], [size_D])
+                                                              ^^^^^^^
+                                                              wrong &mdash; 2x what was stored
+</pre>
+
+  <div class="callout bad">
+    <strong>Why this case fails differently from &sect;4.3</strong>
+    <p>
+      &sect;4.3 (below) fails the <em>lookup</em>: not enough keys to
+      meet <code>expected_per_key</code>. This case fails the
+      <em>fetch</em>: lookup passes because D undercounts the
+      keyspace it needs (<code>tp_count = min(2, 4) = 2</code>, so D
+      only checks 2 of the 4 keys per chunk), but D's
+      <code>block_len</code> sizes are for 2-head slots while the keys
+      hold 1 head each. Mooncake's batch get returns negative codes
+      for the size-mismatched keys; the recv thread logs the failure
+      and breaks
+      (<span class="fileref">store/worker.py:737-750</span>), leaving
+      D's allocated blocks partially populated or empty. The scheduler
+      eventually recomputes the missing range, but the wasted
+      round-trip + the misallocation are both real costs.
+    </p>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;4.2 keyspace view &mdash; lookup passes, fetch sizes mismatch</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>Store</strong> (same as &sect;4.1, populated by TP=8 producer) &mdash; 4 keys per chunk, each <strong>1 head's bytes</strong>
+    </div>
+
+    <div class="cell-row" style="flex-wrap:wrap">
+      <div class="cell" style="min-width:150px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue); font-family:monospace; font-size:0.78em">
+        @tp_rank:0
+        <span class="lo">1 head: 0</span>
+      </div>
+      <div class="cell" style="min-width:150px; background:var(--green-soft); border-color:#abd1bb; color:var(--green); font-family:monospace; font-size:0.78em">
+        @tp_rank:1
+        <span class="lo">1 head: 1</span>
+      </div>
+      <div class="cell" style="min-width:150px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber); font-family:monospace; font-size:0.78em">
+        @tp_rank:2
+        <span class="lo">1 head: 2</span>
+      </div>
+      <div class="cell" style="min-width:150px; background:var(--red-soft); border-color:#e0b3ae; color:var(--red); font-family:monospace; font-size:0.78em">
+        @tp_rank:3
+        <span class="lo">1 head: 3</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 14px 0 6px 0; color:var(--red); font-family:monospace; font-size:0.9em">
+      &darr; D's lookup: <code>tp_count = min(2, 4) = 2</code> &mdash; only iterates tp = 0, 1 &darr;
+    </div>
+
+    <div class="cell-row" style="flex-wrap:wrap">
+      <div class="cell" style="min-width:150px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue); font-family:monospace; font-size:0.78em">
+        @tp_rank:0 &checkmark;
+      </div>
+      <div class="cell" style="min-width:150px; background:var(--green-soft); border-color:#abd1bb; color:var(--green); font-family:monospace; font-size:0.78em">
+        @tp_rank:1 &checkmark;
+      </div>
+      <div class="cell null" style="min-width:150px">
+        @tp_rank:2 &mdash; not checked
+      </div>
+      <div class="cell null" style="min-width:150px">
+        @tp_rank:3 &mdash; not checked
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 8px 0; font-size:0.86em; color:var(--green)">
+      <code>expected_per_key = 2</code>, <code>present_count = 2</code>
+      &rarr; lookup says <strong>PRESENT</strong>. D allocates, recv
+      thread proceeds.
+    </div>
+
+    <div style="text-align:center; margin: 10px 0 4px 0; color:var(--muted); font-family:monospace; font-size:0.9em">
+      &darr; D's <code>batch_get</code> with sizes from <code>db.prepare_value</code> &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D side</strong> &mdash; TP=2, each slot expects <strong>2 heads' bytes</strong> (packed)
+    </div>
+
+    <div class="cell-row">
+      <div class="cell label" style="min-width:80px">D0 slot:</div>
+      <div class="cell evicted" style="min-width:340px; font-family:monospace; font-size:0.84em">
+        &nbsp;&nbsp;asks for 2-heads payload at key @tp_rank:0
+        <span class="lo" style="color:var(--red)">store has 1-head payload &mdash; SIZE MISMATCH</span>
+      </div>
+    </div>
+    <div class="cell-row" style="margin-top:6px">
+      <div class="cell label" style="min-width:80px">D1 slot:</div>
+      <div class="cell evicted" style="min-width:340px; font-family:monospace; font-size:0.84em">
+        &nbsp;&nbsp;asks for 2-heads payload at key @tp_rank:1
+        <span class="lo" style="color:var(--red)">store has 1-head payload &mdash; SIZE MISMATCH</span>
+      </div>
+    </div>
+
+    <div class="diagram-caption">
+      Two failure surfaces stack. (1) D's lookup undercounts the
+      keyspace: <code>tp_count</code> uses D's own
+      <code>tp_size</code>, so D only checks tp_rank 0,1 and never
+      learns that the store also has 2,3 holding the heads D actually
+      needs. (2) Even for the two keys D does fetch, D's
+      per-rank-slot expects 2-heads-worth of bytes while the store
+      holds 1-head-worth &mdash; Mooncake errors on the size
+      mismatch. The lookup-passes-then-fetch-fails pattern is what
+      makes this harder to debug than &sect;4.3.
+    </div>
+  </div>
+
+  <p>
+    The root cause: when <code>tp_size &lt; num_kv_head</code> on
+    <em>either</em> side, that side's per-rank slot packs multiple
+    heads, and the store's "one key = one KV head's bytes"
+    abstraction breaks. P=8 with num_kv=4 is fine on its own (each
+    rank holds 1 head). D=2 with num_kv=4 is NOT &mdash; each rank
+    holds 2 heads, and the store has no concept of "fetch heads 0+1
+    together."
+  </p>
+
+  <h3>4.3 Worked example: TP<sub>P</sub>=2, TP<sub>D</sub>=8, 4 KV heads (lookup fails outright)</h3>
+
+  <p>
+    Now flip it: P undersharded (TP=2, each rank holds 2 KV heads), D
+    oversharded (TP=8, ranks pair up to replicate). Same
+    <code>num_kv_head=4</code>. This case <em>does not get a cache
+    hit</em>, and walking through why is the cleanest way to see the
+    store's constraint.
+  </p>
+
+  <p><strong>P side</strong> &mdash; each rank's key packs multiple heads:</p>
+
+<pre>
+num_kv_head=4, tp_size=2  &rarr;  4 &lt; 2 is False, so:
+                                head_or_tp_rank = tp_rank
+                                put_step = 1
+
+  P rank 0 &rarr; head_or_tp_rank=0   (holds KV heads 0 AND 1, packed)
+  P rank 1 &rarr; head_or_tp_rank=1   (holds KV heads 2 AND 3, packed)
+
+After all puts, store holds 2 keys per chunk hash:
+  "...@tp_rank:0@...@&lt;h&gt;"   (payload bytes = heads 0+1 concatenated)
+  "...@tp_rank:1@...@&lt;h&gt;"   (payload bytes = heads 2+3 concatenated)
+</pre>
+
+  <p>
+    Notice the asymmetry with the previous example: there's no
+    <code>put_step</code> dedup here, because each rank already holds
+    multiple heads, not a fraction. The key just labels "which P
+    rank's blob this is," and the blob contains whatever heads that
+    rank owned &mdash; the store has no idea those bytes are actually
+    two heads concatenated.
+  </p>
+
+  <p><strong>D side</strong> &mdash; expects one key per KV head:</p>
+
+<pre>
+num_kv_head=4, tp_size=8  &rarr;  4 &lt; 8 is True, so:
+                                put_step = 8 // 4 = 2
+                                head_or_tp_rank = tp_rank // 2
+
+  D rank 0,1 &rarr; head_or_tp_rank=0   (replicated full KV head 0)
+  D rank 2,3 &rarr; head_or_tp_rank=1   (replicated full KV head 1)
+  D rank 4,5 &rarr; head_or_tp_rank=2   (replicated full KV head 2)
+  D rank 6,7 &rarr; head_or_tp_rank=3   (replicated full KV head 3)
+
+D's lookup (worker.py:1200-1213):
+  tp_count = min(self.tp_size=8, num_kv_head=4) = 4
+
+  for chunk in [h1, h2, h3]:
+    for tp in [0, 1, 2, 3]:
+      candidate_keys.append(f"...@tp_rank:{tp}@...@{chunk}")
+  &rarr; 12 candidate keys (4 per chunk &times; 3 chunks)
+
+batch_is_exist:
+  tp_rank=0  &rarr;  exists  (P0 stored this)
+  tp_rank=1  &rarr;  exists  (P1 stored this)
+  tp_rank=2  &rarr;  MISSING
+  tp_rank=3  &rarr;  MISSING
+
+expected_per_key = max(1, 4 * 1) = 4
+present_count[(g, h1)] = 2  &lt; 4  &rarr;  NOT PRESENT
+present_count[(g, h2)] = 2  &lt; 4  &rarr;  NOT PRESENT
+present_count[(g, h3)] = 2  &lt; 4  &rarr;  NOT PRESENT
+
+hit_length = 0   &rarr;   D falls back to local prefill
+</pre>
+
+  <div class="callout bad">
+    <strong>Why the dedup check fails here</strong>
+    <p>
+      D expects the keyspace to be partitioned by KV head &mdash; one
+      key per head. P only produced two keys, each holding two heads.
+      Even if D were willing to fetch <code>tp_rank=0</code> and
+      <code>tp_rank=1</code> and call it good, the byte layout
+      wouldn't line up: D's per-rank KV cache slot is sized for one KV
+      head, not two. The
+      <code>expected_per_key</code> check fail-closes the whole chunk,
+      forcing a recompute rather than risking a torn load.
+    </p>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">&sect;4.3 keyspace view &mdash; expected keys exceed what P stored</div>
+
+    <div style="margin: 6px 0 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>P side</strong> &mdash; TP=2, no <code>put_step</code> dedup: each rank's key payload packs 2 heads
+    </div>
+
+    <div class="cell-row">
+      <div class="cell" style="min-width:140px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue)">
+        <strong>P0</strong>
+        <span class="lo">holds heads 0,1 packed</span>
+      </div>
+      <div class="cell" style="min-width:140px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber)">
+        <strong>P1</strong>
+        <span class="lo">holds heads 2,3 packed</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 10px 0 4px 0; color:var(--muted); font-family:monospace; font-size:0.9em">
+      &darr; <code>batch_put</code> &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>Store</strong> &mdash; only 2 keys per chunk, each <strong>2 heads' bytes</strong>
+    </div>
+
+    <div class="cell-row">
+      <div class="cell" style="min-width:150px; background:var(--blue-soft); border-color:#a6c8df; color:var(--blue); font-family:monospace; font-size:0.78em">
+        @tp_rank:0
+        <span class="lo">2 heads: 0,1</span>
+      </div>
+      <div class="cell" style="min-width:150px; background:var(--amber-soft); border-color:#e3c88a; color:var(--amber); font-family:monospace; font-size:0.78em">
+        @tp_rank:1
+        <span class="lo">2 heads: 2,3</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 14px 0 6px 0; color:var(--red); font-family:monospace; font-size:0.9em">
+      &darr; D's lookup: <code>tp_count = min(8, 4) = 4</code> &mdash; expects 4 keys &darr;
+    </div>
+
+    <div style="margin: 4px 0; font-size:0.85em; color:var(--muted)">
+      <strong>D's candidate keys</strong> for each chunk:
+    </div>
+
+    <div class="cell-row" style="flex-wrap:wrap">
+      <div class="cell match" style="min-width:140px; background:var(--green-soft); border-color:#abd1bb; color:var(--green); font-family:monospace; font-size:0.78em">
+        @tp_rank:0 &checkmark;
+        <span class="lo">found</span>
+      </div>
+      <div class="cell match" style="min-width:140px; background:var(--green-soft); border-color:#abd1bb; color:var(--green); font-family:monospace; font-size:0.78em">
+        @tp_rank:1 &checkmark;
+        <span class="lo">found</span>
+      </div>
+      <div class="cell evicted" style="min-width:140px; font-family:monospace; font-size:0.78em">
+        @tp_rank:2 &cross;
+        <span class="lo">missing</span>
+      </div>
+      <div class="cell evicted" style="min-width:140px; font-family:monospace; font-size:0.78em">
+        @tp_rank:3 &cross;
+        <span class="lo">missing</span>
+      </div>
+    </div>
+
+    <div style="text-align:center; margin: 8px 0; font-size:0.86em; color:var(--red)">
+      <code>expected_per_key = 4</code>,
+      <code>present_count = 2</code>
+      &rarr; <strong>NOT PRESENT</strong>. <code>hit_length = 0</code>
+      &mdash; D recomputes locally.
+    </div>
+
+    <div class="diagram-caption">
+      Compare with &sect;4.2: there, the lookup undercounted the
+      keyspace (D's <code>tp_count</code> was too small) and let a
+      false-positive cache hit through. Here, the lookup
+      overcounts &mdash; D's <code>tp_count = 4</code> expects four
+      head-indexed keys, but P could only produce two because each P
+      rank packed two heads under one key. The
+      <code>expected_per_key</code> check fail-closes the chunk
+      immediately. No fetch is attempted, no bytes are wasted on the
+      wire &mdash; just a clean recompute fallback. This is the
+      "fail-fast" mode the dedup check is designed to deliver.
+    </div>
+  </div>
+
+  <p>
+    The fix is on the <em>producer</em> side, not the consumer. If you
+    want hetero-TP cache hits, the producer must shard at least as
+    finely as <code>num_kv_head</code>:
+    <code>tp_size<sub>P</sub> &ge; num_kv_head</code>. Then P's keys
+    partition the keyspace by head, and any D with
+    <code>tp_size<sub>D</sub></code> a multiple/divisor of
+    <code>num_kv_head</code> can reconstruct what it needs.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>tp_size<sub>P</sub> vs num_kv</th>
+        <th>tp_size<sub>D</sub> vs num_kv</th>
+        <th>Cache hit?</th>
+        <th>Failure mode</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>&sect;4.1: TP<sub>P</sub>=8, TP<sub>D</sub>=4, n_kv=4</td>
+        <td>P &gt; n_kv (oversharded, dedups via put_step)</td>
+        <td>D = n_kv</td>
+        <td><strong>Yes</strong></td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td>&sect;4.2: TP<sub>P</sub>=8, TP<sub>D</sub>=2, n_kv=4</td>
+        <td>P &gt; n_kv</td>
+        <td>D &lt; n_kv (keys would need to pack multiple heads)</td>
+        <td><strong>No</strong> &mdash; lookup passes, fetch size mismatch</td>
+        <td>Wasted round-trip + recompute</td>
+      </tr>
+      <tr>
+        <td>&sect;4.3: TP<sub>P</sub>=2, TP<sub>D</sub>=8, n_kv=4</td>
+        <td>P &lt; n_kv (keys pack multiple heads)</td>
+        <td>D &gt; n_kv (replicated)</td>
+        <td><strong>No</strong> &mdash; lookup misses expected keys</td>
+        <td>Fail-fast recompute</td>
+      </tr>
+      <tr>
+        <td>Homogeneous: TP<sub>P</sub>=TP<sub>D</sub>=n_kv</td>
+        <td>P = n_kv</td>
+        <td>D = n_kv</td>
+        <td><strong>Yes</strong></td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td>Homogeneous oversharded: TP<sub>P</sub>=TP<sub>D</sub>&gt;n_kv</td>
+        <td>P &gt; n_kv</td>
+        <td>D &gt; n_kv (same put_step)</td>
+        <td><strong>Yes</strong></td>
+        <td>&mdash;</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Rule of thumb: <strong>both sides must satisfy
+    <code>tp_size &ge; num_kv_head</code></strong>. Above that
+    threshold each rank holds at most one KV head, and the store's
+    "one key = one head's bytes" invariant holds for both producer
+    and consumer. Below it, each rank packs multiple heads into one
+    key and the keyspace stops being head-indexed &mdash; lookups
+    either over- or under-count what's actually there. Note that the
+    failure modes are <em>asymmetric</em>: when only D is
+    undersharded (&sect;4.2) the lookup misleads you into thinking
+    the cache is hot before the fetch fails; when only P is
+    undersharded (&sect;4.3) you fail fast at lookup. The first is
+    worse to debug.
+  </p>
+
+  <h2 id="mla">5. MLA: replicated cache short-circuit</h2>
+
+  <p>
+    Multi-Latent Attention (Deepseek-style) is special: its compressed
+    KV is small enough that vLLM replicates it across TP ranks instead
+    of sharding. So MLA has the same KV on every TP rank.
+  </p>
+
+  <p>
+    Implications for the transfer plane:
+  </p>
+
+  <ul>
+    <li>
+      <strong>NIXL</strong>: <code>compute_tp_mapping</code> hits the MLA
+      branch (<span class="fileref">nixl/tp_mapping.py:79-84</span>) and
+      uses a single remote rank for any local rank &mdash; no
+      head-dimension split, no offset. With TP<sub>P</sub>=4 and
+      TP<sub>D</sub>=2, D's rank 0 reads from P's rank 0 only, D's rank
+      1 reads from P's rank 1 only.
+    </li>
+    <li>
+      <strong>Mooncake pipe</strong>: there's a
+      <code>producer_cache_replicated</code> flag threaded through the
+      planning function. When true, only one local rank actually
+      transfers (the <code>local_tp_rank % tp_ratio == 0</code> rank);
+      others no-op &mdash; replicated data, no need to ship twice.
+    </li>
+    <li>
+      <strong>Mooncake store</strong>: each TP rank still puts its own
+      key, even though the bytes are identical &mdash; this gives the
+      store its bandwidth budget back through dedup
+      (<code>batch_is_exist</code> catches the duplicate before put).
+    </li>
+  </ul>
+
+  <h2 id="gqa">6. GQA: deduplicate redundant shards</h2>
+
+  <p>
+    Grouped-Query Attention has fewer KV heads than Q heads. With
+    <code>num_kv_heads &lt; tp_size</code>, the convention is to
+    replicate KV heads across TP ranks: 8 ranks but only 4 KV heads
+    means ranks (0,1) share KV head 0, ranks (2,3) share KV head 1, etc.
+  </p>
+
+  <p>
+    NIXL handles this in <code>compute_tp_mapping</code>
+    (<span class="fileref">nixl/tp_mapping.py:88-95</span>):
+  </p>
+
+<pre><code>heads = np.arange(start, start + abs_tp) * total_num_kv_heads // remote_tp_size
+_, unique_idx = np.unique(heads, return_index=True)
+attn_ranks = (start + np.sort(unique_idx)).tolist()
+</code></pre>
+
+  <p>
+    <code>heads</code> computes which logical KV head each remote rank
+    holds; <code>np.unique</code> keeps only the first rank per unique
+    head. The result is the minimal set of remote ranks D must read
+    from to cover all needed heads. Without this, D would issue
+    redundant <code>READ</code>s for the same bytes.
+  </p>
+
+  <p>
+    Both Mooncake variants achieve the same thing organically: the pipe
+    via the same arithmetic on TP ratios, the store via
+    <code>tp_count = min(self.tp_size, self.num_kv_head)</code> which
+    caps the iteration at the actual number of KV heads.
+  </p>
+
+  <h2 id="mamba">7. Mamba: three-projection conv state</h2>
+
+  <p>
+    Mamba's KV "cache" is a recurrent state (SSM state plus conv state).
+    With TP, conv state is decomposed into three projections &mdash; x,
+    B, C &mdash; each TP-sharded along its own axis. When P and D have
+    different TP sizes, each projection must be re-sharded individually.
+  </p>
+
+  <p>
+    NIXL handles this in <code>_build_mamba_remote</code>
+    (<span class="fileref">nixl/worker.py:1054-1097</span>):
+  </p>
+
+<pre><code>local_offset = self.tp_rank % effective_ratio
+conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
+# Each D rank reads its TP-shard of each conv projection
+</code></pre>
+
+  <p>
+    The SSM (recurrent) state is treated separately from conv state
+    &mdash; <code>ssm_ranks</code> and <code>attn_ranks</code> are
+    computed independently in <code>compute_tp_mapping</code>. A
+    full-attention + Mamba hybrid model produces transfers from
+    different remote ranks for the two block groups.
+  </p>
+
+  <div class="callout warn">
+    <strong>Mamba pre-emption hazard</strong>
+    <p>
+      Mamba state is non-block-aligned and not rewindable like attention
+      KV. If P pre-empts and re-prefills, the state recomputation must
+      reach the exact same numeric value as before, or D will get a
+      torn transfer. The transfer plane assumes this works &mdash; see
+      <a href="../MAMBA.html">MAMBA.html</a> for the assumptions it
+      relies on. Don't disaggregate Mamba models you don't understand
+      yet.
+    </p>
+  </div>
+
+  <h2 id="pp">8. PP across P and D</h2>
+
+  <p>
+    Pipeline parallelism is much easier than TP for the transfer plane.
+    Each PP stage owns a contiguous range of layers; the KV for layer
+    <em>L</em> lives only on the PP rank that owns <em>L</em>. So a P
+    cluster with PP=2 has rank 0 holding KV for layers
+    <code>[0..N/2)</code> and rank 1 holding KV for layers
+    <code>[N/2..N)</code>.
+  </p>
+
+  <p>
+    All three transports embed the PP rank in their addressing:
+  </p>
+
+  <ul>
+    <li>
+      <strong>NIXL</strong>: a P PP rank registers only its own subset
+      of KV memory. The handshake exchanges per-layer info via
+      <code>block_lens</code>. D's TP mapping naturally targets
+      "P's rank that owns this layer's KV".
+    </li>
+    <li>
+      <strong>Mooncake pipe</strong>: bootstrap registry indexes by
+      <code>(dp_rank, tp_rank, pp_rank)</code>
+      (<span class="fileref">mooncake_utils.py:38-41</span>); each PP
+      rank registers its own ZMQ address.
+    </li>
+    <li>
+      <strong>Mooncake store</strong>: the key includes
+      <code>@pp_rank:k</code>. PP is just another dimension of the
+      key space.
+    </li>
+  </ul>
+
+  <p>
+    The trickiness with PP shows up only when PP<sub>P</sub> &ne;
+    PP<sub>D</sub> &mdash; e.g., P has PP=2, D has PP=1. Then D's single
+    rank must fetch layer ranges from <em>two</em> P ranks. In practice
+    this is rare (P and D usually agree on layer partitioning) and
+    handled by the same per-rank descriptor machinery as TP.
+  </p>
+
+  <h2 id="dp">9. DP and engine routing</h2>
+
+  <p>
+    Data parallelism runs multiple <em>engines</em>. Each engine has its
+    own TP/PP layout, model state, and KV cache. With P/D
+    disaggregation, you typically have multiple P engines and multiple
+    D engines:
+  </p>
+
+  <ul>
+    <li>
+      A frontend router decides which D engine gets the request.
+    </li>
+    <li>
+      That request's prefill happened on <em>some</em> P engine.
+      The <code>kv_transfer_params</code> identifies which one (engine
+      ID, host, port).
+    </li>
+    <li>
+      D's worker contacts that specific P engine. All connectors
+      handle this by treating each engine pair as an independent
+      handshake / agent.
+    </li>
+  </ul>
+
+  <p>
+    In Mooncake pipe, the bootstrap server actually keys by
+    <code>dp_rank</code> first, so multiple DP groups can share a
+    single endpoint:
+  </p>
+
+<pre><code># mooncake_utils.py:91-96
+if payload.dp_rank not in self.workers:
+    self.workers[payload.dp_rank] = EngineEntry(
+        engine_id=payload.engine_id,
+        worker_addr={},
+    )
+</code></pre>
+
+  <p>
+    In the store, DP isn't even visible at the connector layer &mdash;
+    every engine independently puts and gets keyed by content hash, and
+    the store dedups across DP groups for free.
+  </p>
+
+  <h2 id="cheat">10. Cheat sheet</h2>
+
+  <table>
+    <thead>
+      <tr><th>Scenario</th><th>NIXL</th><th>Mooncake pipe</th><th>Mooncake store</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>TP<sub>P</sub> = TP<sub>D</sub></td>
+        <td>1:1 read per request</td>
+        <td>1:1 push per request</td>
+        <td>1:1 keys</td>
+      </tr>
+      <tr>
+        <td>TP<sub>P</sub> &gt; TP<sub>D</sub> (D gathers)</td>
+        <td>Multiple READs per request (one per source rank)</td>
+        <td>Single push from each source rank, validated by region length</td>
+        <td>D iterates over source TP indices in candidate-key lookup</td>
+      </tr>
+      <tr>
+        <td>TP<sub>P</sub> &lt; TP<sub>D</sub> (D takes a fraction)</td>
+        <td>Head-dim split via <code>rank_offset_factor</code></td>
+        <td>Source-offset split via <code>_compute_sender_transfer_plan</code></td>
+        <td>Multiple D ranks read same key into different slices &mdash; dedup at store level</td>
+      </tr>
+      <tr>
+        <td>MLA</td>
+        <td>One-to-one (replicated cache flag)</td>
+        <td><code>producer_cache_replicated=True</code> path</td>
+        <td>Each rank puts; dedup catches it</td>
+      </tr>
+      <tr>
+        <td>GQA</td>
+        <td><code>np.unique</code> dedup in <code>compute_tp_mapping</code></td>
+        <td>Same arithmetic on the ratio</td>
+        <td><code>min(tp_size, num_kv_head)</code> caps the iteration</td>
+      </tr>
+      <tr>
+        <td>Mamba</td>
+        <td>Separate <code>ssm_ranks</code> + 3-projection conv math</td>
+        <td>Supported but model-specific path</td>
+        <td>Group-based keys handle naturally; depends on coordinator</td>
+      </tr>
+      <tr>
+        <td>PP mismatch</td>
+        <td>Per-PP-rank descriptors at registration</td>
+        <td>Per-PP-rank ZMQ address in bootstrap</td>
+        <td>Per-PP-rank in key, iterated at lookup</td>
+      </tr>
+      <tr>
+        <td>DP</td>
+        <td>Engine ID in handshake</td>
+        <td><code>dp_rank</code> in bootstrap</td>
+        <td>Invisible &mdash; content-addressed</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <strong>The big picture</strong>
+    <p>
+      All three connectors solve the same problem, but they place the
+      complexity in different places. NIXL and Mooncake pipe pay it at
+      handshake time (compute a plan, validate layouts, error
+      early). Mooncake store defers it to lookup time (ask the store,
+      take what's there). Each choice has consequences: precomputed
+      plans are faster per request but rigid; lookup-driven plans
+      tolerate cluster churn but make a chattier control path. Match
+      the choice to your deployment.
+    </p>
+  </div>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Back to the <a href="index.html">transfer index</a> or up to the
+    parent <a href="../index.html">KV Cache notes</a>.
+  </p>
+</main>
+</body>
+</html>

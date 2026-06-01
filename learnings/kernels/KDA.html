@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reading the KDA Kernel — Kimi Delta Attention</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  /* page-local helpers */
+  .sk { /* "shape key" inline */
+    font-family: "SF Mono", Monaco, monospace; font-size: 0.82em;
+    background: var(--code); border-radius: 3px; padding: 1px 5px; color: var(--violet);
+  }
+  .matrix { display: inline-grid; gap: 2px; margin: 6px 0; background: var(--border);
+    padding: 2px; border-radius: 5px; vertical-align: middle; }
+  .matrix .mcell { background: var(--panel); font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.78em; padding: 5px 8px; text-align: center; min-width: 34px; border-radius: 2px; }
+  .matrix .mcell.hl { background: var(--blue-soft); color: var(--blue); }
+  .matrix .mcell.hl2 { background: var(--amber-soft); color: var(--amber); }
+  .matrix .mcell.z { color: var(--muted); }
+  .mlabel { font-size: 0.8em; color: var(--muted); font-family: "SF Mono", Monaco, monospace; }
+  .pathtag { display:inline-block; font-family:"SF Mono",Monaco,monospace; font-size:0.74em;
+    padding:1px 7px; border-radius:4px; margin-right:4px; }
+  .pathtag.dec { background: var(--green-soft); border:1px solid #abd1bb; color: var(--green); }
+  .pathtag.pre { background: var(--blue-soft); border:1px solid #a6c8df; color: var(--blue); }
+  .kgrid { display:grid; grid-template-columns: 130px 1fr; gap:4px 12px; align-items:center; margin:10px 0; font-size:0.9em; }
+  .kgrid .kk { font-family:"SF Mono",Monaco,monospace; font-size:0.86em; color:var(--violet); text-align:right; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../">&larr; learnings</a> &nbsp;|&nbsp; kernels &nbsp;|&nbsp;
+    source: <span class="fileref">vllm/model_executor/layers/fla/ops/kda.py</span>
+  </div>
+
+  <h1>Reading the KDA Kernel</h1>
+  <p class="subtitle">
+    Kimi Delta Attention — a per-channel gated delta-rule linear attention, in Triton.
+    A guided tour of <em>what goes in, what comes out, and every step in between</em>,
+    with worked numeric examples. Grounded line-by-line in vLLM source.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Want the actual Triton, annotated?</strong>
+    This page is the <em>what &amp; why</em>. Its companion <a href="KDA_CODE.html">KDA_CODE.html</a> is a
+    line-by-line walk-through of three real kernels — start there if you're learning to read kernel code.
+  </div>
+
+  <div class="tldr">
+    <strong>TL;DR</strong>
+    KDA is <em>linear attention</em>: instead of an O(T²) softmax over all past tokens, each head
+    keeps a fixed-size <b>state matrix</b> <span class="sk">S ∈ ℝ^{V×K}</span> (128×128) that is updated
+    one token at a time. The update is the <b>delta rule</b> (write the prediction error, not the raw
+    value) plus a <b>per-channel forget gate</b> (each of the 128 key-dimensions decays independently).
+    Two implementations compute the <em>same</em> math: a token-by-token <span class="pathtag dec">recurrent</span>
+    kernel for decode, and a <span class="pathtag pre">chunked</span> kernel that batches 64 tokens into
+    matmuls for prefill. The gate is what makes it "Kimi": it is a fine-grained <em>vector</em>, not the
+    scalar of Gated DeltaNet / Mamba-2.
+  </div>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#bigpic">1. Where KDA sits</a></li>
+      <li><a href="#layer">2. The layer around the kernel</a></li>
+      <li><a href="#io">3. Kernel inputs &amp; outputs</a></li>
+      <li><a href="#math">4. The core recurrence (the 4 lines)</a></li>
+      <li><a href="#example">5. Worked decode example</a></li>
+      <li><a href="#gate">6. How the gate is built</a></li>
+      <li><a href="#decode">7. Decode path: <code>fused_recurrent_kda</code></a></li>
+      <li><a href="#chunk">8. Prefill path: <code>chunk_kda</code> (5 sub-kernels)</a></li>
+      <li><a href="#exp2">9. The exp2 / cumsum trick</a></li>
+      <li><a href="#reading">10. Reading tips &amp; file map</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="bigpic">1. Where KDA sits</h2>
+
+  <p>
+    Kimi-Linear interleaves two kinds of token-mixing layers. ~3 out of every 4 layers are
+    <b>KDA</b> (linear, constant-memory); the rest are ordinary full softmax attention (MLA). In the
+    released <span class="mono">Kimi-Linear-48B-A3B</span> there are 27 layers: 20 KDA, 7 full-attention.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Softmax attention (the other 7 layers)</h3>
+      <ul>
+        <li>Keeps <b>every</b> past K/V in the cache.</li>
+        <li>Cost grows with sequence length: O(T²) compute, O(T) memory.</li>
+        <li>Token <code>t</code> can look back at all tokens exactly.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>KDA linear attention (the 20 layers)</h3>
+      <ul>
+        <li>Compresses the past into a fixed <b>state</b> <span class="sk">S: 128×128</span> per head.</li>
+        <li>Cost is O(T) compute, <b>O(1) memory</b> in sequence length.</li>
+        <li>The state is a lossy, gated running summary — old info decays.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The family tree</strong>
+    Linear attention → + delta rule (DeltaNet) → + a forget gate (Gated DeltaNet, used by Qwen3-Next/Mamba-2)
+    → make the gate <em>per-channel</em> instead of scalar = <b>KDA</b>. The vLLM kernel literally reuses the
+    Gated-DeltaNet recurrent kernel and flips an <code>IS_KDA</code> flag to switch the gate from a scalar
+    multiply to a per-K-dimension vector multiply.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="layer">2. The layer around the kernel</h2>
+
+  <p>
+    Before any KDA kernel runs, the layer
+    (<span class="fileref">mamba/gdn/kimi_gdn_linear_attn.py</span>,
+    <code>KimiGatedDeltaNetAttention</code>) turns the hidden state into the kernel's inputs. Knowing this
+    pipeline tells you <em>where each kernel argument comes from</em>.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Per-token data flow inside one KDA layer</div>
+    <div class="flow">
+      <div class="flow-step b"><span class="num">IN</span>hidden_states<br><span class="mono">[T, 2304]</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><span class="num">PROJECT</span>q,k,v = q/k/v_proj<br><span class="mono">[T, 32·128]</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step a"><span class="num">SHORT CONV</span>causal conv1d (k=4)<br>+ SiLU, per channel</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><span class="num">CORE</span>KDA kernel<br>chunk <em>or</em> recurrent</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><span class="num">OUT GATE</span>o_norm: RMSNorm<br>× sigmoid(g2)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step b"><span class="num">OUT</span>o_proj<br><span class="mono">[T, 2304]</span></div>
+    </div>
+    <div class="diagram-caption">
+      Two side-projections feed the kernel: the <b>decay gate</b> g1 (low-rank
+      <code>f_a_proj→f_b_proj</code>) and <b>beta</b> (<code>b_proj</code>, then sigmoid). A separate
+      <b>output gate</b> g2 (<code>g_a_proj→g_b_proj</code>) is applied <em>after</em> the kernel.
+    </div>
+  </div>
+
+  <p>The exact lines that prepare and dispatch the kernel
+  (<a href="../../vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py">forward</a>, paraphrased):</p>
+
+<pre><code><span class="c"># projections (per token)</span>
+q, k, v = q_proj(h), k_proj(h), v_proj(h)        <span class="c"># each [T, 4096] → view [1,T,32,128]</span>
+beta    = b_proj(h).<span class="fn">sigmoid</span>()                 <span class="c"># [1, T, 32]   scalar write-strength per head</span>
+g1      = f_b_proj(f_a_proj(h))                  <span class="c"># [1, T, 32, 128]  raw per-channel decay logits</span>
+g2      = g_b_proj(g_a_proj(h))                  <span class="c"># [1, T, 32, 128]  output gate (used later)</span>
+
+<span class="c"># short depthwise causal conv smooths q/k/v over the last 4 tokens, then SiLU</span>
+q, k, v = causal_conv1d(q,k,v, activation=<span class="s">"silu"</span>)
+
+<span class="k">if</span> prefill:                                       <span class="c"># at least one sequence is processing many tokens</span>
+    o, new_state = <span class="fn">chunk_kda_with_fused_gate</span>(q,k,v, raw_g=g1, beta=beta,
+                       A_log=self.A_log, g_bias=self.dt_bias,
+                       initial_state=state, use_qk_l2norm_in_kernel=<span class="k">True</span>,
+                       cu_seqlens=query_start_loc)
+<span class="k">else</span>:                                             <span class="c"># pure decode: 1 new token per sequence</span>
+    g1 = <span class="fn">fused_kda_gate</span>(g1, A_log, head_dim, g_bias=dt_bias)   <span class="c"># gate applied up front</span>
+    o, new_state = <span class="fn">fused_recurrent_kda</span>(q,k,v, g=g1, beta=beta,
+                       initial_state=state, use_qk_l2norm_in_kernel=<span class="k">True</span>,
+                       cu_seqlens=..., ssm_state_indices=...)</code></pre>
+
+  <div class="callout">
+    <strong>Two L2-norm + scale details that live inside the kernel</strong>
+    <code>use_qk_l2norm_in_kernel=True</code> means q and k are L2-normalized <em>per head</em> right before
+    use, and q is multiplied by <code>scale = 1/√128</code>. You will not see a separate norm op — it is
+    fused into the first few lines of every KDA kernel.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="io">3. Kernel inputs &amp; outputs</h2>
+
+  <p>Using the released config (<span class="mono">head_dim K=V=128</span>, <span class="mono">H=32 heads</span>,
+  chunk size <span class="mono">BT=64</span>). With continuous batching, <code>B=1</code> and all sequences are
+  flattened into one axis <code>T</code> delimited by <code>cu_seqlens</code>.</p>
+
+  <table>
+    <thead><tr><th>Tensor</th><th>Shape</th><th>Meaning</th><th>Comes from</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">q</td><td class="mono">[1, T, 32, 128]</td><td>query, L2-normed &amp; scaled in-kernel</td><td>q_proj → conv → SiLU</td></tr>
+      <tr><td class="mono">k</td><td class="mono">[1, T, 32, 128]</td><td>key, L2-normed in-kernel</td><td>k_proj → conv → SiLU</td></tr>
+      <tr><td class="mono">v</td><td class="mono">[1, T, 32, 128]</td><td>value to be stored</td><td>v_proj → conv → SiLU</td></tr>
+      <tr><td class="mono">g</td><td class="mono">[1, T, 32, 128]</td><td><b>per-channel</b> log-decay (one per K-dim)</td><td>f_a→f_b proj, then <a href="#gate">gate fn</a></td></tr>
+      <tr><td class="mono">beta</td><td class="mono">[1, T, 32]</td><td>delta-rule write strength ∈ (0,1)</td><td>b_proj → sigmoid</td></tr>
+      <tr><td class="mono">A_log</td><td class="mono">[1, 1, 32, 1]</td><td>learned per-head decay base</td><td>parameter</td></tr>
+      <tr><td class="mono">dt_bias</td><td class="mono">[32·128]</td><td>per-channel gate bias</td><td>parameter</td></tr>
+      <tr><td class="mono">scale</td><td class="mono">scalar</td><td><code>1/√128 ≈ 0.0884</code></td><td>computed</td></tr>
+      <tr><td class="mono">initial_state</td><td class="mono">[N, 32, 128, 128]</td><td>the recurrent state S per seq/head <span class="sk">[V,K]</span></td><td>paged mamba cache</td></tr>
+      <tr><td class="mono">cu_seqlens</td><td class="mono">[N+1]</td><td>where each of the N sequences starts in T</td><td>attn metadata</td></tr>
+      <tr><td class="mono">ssm_state_indices</td><td class="mono">[…]</td><td>which cache slot each sequence's state lives in</td><td>attn metadata</td></tr>
+    </tbody>
+  </table>
+
+  <h4>Outputs</h4>
+  <div class="kgrid">
+    <div class="kk">o</div><div><span class="sk">[1, T, 32, 128]</span> — the attention output per token, before the output gate and <code>o_proj</code>.</div>
+    <div class="kk">final_state</div><div><span class="sk">[N, 32, 128, 128]</span> — the updated state S for each sequence, written back to the paged cache so the next forward continues the recurrence.</div>
+  </div>
+
+  <div class="callout info">
+    <strong>The state is the whole point</strong>
+    Softmax attention stores a growing KV cache. KDA stores exactly <span class="sk">32 × 128 × 128</span> floats
+    per sequence <em>regardless of how long the sequence is</em>. That one matrix per head <em>is</em> the
+    compressed memory of everything seen so far.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="math">4. The core recurrence (the 4 lines)</h2>
+
+  <p>
+    Every KDA kernel — recurrent or chunked — computes this exact per-token update. <span class="sk">S</span>
+    is the <span class="mono">[V, K]</span> state for one head. Read <code>⊙</code> as elementwise, <code>⊗</code>
+    as outer product.
+  </p>
+
+  <div class="eq">
+    <b>(a) decay</b> &nbsp;&nbsp;&nbsp; S ← S ⊙ exp(g)<sub>broadcast over V</sub> &nbsp;&nbsp; <span class="c"># each K-column scaled by its own gate</span><br>
+    <b>(b) delta</b> &nbsp;&nbsp;&nbsp; u = β · ( v − S·k ) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="c"># prediction error, scaled by write strength</span><br>
+    <b>(c) write</b> &nbsp;&nbsp;&nbsp; S ← S + u ⊗ k &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="c"># rank-1 update: store the corrected value at key k</span><br>
+    <b>(d) read</b> &nbsp;&nbsp;&nbsp;&nbsp; o = S·q &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="c"># query the updated state</span>
+  </div>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Why "delta rule"?</h3>
+      <p>Naïve linear attention writes <code>S += v ⊗ k</code> — it appends every value. The delta rule first
+      <em>reads what it would predict</em> for key <code>k</code> (that's <code>S·k</code>), then writes only the
+      <b>error</b> <code>v − S·k</code>. This makes the state <em>overwrite</em> stale associations for a key
+      rather than pile up — like one step of online gradient descent on a key→value memory.</p>
+    </div>
+    <div class="box">
+      <h3>Why the gate?</h3>
+      <p>Step (a) multiplies the state by <code>exp(g)</code> with <code>g ≤ 0</code>, so <code>exp(g) ∈ (0,1]</code>:
+      a forget factor. In KDA <code>g</code> is a <b>vector of length K=128</b> — every key-dimension forgets at
+      its own learned, input-dependent rate. That is the KDA difference; Gated DeltaNet uses one scalar per head.</p>
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>These 4 lines, verbatim, in the decode kernel</strong>
+    <span class="fileref">fused_recurrent.py:135–148</span>
+<pre><code>b_h *= <span class="fn">exp</span>(b_gk[<span class="k">None</span>, :])        <span class="c"># (a) per-K-channel decay   b_h is [BV, BK] = [V, K]</span>
+b_v -= tl.<span class="fn">sum</span>(b_h * b_k[<span class="k">None</span>, :], 1) <span class="c"># (b) v - S·k   (sum over K)</span>
+b_v *= b_beta                       <span class="c"># (b) × β</span>
+b_h += b_v[:, <span class="k">None</span>] * b_k[<span class="k">None</span>, :]  <span class="c"># (c) S += u ⊗ k</span>
+b_o  = tl.<span class="fn">sum</span>(b_h * b_q[<span class="k">None</span>, :], 1) <span class="c"># (d) o = S·q</span></code></pre>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="example">5. Worked decode example</h2>
+
+  <p>
+    Let's shrink to <span class="mono">K = V = 2</span> and walk two tokens through the recurrence by hand.
+    Start with empty state <code>S = 0</code>, <code>scale = 1</code> (so we can see the arithmetic).
+  </p>
+
+  <h4>Token 1 &nbsp;<span class="mlabel">k=[1, 0], v=[2, 3], β=0.5, exp(g)=[0.9, 0.8], q=[1, 0]</span></h4>
+  <ol class="steps">
+    <li><b>decay:</b> S is still 0, so 0 ⊙ [0.9, 0.8] = 0. Nothing to forget yet.</li>
+    <li><b>delta:</b> S·k = 0, so the error is <code>v − 0 = [2, 3]</code>.
+        Scale by β: <code>u = 0.5·[2,3] = [1, 1.5]</code>.</li>
+    <li><b>write:</b> <code>u ⊗ k = [1,1.5] ⊗ [1,0]</code> writes <code>u</code> into the <em>column for key-dim 0</em>:
+      <div class="mlabel">S =</div>
+      <span class="matrix" style="grid-template-columns:repeat(2,auto)">
+        <span class="mcell hl">1</span><span class="mcell z">0</span>
+        <span class="mcell hl">1.5</span><span class="mcell z">0</span>
+      </span>
+    </li>
+    <li><b>read:</b> <code>o = S·q = S·[1,0]</code> picks column 0 → <code>o = [1, 1.5]</code>.</li>
+  </ol>
+
+  <h4>Token 2 &nbsp;<span class="mlabel">k=[0, 1], v=[1, 1], β=1.0, exp(g)=[0.9, 0.8], q=[0, 1]</span></h4>
+  <ol class="steps">
+    <li><b>decay:</b> scale each column by its gate (<code>col0×0.9</code>, <code>col1×0.8</code>):
+      <span class="matrix" style="grid-template-columns:repeat(2,auto)">
+        <span class="mcell hl">0.9</span><span class="mcell z">0</span>
+        <span class="mcell hl">1.35</span><span class="mcell z">0</span>
+      </span>
+      The memory written for key-dim 0 has faded ~10%.
+    </li>
+    <li><b>delta:</b> <code>S·k</code> with <code>k=[0,1]</code> reads column 1 → <code>[0, 0]</code>.
+        Error <code>= v − [0,0] = [1,1]</code>, β=1 → <code>u = [1, 1]</code>.</li>
+    <li><b>write:</b> <code>u ⊗ k</code> writes into column 1:
+      <span class="matrix" style="grid-template-columns:repeat(2,auto)">
+        <span class="mcell hl">0.9</span><span class="mcell hl2">1</span>
+        <span class="mcell hl">1.35</span><span class="mcell hl2">1</span>
+      </span>
+    </li>
+    <li><b>read:</b> <code>o = S·q = S·[0,1]</code> picks column 1 → <code>o = [1, 1]</code>.</li>
+  </ol>
+
+  <div class="callout good">
+    <strong>What you just saw</strong>
+    Each distinct key direction owns a "column" of the state. Writing at a new key fills its column; the
+    gate slowly fades older columns; reading with a query is a dot-product lookup across columns. The delta
+    rule (step b) means re-writing the <em>same</em> key replaces rather than accumulates — try repeating a key
+    and watch <code>S·k</code> become non-zero, shrinking the error.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="gate">6. How the gate is built</h2>
+
+  <p>
+    The kernel consumes <code>g</code> as a finished log-decay, but it is assembled from three learned pieces.
+    This is the Mamba-style discretization, done <b>per channel</b>
+    (<span class="fileref">kda.py</span> <code>kda_gate_fwd_kernel</code> / <code>fused_kda_gate</code>):
+  </p>
+
+  <div class="eq">
+    g_raw = f_b_proj( f_a_proj(h) )  +  dt_bias &nbsp;&nbsp; <span class="c"># [T, 32, 128] low-rank logits + per-channel bias</span><br>
+    g = <b>−exp(A_log)</b> · <b>softplus</b>(g_raw) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="c"># A_log per head, softplus per channel</span>
+  </div>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>−exp(A_log)</h3>
+      <p><code>A = −exp(A_log)</code> is guaranteed <b>negative</b>. It is the per-head base decay rate, learned.
+      Negative ⇒ <code>g ≤ 0</code> ⇒ <code>exp(g) ∈ (0,1]</code> is a valid forget factor.</p>
+    </div>
+    <div class="box">
+      <h3>softplus(g_raw)</h3>
+      <p><code>softplus(x)=log(1+eˣ) ≥ 0</code> is the per-token, per-channel "Δt". Large input ⇒ big timestep
+      ⇒ strong forget. The kernel uses the linear approximation <code>softplus(x)≈x</code> when
+      <code>x &gt; 20</code> to avoid overflow.</p>
+    </div>
+    <div class="box">
+      <h3>per-channel</h3>
+      <p>Because <code>g_raw</code> has shape <span class="mono">[…, 128]</span>, every key-dimension gets its own
+      decay. That vector <code>g</code> is exactly the <code>exp(g)</code> applied column-wise in step (a).</p>
+    </div>
+  </div>
+
+  <p>
+    The corresponding source (linear region picked when <code>β·x &gt; threshold</code>):
+  </p>
+<pre><code><span class="c"># kda.py — fused_kda_gate / kda_gate_fwd_kernel</span>
+b_a = -tl.<span class="fn">exp</span>(A_log)                                 <span class="c"># per-head, negative</span>
+g_scaled = b_g * beta
+sp = tl.<span class="fn">where</span>(g_scaled &gt; threshold, b_g,             <span class="c"># softplus, with linear tail</span>
+              (1.0 / beta) * <span class="fn">log</span>(1.0 + tl.<span class="fn">exp</span>(g_scaled)))
+b_y = b_a * sp                                       <span class="c"># = g, the per-channel log-decay</span></code></pre>
+
+  <div class="callout">
+    <strong>Two different "gates", don't confuse them</strong>
+    <code>g</code> / <code>g1</code> here is the <b>decay gate</b> inside the recurrence (step a). The separate
+    <code>g2</code> from <code>g_a_proj/g_b_proj</code> is the <b>output gate</b>, applied <em>after</em> the kernel
+    by <code>o_norm</code> as <code>RMSNorm(o) × sigmoid(g2)</code>. And <code>β</code> (from <code>b_proj</code>)
+    is yet another scalar — the delta-rule write strength in step (b).
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="decode">7. Decode path: <span class="mono">fused_recurrent_kda</span></h2>
+
+  <p>
+    <span class="pathtag dec">DECODE</span> Used when every sequence contributes just 1 (or a few) new tokens.
+    One Triton program per <span class="mono">(sequence, head)</span>, looping over the sequence's tokens and
+    doing the 4-line update each step. <span class="fileref">fused_recurrent.py:27</span>,
+    dispatched with <code>IS_KDA=True</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">grid = (NK=1, NV, N·HV) — one program owns a [BV, K] slice of the state</div>
+    <div class="diagram-row" style="justify-content:center;flex-wrap:wrap">
+      <span class="cell label">state S [V,K]</span>
+      <span class="cell used">BV=8 rows</span>
+      <span class="cell free">8</span>
+      <span class="cell free">8</span>
+      <span class="cell free">…</span>
+      <span class="cell free">8</span>
+      <span class="mlabel" style="margin-left:8px">V=128 split into NV=16 row-blocks; K=128 kept whole (BK=128)</span>
+    </div>
+    <div class="diagram-caption">
+      Each program holds <code>b_h</code> of shape <span class="mono">[BV=8, BK=128]</span> in registers and marches
+      through time. <code>BV</code> is capped at 8 (vs 32 for plain GDN) to keep the per-channel gate's register
+      pressure down — see <code>fused_recurrent_kda_fwd</code> line <span class="mono">BV = min(npo2(V), 8)</span>.
+    </div>
+  </div>
+
+  <h4>The loop, annotated</h4>
+<pre><code>b_h = load(initial_state[slot])          <span class="c"># [BV, K], the carried state for this seq+head</span>
+<span class="k">for</span> t <span class="k">in</span> range(T):                       <span class="c"># T tokens of this sequence</span>
+    b_q, b_k, b_v = load q[t], k[t], v[t]
+    b_q = l2norm(b_q); b_k = l2norm(b_k)  <span class="c"># USE_QK_L2NORM_IN_KERNEL</span>
+    b_q = b_q * scale
+    b_gk = load g[t]                      <span class="c"># [K]  per-channel decay (already = −exp(A_log)·softplus)</span>
+    b_h *= <span class="fn">exp</span>(b_gk[<span class="k">None</span>, :])             <span class="c"># (a)</span>
+    b_v -= tl.<span class="fn">sum</span>(b_h * b_k[<span class="k">None</span>, :], 1)  <span class="c"># (b)</span>
+    b_v *= b_beta                         <span class="c"># (b)</span>
+    b_h += b_v[:, <span class="k">None</span>] * b_k[<span class="k">None</span>, :]   <span class="c"># (c)</span>
+    b_o  = tl.<span class="fn">sum</span>(b_h * b_q[<span class="k">None</span>, :], 1)  <span class="c"># (d)</span>
+    store o[t] = b_o
+    store final_state[slot] = b_h         <span class="c"># write back every step (multi-token decode safe)</span></code></pre>
+
+  <div class="callout info">
+    <strong>Paging &amp; speculative decode</strong>
+    <code>ssm_state_indices</code> maps each sequence to a cache slot; a slot <code>≤ 0</code> (NULL_BLOCK_ID)
+    is skipped. With speculative decoding, the kernel seeds from the state after the last
+    <em>accepted</em> token (<code>num_accepted_tokens − 1</code>) so rejected draft tokens never corrupt the
+    carried state.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="chunk">8. Prefill path: <span class="mono">chunk_kda</span> (5 sub-kernels)</h2>
+
+  <p>
+    <span class="pathtag pre">PREFILL</span> A long prompt has thousands of tokens; running them one-at-a-time
+    wastes the GPU. The chunked path splits the sequence into chunks of <span class="mono">BT=64</span> and
+    expresses the work as <b>matmuls</b>: <em>parallel within a chunk</em>, <em>sequential across chunks</em>.
+    It computes the identical result as the recurrence.
+    Driver: <code>_chunk_kda_fwd_with_cumulative_g</code> (<span class="fileref">kda.py:1306</span>).
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Sequence → chunks: within-chunk parallel, cross-chunk recurrent</div>
+    <div class="cell-row" style="justify-content:center">
+      <span class="cell head">chunk 0<br><span class="lo">tok 0–63</span></span>
+      <span class="flow-arrow">→S→</span>
+      <span class="cell head">chunk 1<br><span class="lo">tok 64–127</span></span>
+      <span class="flow-arrow">→S→</span>
+      <span class="cell head">chunk 2<br><span class="lo">tok 128–191</span></span>
+      <span class="flow-arrow">→S→</span>
+      <span class="cell free">…</span>
+    </div>
+    <div class="diagram-caption">
+      Inside a chunk, the 64×64 token interactions are dense matmuls. Only the carry of the state matrix
+      <code>S</code> from one chunk to the next is sequential (<code>NT</code> steps, not <code>T</code>).
+    </div>
+  </div>
+
+  <h4>The pipeline of 5 kernels</h4>
+  <p>Each row is one Triton launch. Shapes assume one head; <code>BT=64</code>.</p>
+
+  <ol class="steps">
+    <li>
+      <b>Gate cumsum</b> — <code>fused_kda_gate_chunk_cumsum</code><br>
+      Builds <code>g</code> (the same −exp(A_log)·softplus gate as decode) <em>and</em> takes its
+      <b>cumulative sum along time within each chunk</b>. So <code>g[t]</code> now holds
+      <code>Σ<sub>s≤t</sub> decay<sub>s</sub></code>. Then the decay from token <code>j</code> to token <code>i</code>
+      in the same chunk is just <code>exp(g[i] − g[j])</code>. Scaled by <code>RCP_LN2</code> (see §9).
+      <div class="mlabel">out: g [1, T, 32, 128]</div>
+    </li>
+    <li>
+      <b>Intra-chunk Gram matrices</b> — <code>chunk_kda_scaled_dot_kkt_fwd</code> → <code>A</code>, <code>Aqk</code><br>
+      For each 64-token chunk, builds two <span class="mono">64×64</span> matrices, gate-weighted by
+      <code>exp2(g<sub>i</sub> − g<sub>j</sub>)</code>:
+      <div class="grid">
+        <div class="box"><h3>A = β · (K Kᵀ)</h3><p>strictly lower-triangular key–key interactions; the
+          system of within-chunk delta corrections.</p></div>
+        <div class="box"><h3>Aqk = scale · (Q Kᵀ)</h3><p>lower-triangular (incl. diagonal) query–key scores; the
+          within-chunk part of the output.</p></div>
+      </div>
+    </li>
+    <li>
+      <b>Invert the triangular system</b> — <code>solve_tril</code> → <code>A = (I + A)⁻¹</code><br>
+      The delta rule inside a chunk is a sequential dependency (token <code>i</code>'s correction depends on
+      earlier corrections). Inverting <code>I + A</code> resolves all of them <em>at once</em> — this is the
+      "UT transform". <code>A</code> must be 16/32/64-wide; KDA uses 64.
+    </li>
+    <li>
+      <b>Resolve per-token updates</b> — <code>recompute_w_u_fwd</code> → <code>w</code>, <code>u</code>, <code>kg</code><br>
+      Applies the inverted matrix: <code>u = A·(β v)</code> (corrected values), <code>w = A·(β k·exp2(g))</code>
+      (key-side update weights), and <code>kg = k·exp2(g<sub>last</sub> − g)</code> (keys re-aligned to the chunk's
+      end so they can update the carried state).
+    </li>
+    <li>
+      <b>Cross-chunk state recurrence + output</b> — two kernels:
+      <ul>
+        <li><code>chunk_gated_delta_rule_fwd_h</code> (<span class="fileref">chunk_delta_h.py</span>) — the
+          <em>only</em> sequential-over-chunks loop. For each chunk it: snapshots the incoming <code>S</code> into
+          <code>h</code>; computes new values <code>v_new = u − w·Sᵀ</code>; decays <code>S</code> by the chunk's
+          total per-channel gate <code>exp2(g<sub>last</sub>)</code>; then <code>S += kgᵀ·v_new</code>.</li>
+        <li><code>chunk_gla_fwd_o_gk</code> — forms the output by adding the <b>intra</b>-chunk term
+          <code>(Aqk masked)·v_new</code> and the <b>inter</b>-chunk term <code>(q·exp2(g))·hᵀ</code>
+          (query attends to the state carried <em>into</em> the chunk).</li>
+      </ul>
+    </li>
+  </ol>
+
+  <div class="diagram">
+    <div class="diagram-title">Data dependencies between the 5 launches</div>
+    <div class="flow">
+      <div class="flow-step a"><span class="num">1</span>gate cumsum<br><span class="mono">→ g</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step b"><span class="num">2</span>K Kᵀ, Q Kᵀ<br><span class="mono">→ A, Aqk</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step v"><span class="num">3</span>solve_tril<br><span class="mono">→ (I+A)⁻¹</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step g"><span class="num">4</span>recompute<br><span class="mono">→ w, u, kg</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step r"><span class="num">5a</span>chunk state h<br><span class="mono">→ h, v_new, Sₙ</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step b"><span class="num">5b</span>GLA output<br><span class="mono">→ o</span></div>
+    </div>
+    <div class="diagram-caption">
+      <code>Aqk</code> from step 2 skips straight to 5b. The state carried out of 5a (<code>Sₙ</code>) is written
+      to the paged cache so the next forward (often a decode) continues seamlessly.
+    </div>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>The driver, in full</strong>
+    <span class="fileref">kda.py:1306 _chunk_kda_fwd_with_cumulative_g</span>
+<pre><code>A, Aqk = <span class="fn">chunk_kda_scaled_dot_kkt_fwd</span>(q, k, gk=g, beta=beta, scale=scale, ...)  <span class="c"># 2</span>
+A = <span class="fn">solve_tril</span>(A=A, ...)                                                   <span class="c"># 3</span>
+w, u, _, kg = <span class="fn">recompute_w_u_fwd</span>(k=k, v=v, beta=beta, A=A, gk=g, ...)          <span class="c"># 4</span>
+h, v_new, final_state = <span class="fn">chunk_gated_delta_rule_fwd_h</span>(k=kg, w=w, u=u, gk=g,
+                            initial_state=initial_state, use_exp2=<span class="k">True</span>, ...)    <span class="c"># 5a</span>
+o = <span class="fn">chunk_gla_fwd_o_gk</span>(q=q, v=v_new, g=g, A=Aqk, h=h, o=v, scale=scale, ...)   <span class="c"># 5b</span>
+<span class="k">return</span> o, final_state</code></pre>
+  </div>
+
+  <div class="callout good">
+    <strong>The one mental model for the chunk path</strong>
+    Steps 2–4 turn "64 sequential delta-rule updates" into "a few 64×64 matmuls" using the triangular-inverse
+    trick. Step 5a is the only part that still walks chunk-by-chunk, and it does so with the same decay→correct→write
+    structure as the decode recurrence — just on whole chunks at once. Step 5b reads the state to produce outputs.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="exp2">9. The exp2 / cumsum trick</h2>
+
+  <p>
+    You will see <code>exp2(...)</code> everywhere in the chunk kernels and a mysterious
+    <code>g = g * RCP_LN2</code> after the cumsum. Here is why.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Hardware likes exp2</h3>
+      <p>GPUs have a fast native <code>exp2</code> (base-2) instruction. To use it while still computing
+      <code>eˣ</code>, rewrite <code>eˣ = 2^(x / ln2) = exp2(x · RCP_LN2)</code> where
+      <code>RCP_LN2 = 1/ln2 ≈ 1.4427</code>.</p>
+    </div>
+    <div class="box">
+      <h3>Pre-scale once</h3>
+      <p>So the driver scales the cumulative gate <code>g ← g · RCP_LN2</code> <b>once</b>
+      (<span class="fileref">kda.py:1400</span>), and every downstream kernel can call <code>exp2(g)</code>
+      directly and get <code>exp(original g)</code>. The decode path doesn't cumsum, so it uses plain
+      <code>exp</code>.</p>
+    </div>
+  </div>
+
+  <p>
+    And why cumulative sums? Within a chunk the state decays multiplicatively across tokens. The product of
+    per-step decays telescopes into a <b>difference of cumulative log-decays</b>:
+  </p>
+  <div class="eq">
+    ∏<sub>j&lt;s≤i</sub> exp(decay<sub>s</sub>)  =  exp( Σ<sub>s≤i</sub> decay<sub>s</sub> − Σ<sub>s≤j</sub> decay<sub>s</sub> )  =  exp( g[i] − g[j] )  =  <b>exp2( g[i] − g[j] )</b>
+  </div>
+  <p>
+    That single subtraction is how every gate-weighting term in steps 2, 4, and 5 is computed — you'll spot
+    <code>exp2(b_g − b_gn)</code> (decay to the chunk anchor) and <code>exp2(b_gn − b_gk)</code> patterns throughout.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="reading">10. Reading tips &amp; file map</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>How to read these kernels</h3>
+      <ul>
+        <li><b>Find the state first.</b> <code>b_h</code> shape <span class="mono">[BV, BK] = [V, K]</span> is S.
+          Everything else updates it.</li>
+        <li><b>Map to the 4 lines</b> (§4). Every kernel is decay → delta → write → read, possibly batched.</li>
+        <li><code>make_block_ptr(base, shape, strides, offset, block, order)</code> is just "give me this tile";
+          the <code>(H*K, 1)</code> strides skip across the head dimension.</li>
+        <li><code>bos/eos</code> come from <code>cu_seqlens</code> — they bound one sequence inside the packed T axis.</li>
+        <li><b>Ignore autotune configs</b> on first read; they only pick <code>BK/BV/num_warps</code>.</li>
+        <li><code>i_t, i_v, i_bh = tl.program_id(...)</code> tells you what slice this program owns.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>File map</h3>
+      <ul>
+        <li><span class="fileref">fla/ops/kda.py</span> — entry points, gate, KKt, recompute_w_u, GLA output.</li>
+        <li><span class="fileref">fla/ops/fused_recurrent.py</span> — the decode recurrence (IS_KDA flag).</li>
+        <li><span class="fileref">fla/ops/chunk_delta_h.py</span> — cross-chunk state recurrence (step 5a).</li>
+        <li><span class="fileref">fla/ops/cumsum.py</span>, <span class="fileref">solve_tril.py</span>,
+            <span class="fileref">l2norm.py</span> — the helpers.</li>
+        <li><span class="fileref">mamba/gdn/kimi_gdn_linear_attn.py</span> — the layer; prefill vs decode dispatch.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="compare">
+    <div class="side left">
+      <h4>Decode (recurrent)</h4>
+      <ul>
+        <li>1 token at a time, in a register loop</li>
+        <li>Gate via <code>fused_kda_gate</code> up front (no cumsum)</li>
+        <li>Plain <code>exp</code></li>
+        <li>1 program per (seq, head, value-block)</li>
+        <li>Latency-bound; tiny matrices</li>
+      </ul>
+    </div>
+    <div class="vs">same<br>math</div>
+    <div class="side right">
+      <h4>Prefill (chunked)</h4>
+      <ul>
+        <li>64 tokens at once, as matmuls</li>
+        <li>Gate + within-chunk <b>cumsum</b></li>
+        <li><code>exp2</code> with RCP_LN2 pre-scale</li>
+        <li>5 kernel launches, only step 5a is sequential</li>
+        <li>Throughput-bound; uses tensor cores</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>Caveat &amp; verification</strong>
+    Shapes and the 5-step pipeline were read directly from the source listed above at the time of writing
+    (vLLM, branch <code>dao/understand</code>). The config numbers (K=V=128, 32 heads, 27 layers, BT=64) are from
+    <span class="mono">moonshotai/Kimi-Linear-48B-A3B-Base</span>. The math derivation of the chunked UT transform is
+    summarized, not proved — for the full derivation see the DeltaNet chunked-form paper. Always re-confirm against
+    the live kernel before relying on a specific line number.
+  </div>
+
+  <div class="foot">
+    KDA = Kimi Delta Attention · per-channel gated delta-rule linear attention ·
+    sources: <span class="mono">vllm/model_executor/layers/fla/ops/{kda,fused_recurrent,chunk_delta_h}.py</span>,
+    <span class="mono">mamba/gdn/kimi_gdn_linear_attn.py</span>.
+  </div>
+</main>
+</body>
+</html>

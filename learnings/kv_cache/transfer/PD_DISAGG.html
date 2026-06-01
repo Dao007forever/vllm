@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>P/D Disaggregation &mdash; vLLM Learning Notes</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">KV Cache</a> &middot;
+    <a href="index.html">Transfer</a> &middot;
+    <span>PD_DISAGG</span>
+  </div>
+
+  <h1>P/D Disaggregation &mdash; The Protocol</h1>
+  <p class="subtitle">
+    Why split prefill and decode in the first place, the five-method
+    connector contract every transport implements, and where the cache
+    transfer plane sits relative to vLLM's scheduler and worker.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      Prefill and decode have <em>different</em> hardware profiles &mdash;
+      prefill is compute-bound and bursty, decode is memory-bandwidth-bound
+      and steady. P/D disaggregation puts them on different worker pools
+      and moves KV cache between them. Every transport (NIXL, Mooncake
+      pipe, Mooncake store) implements the same five-method
+      <code>KVConnectorBase_V1</code> contract; the differences live in
+      <em>who initiates</em> the transfer, <em>through what</em>, and
+      <em>when the bytes land</em>.
+    </p>
+  </section>
+
+  <div class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#why">1. Why disaggregate at all</a></li>
+      <li><a href="#contract">2. The connector contract (5 methods)</a></li>
+      <li><a href="#lifecycle">3. Request lifecycle across P and D</a></li>
+      <li><a href="#push-vs-pull">4. Push vs pull as a design axis</a></li>
+      <li><a href="#stores">5. Direct pipe vs shared store</a></li>
+      <li><a href="#roles">6. kv_producer, kv_consumer, kv_both</a></li>
+      <li><a href="#prefix">7. Composition with local prefix cache</a></li>
+      <li><a href="#next">8. Reading next</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why">1. Why disaggregate at all</h2>
+
+  <p>
+    Prefill processes a long prompt in one large matmul-heavy forward,
+    saturating tensor cores. Decode generates one token at a time, each
+    step memory-bound by the KV cache size. On the same GPU pool, the
+    two collide:
+  </p>
+
+  <ul>
+    <li>A long prefill stalls all in-flight decodes behind it.</li>
+    <li>Decode batching wants <em>many</em> tokens-in-flight; prefill
+        wants <em>few large</em> requests-in-flight. The optimal batch
+        composition is the opposite.</li>
+    <li>Hardware is wasted: an H100 doing decode runs at ~10% of its
+        flop ceiling. An A100 doing prefill is fine.</li>
+  </ul>
+
+  <p>
+    The fix is to put prefill on one cluster (P pool) and decode on
+    another (D pool), then ship the KV cache between them. P frees its
+    KV the moment D has it; D doesn't even have a model-execute step
+    for the prompt &mdash; just loads the KV and starts generating.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Why split the model in two</div>
+    <div class="compare">
+      <div class="side left">
+        <strong>Colocated</strong>
+        <ul>
+          <li>Prefill blocks decode queue.</li>
+          <li>Same hardware does both badly.</li>
+          <li>One bad batch composition tanks throughput.</li>
+        </ul>
+      </div>
+      <div class="vs">vs</div>
+      <div class="side right">
+        <strong>Disaggregated</strong>
+        <ul>
+          <li>P and D scale independently.</li>
+          <li>Each pool tuned for its workload.</li>
+          <li>KV transfer becomes the new bottleneck &mdash; that's what these docs are about.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h2 id="contract">2. The connector contract</h2>
+
+  <p>
+    Every KV transfer transport in vLLM is a <code>KVConnectorBase_V1</code>
+    subclass living at
+    <span class="fileref">vllm/distributed/kv_transfer/kv_connector/v1/base.py</span>.
+    The class has two halves: <strong>scheduler-side</strong> methods
+    called inside the engine loop, and <strong>worker-side</strong>
+    methods called on each model-execute worker.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Scheduler-side</h3>
+      <ul>
+        <li>
+          <code>get_num_new_matched_tokens(request)</code> &mdash; "how
+          many tokens of this request's prefix can you supply?" Returns a
+          token count and an async flag. Local prefix cache hits are
+          subtracted before the connector is asked.
+        </li>
+        <li>
+          <code>update_state_after_alloc(...)</code> &mdash; called once
+          the scheduler has actually allocated GPU blocks to receive the
+          load. The connector flips its per-request <code>can_load</code>
+          flag here.
+        </li>
+        <li>
+          <code>build_connector_meta(scheduler_output)</code> &mdash;
+          builds a <code>KVConnectorMetadata</code> describing what the
+          worker must do this step. The struct rides on the
+          <code>ExecuteModelRequest</code> down to the worker.
+        </li>
+        <li>
+          <code>request_finished(request, ...)</code> &mdash; returns
+          <code>(should_defer_free, kv_transfer_params)</code>. If the
+          connector still has pending saves for the request, it returns
+          <code>True</code> so the scheduler doesn't free the blocks yet.
+        </li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Worker-side</h3>
+      <ul>
+        <li>
+          <code>start_load_kv(forward_context, ...)</code> &mdash; called
+          <em>before</em> the forward pass. Connectors that need KV
+          loaded for this step initiate the transfer here.
+        </li>
+        <li>
+          <code>wait_for_layer_load(layer_name)</code> /
+          <code>save_kv_layer(layer_name, kv_layer, ...)</code> &mdash;
+          per-layer hooks for connectors that want to overlap transfer
+          with the forward pass on a layer-by-layer basis. <strong>Both
+          NIXL and Mooncake leave these as no-ops</strong> &mdash; they
+          batch instead.
+        </li>
+        <li>
+          <code>wait_for_save()</code> &mdash; called <em>after</em> the
+          forward pass before reporting the step done. Synchronizes any
+          saves the worker scheduled this step.
+        </li>
+        <li>
+          <code>get_finished(finished_req_ids)</code> &mdash; called each
+          step. Returns <code>(done_sending, done_recving)</code>: which
+          requests have completed their async save/load. The scheduler
+          uses these to release blocks and unblock waiting requests.
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>What the contract <em>does not</em> mandate</strong>
+    <p>
+      It says nothing about <em>who</em> initiates the wire transfer,
+      <em>which direction</em> it flows, or <em>whether</em> there's a
+      store in the middle. Push vs pull is entirely the transport's
+      choice. The contract just demands that
+      <code>get_finished()</code> eventually reports completion.
+    </p>
+  </div>
+
+  <h2 id="lifecycle">3. Request lifecycle across P and D</h2>
+
+  <p>
+    A decode request on D arrives with a
+    <code>kv_transfer_params</code> dict identifying its remote prefill
+    (engine id, request id, host, port, etc.). It then flows through:
+  </p>
+
+  <ol class="steps">
+    <li>
+      <strong>D scheduler: ask the connector for matched tokens.</strong>
+      <code>get_num_new_matched_tokens</code> may return immediately
+      (Mooncake store: lookup keys in the store) or asynchronously
+      (NIXL: kick off a handshake, return 0 + async-flag).
+    </li>
+    <li>
+      <strong>D scheduler: allocate blocks for the load.</strong>
+      The block manager reserves GPU paged-cache blocks based on the
+      matched-token count. The connector is notified via
+      <code>update_state_after_alloc</code> with the allocated block IDs.
+    </li>
+    <li>
+      <strong>D scheduler: build metadata.</strong>
+      <code>build_connector_meta</code> emits a per-step metadata struct
+      listing every request that needs send or receive this step.
+    </li>
+    <li>
+      <strong>D worker: <code>start_load_kv</code>.</strong>
+      The worker reads the metadata, initiates async transfers (the
+      transport-specific part), and returns immediately.
+    </li>
+    <li>
+      <strong>D worker: forward pass.</strong>
+      The forward runs <em>before</em> the transfer completes in some
+      transports (relying on per-layer wait), <em>after</em> in others
+      (NIXL waits on a host-side check before the prompt's first decode).
+    </li>
+    <li>
+      <strong>D worker: <code>get_finished</code>.</strong>
+      Each step the worker polls in-flight transfers. When all of a
+      request's transfers are done, it appears in <code>done_recving</code>.
+    </li>
+    <li>
+      <strong>P side, in parallel:</strong> P has been holding the
+      request's blocks pinned (because <code>request_finished</code> said
+      "defer free"). The completion signal &mdash; either a NIXL notif
+      or a Mooncake response &mdash; flips the request to
+      <code>done_sending</code> and lets P reclaim the blocks.
+    </li>
+  </ol>
+
+  <h2 id="push-vs-pull">4. Push vs pull as a design axis</h2>
+
+  <p>
+    The single biggest architectural divergence between the three
+    transports is who initiates the wire transfer:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Three initiation models</div>
+    <table>
+      <thead>
+        <tr><th></th><th>Initiator</th><th>Mechanism</th><th>Code reference</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th><a href="NIXL.html">NIXL</a> (pull)</th>
+          <td>D worker</td>
+          <td>NIXL <code>READ</code> xfer over RDMA</td>
+          <td><span class="fileref">nixl/worker.py:2220</span> <code>make_prepped_xfer("READ", ...)</code></td>
+        </tr>
+        <tr>
+          <th><a href="MOONCAKE_PIPE.html">Mooncake pipe</a> (push)</th>
+          <td>P worker (after D requests)</td>
+          <td>Mooncake <code>batch_transfer_sync_write</code></td>
+          <td><span class="fileref">mooncake_connector.py:1365</span> <code>self.engine.batch_transfer_sync_write(remote_session, src_ptrs, dst_ptrs, lengths)</code></td>
+        </tr>
+        <tr>
+          <th><a href="MOONCAKE_STORE.html">Mooncake store</a> (decoupled)</th>
+          <td>P puts, D gets &mdash; via store</td>
+          <td><code>batch_put_from_multi_buffers</code> / <code>batch_get_into_multi_buffers</code></td>
+          <td><span class="fileref">mooncake/store/worker.py:578, 730</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    Why does it matter? Two things change with the choice:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Who owns memory addressing.</strong> In a pull, D knows its
+      own destination addresses and just needs P's source addresses. In a
+      push, D must hand P its destination addresses upfront, before P
+      has issued the transfer. The push case requires a request/response
+      hop in the handshake; the pull case can issue READs as soon as the
+      remote agent is registered.
+    </li>
+    <li>
+      <strong>Where the latency cost lands.</strong> A pull adds one
+      round-trip of "ask P, then read P." A push has the request
+      round-trip but then transfers as fast as the wire allows. With a
+      store, you pay the wire latency twice (P&rarr;store, store&rarr;D)
+      but get cross-run caching back.
+    </li>
+  </ul>
+
+  <h2 id="stores">5. Direct pipe vs shared store</h2>
+
+  <p>
+    The second axis: whether KV passes <em>directly</em> from P to D, or
+    sits in a shared store that both consult.
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <strong>Direct pipe (NIXL, Mooncake pipe)</strong>
+      <ul>
+        <li>Lowest latency.</li>
+        <li>P blocks pinned until D acknowledges.</li>
+        <li>No reuse across engine runs &mdash; if the same prompt comes back later, P re-prefills.</li>
+        <li>Requires P and D to be alive simultaneously and reachable to each other.</li>
+      </ul>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <strong>Shared store (Mooncake store)</strong>
+      <ul>
+        <li>Cross-run reuse: a popular system prompt is put once, fetched many times.</li>
+        <li>Decouples P and D in time and space: P can finish and exit; D can join later.</li>
+        <li>Two wire hops instead of one.</li>
+        <li>Store cluster is now a new failure domain (and an ops burden &mdash; replication, eviction, capacity).</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    The Mooncake store variant is also the only one that's
+    <em>content-addressed</em>: keys are derived from vLLM's prefix-cache
+    block hashes. That's what makes cross-run reuse work &mdash; two
+    different engine processes can independently hash the same prompt
+    and arrive at the same key.
+  </p>
+
+  <h2 id="roles">6. kv_producer, kv_consumer, kv_both</h2>
+
+  <p>
+    Every worker is configured at startup with a <code>kv_role</code>
+    string. The connector branches on this to know which side of the
+    transfer plane it's on:
+  </p>
+
+  <ul>
+    <li>
+      <code>kv_producer</code>: prefill side. Saves, never loads.
+    </li>
+    <li>
+      <code>kv_consumer</code>: decode side. Loads, never saves.
+    </li>
+    <li>
+      <code>kv_both</code>: hybrid &mdash; some clusters run a unified
+      pool that does both. Common in the Mooncake store deployment
+      because cache hits short-circuit prefill anyway.
+    </li>
+  </ul>
+
+  <div class="callout warn">
+    <strong>The store's <code>force_skip_save</code> rule</strong>
+    <p>
+      In <a href="MOONCAKE_STORE.html">MOONCAKE_STORE.html</a>, the
+      scheduler sets <code>force_skip_save = (kv_role == "kv_consumer")</code>.
+      A pure consumer never writes back &mdash; even if it had a partial
+      KV state to contribute. This is a deliberate design choice: the
+      store treats prefill workers as the only source of truth. Mixed
+      <code>kv_both</code> workers are the only ones that both feed and
+      drain the store.
+    </p>
+  </div>
+
+  <h2 id="prefix">7. Composition with local prefix cache</h2>
+
+  <p>
+    Both vLLM workers already have a local prefix cache (the in-GPU
+    block-hash cache covered in <a href="../KV_CACHE.html">KV_CACHE.html</a>).
+    The connector and the local cache compose:
+  </p>
+
+  <ol>
+    <li>
+      Scheduler queries local prefix cache first. Matched tokens are
+      subtracted.
+    </li>
+    <li>
+      Connector is asked about the <em>remaining</em> tokens via
+      <code>get_num_new_matched_tokens</code>. It returns how many it
+      can supply from remote.
+    </li>
+    <li>
+      The Mooncake store variant uses this to mask out tokens already
+      covered locally: the recv thread won't redownload them. See
+      <span class="fileref">connector/MOONCAKE.md</span> for the
+      <code>vllm_cached_tokens</code> mask field on <code>LoadSpec</code>.
+    </li>
+  </ol>
+
+  <p>
+    This is why a hot system prompt costs essentially zero KV transfer:
+    after the first call, every D worker has it in its local prefix
+    cache, and the connector is never asked.
+  </p>
+
+  <h2 id="next">8. Reading next</h2>
+
+  <ul>
+    <li>
+      Pick a transport. <a href="NIXL.html">NIXL.html</a> is the
+      canonical reference (most production deployments). The
+      <a href="MOONCAKE_PIPE.html">direct Mooncake pipe</a> is the
+      closest analog with a different initiation model.
+    </li>
+    <li>
+      If you're operating a shared cache cluster, jump to
+      <a href="MOONCAKE_STORE.html">MOONCAKE_STORE.html</a>.
+    </li>
+    <li>
+      Cross-cutting: <a href="PARALLELISM.html">PARALLELISM.html</a> for
+      how each transport reconciles TP<sub>P</sub> &ne; TP<sub>D</sub>.
+      You almost certainly want this if you're deploying P on H100 and
+      D on H200, or vice versa.
+    </li>
+  </ul>
+</main>
+</body>
+</html>

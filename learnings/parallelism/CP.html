@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Context Parallelism (DCP / PCP) &mdash; vLLM Parallelism</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .seq-shard {
+    display: grid;
+    grid-template-columns: 80px repeat(8, 1fr);
+    gap: 2px;
+    align-items: stretch;
+    margin: 10px 0;
+    font-size: 0.78em;
+    font-family: "SF Mono", Monaco, monospace;
+  }
+  .seq-shard .lbl { background: transparent; color: var(--muted); padding: 8px 6px; text-align: right; }
+  .seq-shard .tok { padding: 8px 4px; text-align: center; border-radius: 4px; }
+  .seq-shard .tok.r0 { background: var(--blue-soft); color: var(--blue); border: 1px solid #a6c8df; }
+  .seq-shard .tok.r1 { background: var(--green-soft); color: var(--green); border: 1px solid #abd1bb; }
+  .seq-shard .tok.r2 { background: var(--amber-soft); color: var(--amber); border: 1px solid #e3c88a; }
+  .seq-shard .tok.r3 { background: var(--red-soft); color: var(--red); border: 1px solid #e0b3ae; }
+  .formula { background: var(--code); padding: 10px 12px; border-radius: 6px; margin: 10px 0; font-family: monospace; font-size: 0.86em; }
+</style>
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">parallelism/</a> &rsaquo; <strong>CP</strong> &mdash;
+    Context Parallelism (DCP / PCP)
+  </div>
+
+  <h1>Context Parallelism &mdash; DCP and PCP</h1>
+  <p class="subtitle">
+    Shard the <em>sequence dimension</em> instead of the head dimension. vLLM
+    has two flavours, and the names are about <em>which dimension they shard</em>,
+    not which phase they run in: <strong>DCP</strong> shards the <em>context</em>
+    (the cached KV of a sequence) and <strong>PCP</strong> shards the
+    <em>query tokens</em> of a prefill. DCP actually runs in <em>both</em> decode
+    and (chunked-)prefill &mdash; it just never parallelises the new query
+    tokens. PCP is the follow-up that does exactly that, to cut TTFT on very long
+    prompts. Both recombine partial attention with the same LSE (log-sum-exp)
+    algebra; they differ in their collectives.
+  </p>
+
+  <section class="tldr">
+    <strong>One-line model</strong>
+    <p>
+      TP fails when you can't divide the heads any further (e.g. only 8 KV heads,
+      already at TP=8) or when the KV cache for a long sequence won't fit per-rank.
+      CP solves both: shard tokens, recombine partial attention outputs using LSE
+      algebra, paying one extra collective per attention layer.
+    </p>
+    <p>
+      <strong>The unlock for FlashInfer:</strong> CP can't merge partial
+      attentions without each shard's LSE &mdash; the online-softmax correction
+      needs the per-shard softmax denominators. FlashInfer only recently started
+      returning LSE from its prefill/decode wrappers, which is why
+      <code>BatchDCPPrefillWrapper</code>
+      (<span class="fileref">vllm/v1/attention/backends/flashinfer.py</span>:214)
+      now exists and FlashInfer can be a DCP backend. Without LSE there is no
+      <code>merge_attn_states</code>, so there was no way to stitch the
+      rank-local outputs back into a correct global attention.
+    </p>
+  </section>
+
+  <div class="nav">
+    <ol>
+      <li><a href="#why">Why CP exists: the GQA wall and long context</a></li>
+      <li><a href="#layout">How tokens are sharded</a></li>
+      <li><a href="#lse">The LSE merge: how partial attentions combine</a></li>
+      <li><a href="#dcp">DCP: Decode Context Parallel</a></li>
+      <li><a href="#pcp">PCP: Prefill Context Parallel</a></li>
+      <li><a href="#kv-cache">KV cache interleaving</a></li>
+      <li><a href="#config">Config and code pointers</a></li>
+      <li><a href="#limits">Limits and gotchas</a></li>
+    </ol>
+  </div>
+
+  <h2 id="why">Why CP exists: the GQA wall and long context</h2>
+
+  <p>
+    TP shards along <em>heads</em>. That works until one of two things runs out:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>The GQA wall</h3>
+      <p>
+        Modern models use Grouped-Query Attention (GQA) where
+        <code>num_kv_heads</code> is small (e.g. Llama-3 70B has 8 KV heads,
+        Mistral 8x22B has 8, DeepSeek-V3 has 1 via MLA). Once you reach
+        <code>TP = num_kv_heads</code>, you can't shard the KV cache any further
+        &mdash; the next rank would have to <em>replicate</em> KV, defeating the
+        memory split.
+      </p>
+      <p>
+        DCP says: keep TP at the head limit, then shard <em>tokens</em>
+        within each KV head. So a TP=16, DCP=2 setup gives effectively 32-way
+        compute split while still respecting 8 KV heads.
+      </p>
+    </div>
+    <div class="box">
+      <h3>The long-context wall</h3>
+      <p>
+        For a 1M-token prefill, even one TP rank's KV cache is enormous (KV is
+        <code>S &times; H_kv</code> per layer). Storing the full sequence per
+        rank during prefill is impossible. PCP splits the <em>tokens</em>
+        themselves across ranks &mdash; each rank handles a contiguous chunk of
+        the sequence.
+      </p>
+      <p>
+        PCP also enables ring-attention-style algorithms where K and V slabs
+        cycle around the ring while Q stays put.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="layout">How tokens are sharded</h2>
+
+  <p>
+    With <code>CP=4</code> and a sequence of 8 tokens, the per-token assignment
+    looks like:
+  </p>
+
+  <div class="seq-shard">
+    <div class="lbl">interleave=1</div>
+    <div class="tok r0">t0</div>
+    <div class="tok r1">t1</div>
+    <div class="tok r2">t2</div>
+    <div class="tok r3">t3</div>
+    <div class="tok r0">t4</div>
+    <div class="tok r1">t5</div>
+    <div class="tok r2">t6</div>
+    <div class="tok r3">t7</div>
+  </div>
+
+  <p>
+    Token-level interleaving (<code>cp_kv_cache_interleave_size=1</code>) means
+    token <code>i</code> lives on rank <code>i % CP</code>. This minimises tail
+    imbalance &mdash; if the sequence length isn't a multiple of CP, the
+    imbalance is at most 1 token per rank.
+  </p>
+
+  <div class="seq-shard">
+    <div class="lbl">interleave=2</div>
+    <div class="tok r0">t0</div>
+    <div class="tok r0">t1</div>
+    <div class="tok r1">t2</div>
+    <div class="tok r1">t3</div>
+    <div class="tok r2">t4</div>
+    <div class="tok r2">t5</div>
+    <div class="tok r3">t6</div>
+    <div class="tok r3">t7</div>
+  </div>
+
+  <p>
+    Larger interleaves are friendlier to KV-block alignment &mdash; you can store
+    an entire KV block (typically 16 or 64 tokens) on one rank instead of
+    striping tokens within a block. At
+    <code>interleave = block_size</code> the layout is block-level: contiguous
+    blocks rotate through ranks.
+  </p>
+
+  <h2 id="lse">The LSE merge: how partial attentions combine</h2>
+
+  <p>
+    Attention output is a softmax-weighted sum of value vectors. For one query
+    against keys/values indexed by <code>k</code>, with scores
+    <code>s_k = q&middot;k_k / &radic;d</code>:
+  </p>
+
+  <div class="formula">
+    O = &Sigma;<sub>k</sub> &nbsp;
+    <span style="display:inline-block; vertical-align:middle; text-align:center;">
+      exp(s<sub>k</sub>)<br>
+      <span style="border-top:1px solid var(--fg); padding-top:1px;">&Sigma;<sub>j</sub> exp(s<sub>j</sub>)</span>
+    </span>
+    &nbsp; &middot; v<sub>k</sub>
+  </div>
+
+  <h3 id="what-is-o">What <code>O</code> and <code>L</code> actually are</h3>
+
+  <p>
+    This is the crux. When a shard <code>i</code> computes attention over
+    <em>only its slice of keys</em> <code>K_i</code>, it returns a pair
+    <code>(O_i, L_i)</code>:
+  </p>
+
+  <ul>
+    <li>
+      <strong><code>O_i</code> is a fully-normalized attention output</strong>
+      &mdash; the softmax taken <em>over shard i's keys only</em>, dotted with
+      shard i's values. It is <em>not</em> a raw, un-normalized numerator;
+      shard <code>i</code> already divided by its own local denominator. So
+      <code>O_i = &Sigma;<sub>k&isin;K_i</sub> exp(s_k) v_k / &Sigma;<sub>k&isin;K_i</sub> exp(s_k)</code>.
+      It's a complete, valid attention output &mdash; just over a subset of the
+      keys. Shape <code>[tokens, heads, head_dim]</code>.
+    </li>
+    <li>
+      <strong><code>L_i</code> is the log of that shard's softmax
+      denominator</strong>: <code>L_i = log &Sigma;<sub>k&isin;K_i</sub> exp(s_k)</code>
+      &mdash; the "log-sum-exp." This is the one scalar per (token, head) that
+      <code>O_i</code> threw away when it normalized, and it's exactly what's
+      needed to undo and re-do the normalization at merge time. Shape
+      <code>[heads, tokens]</code>.
+    </li>
+  </ul>
+
+  <p>
+    Without <code>L_i</code> you could never recombine, because you'd have no
+    idea how much softmax mass each shard's <code>O_i</code> represents. A shard
+    that saw the single highest-scoring key and a shard that saw a thousand
+    near-zero keys both return a unit-normalized <code>O_i</code>; only
+    <code>L_i</code> tells you the first one should dominate.
+  </p>
+
+  <h3>The final softmax is reconstructed, not recomputed</h3>
+
+  <p>
+    There is no second pass over <code>QK<sup>T</sup></code>. The merge never
+    revisits scores &mdash; it only reweights the pre-normalized
+    <code>O_i</code>'s by each shard's share of the total softmax mass:
+  </p>
+
+  <div class="formula">
+    Given shards i, j with <code>(O_i, L_i), (O_j, L_j)</code>:<br><br>
+    L = log(exp(L_i) + exp(L_j))&nbsp; &nbsp;<span style="color:var(--muted)">// merged LSE</span><br>
+    w_i = exp(L_i &minus; L),&nbsp; w_j = exp(L_j &minus; L)&nbsp; &nbsp;<span style="color:var(--muted)">// note w_i + w_j = 1</span><br>
+    O = w_i &middot; O_i + w_j &middot; O_j
+  </div>
+
+  <p>
+    The punchline: those weights <code>w_i = exp(L_i &minus; L)</code> are
+    themselves <em>a softmax over the per-shard LSEs</em>. So the global softmax
+    factorizes cleanly into two nested softmaxes:
+  </p>
+
+  <div class="formula">
+    final O = &Sigma;<sub>i</sub> softmax(L)<sub>i</sub> &middot; O_i<br>
+    &nbsp; &nbsp; &nbsp; &nbsp; &uarr; softmax over shards &nbsp; &nbsp; &nbsp; &uarr; softmax within shard
+  </div>
+
+  <p>
+    Generalises to <code>N</code> shards as a tree-reduction (each step merges
+    two partials, the merged <code>(O, L)</code> feeds the next step). This is
+    the same identity FlashAttention uses to tile a long sequence in SRAM;
+    DCP/PCP just lift it to the network.
+  </p>
+
+  <div class="callout info">
+    <strong>Worked example.</strong> One query, four keys, scores
+    <code>s = [2, 1, 3, 0]</code>. Split into shard A = keys{0,1} and shard B =
+    keys{2,3}.
+    <ul>
+      <li>Shard A: denom <code>= e&sup2;+e&sup1; = 10.11</code>, so
+        <code>L_A = 2.31</code> and <code>O_A = 0.731 v&#8320; + 0.269 v&#8321;</code>.</li>
+      <li>Shard B: denom <code>= e&sup3;+e&#8304; = 21.09</code>, so
+        <code>L_B = 3.05</code> and <code>O_B = 0.953 v&#8322; + 0.047 v&#8323;</code>.</li>
+      <li>Merge: <code>L = log(10.11 + 21.09) = 3.44</code>,
+        <code>w_A = 10.11/31.20 = 0.324</code>, <code>w_B = 0.676</code>.</li>
+      <li><code>O = 0.324&middot;O_A + 0.676&middot;O_B</code>. Expanding the
+        v&#8320; coefficient: <code>0.324&times;0.731 = 0.237</code> &mdash;
+        which is exactly <code>e&sup2;/31.20</code>, the global softmax weight on
+        key&nbsp;0. Every coefficient matches the one-shot softmax.</li>
+    </ul>
+    The two normalized partials, reweighted by their LSE share, reproduce the
+    full-sequence softmax bit-for-bit.
+  </div>
+
+  <div class="callout info">
+    <strong>In the kernel.</strong>
+    <span class="fileref">vllm/v1/attention/ops/triton_merge_attn_states.py</span>:118-161
+    does exactly this, with a max-subtraction for stability:
+    <code>max_lse = max(p_lse, s_lse)</code>;
+    <code>p_se = exp(p_lse &minus; max_lse)</code>, likewise <code>s_se</code>;
+    <code>p_scale = p_se/(p_se+s_se)</code> (= <code>w_i</code>);
+    <code>out = p_out&middot;p_scale + s_out&middot;s_scale</code>. The
+    DCP prefill path feeds it <code>prefix = context</code> region and
+    <code>suffix = new-tokens</code> region. Tokens with no prefix context skip
+    the merge entirely &mdash; their <code>O</code> is copied straight from the
+    suffix (kernel lines 89-102).
+  </div>
+
+  <h3 id="comm-pattern">Why this dictates the comm pattern (ag_rs vs a2a)</h3>
+
+  <p>
+    The collective has to do <em>two</em> things at once, and that's what shapes
+    the two backend choices. After the per-rank attention, recall that Q was
+    AllGathered across the DCP group, so <em>every rank holds a partial output
+    for all heads</em> &mdash; but each partial only covers that rank's KV shard.
+    The collective must:
+  </p>
+
+  <ol>
+    <li><strong>LSE-merge across ranks</strong> &mdash; combine the N partials per head into the true output (the math above).</li>
+    <li><strong>Scatter heads back</strong> &mdash; leave each rank holding only <em>its own</em> <code>H/N</code> heads, because the downstream <code>o_proj</code> is row-parallel TP and each rank owns just its head slice.</li>
+  </ol>
+
+  <p>
+    "Merge-then-scatter" is the shape of a <strong>reduce-scatter</strong>, not an
+    all-reduce &mdash; nobody needs the whole answer, just their head slice. The
+    two backends realize it differently:
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3><code>ag_rs</code> (default) &mdash; two collectives</h3>
+      <p>
+        <span class="fileref">common.py</span>:212 <code>cp_lse_ag_out_rs</code>:
+      </p>
+      <ol class="steps">
+        <li><strong>AllGather the LSE only</strong> (<code>[B,H]</code>, tiny) so every rank knows all shards' <code>L_i</code> per head.</li>
+        <li>Local Triton kernel rescales this rank's output by its weight <code>w_i = exp(L_i &minus; L)</code> &mdash; producing its <em>weighted contribution</em>.</li>
+        <li><strong>ReduceScatter the weighted outputs</strong> (<code>dim=1</code>): the sum-across-ranks <em>is</em> the LSE merge, and the scatter hands each rank its <code>H/N</code> heads.</li>
+      </ol>
+      <p>
+        Only the small LSE is broadcast; the big <code>O</code> moves once, via
+        the reduce-scatter.
+      </p>
+    </div>
+    <div class="box">
+      <h3><code>a2a</code> &mdash; one collective</h3>
+      <p>
+        <span class="fileref">dcp_alltoall.py</span>:393 <code>dcp_a2a_lse_reduce</code>:
+      </p>
+      <ol class="steps">
+        <li>Pack each rank's <code>(O_i, L_i)</code> by destination &mdash; rank <code>r</code>'s slice goes to whichever rank owns those heads.</li>
+        <li><strong>One All2All</strong>: now each rank holds, for <em>its</em> <code>H/N</code> heads, the partials from <em>all</em> N ranks.</li>
+        <li>Do the full LSE combine <em>locally</em> &mdash; no further comm.</li>
+      </ol>
+      <p>
+        One NCCL call instead of two, and <code>O</code> + LSE travel together.
+        Lower latency; favoured for MLA, where the head/comm layout suits it.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    Same answer either way &mdash; <code>a2a</code> just folds the gather, merge,
+    and scatter into a single exchange. This is the
+    <code>dcp_comm_backend</code> knob (<span class="fileref">parallel.py</span>:333),
+    and it's also why <code>a2a</code> is rejected at <code>DCP=1</code>: with one
+    rank there are no partials to exchange.
+  </p>
+
+  <h3 id="comm-example">Worked 4-rank example</h3>
+
+  <p>
+    Take <code>DCP=4</code> and (for simplicity) <strong>1 head owned per
+    rank</strong>, so 4 heads total. KV is sharded across the 4 ranks. After the
+    Q-AllGather + per-rank attention, every rank has computed a partial
+    <code>(O, L)</code> for <em>all 4 heads</em>, but each partial covers only
+    <em>its own</em> KV shard. Call that partial <code>p[r][h]</code> = "head
+    <code>h</code> attended over KV shard <code>r</code>". The state is a 4&times;4
+    matrix &mdash; <strong>each rank holds one full row</strong>:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>head 0</th><th>head 1</th><th>head 2</th><th>head 3</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>rank 0</strong> (KV shard 0)</td><td><code>p[0][0]</code> &starf;</td><td><code>p[0][1]</code></td><td><code>p[0][2]</code></td><td><code>p[0][3]</code></td></tr>
+      <tr><td><strong>rank 1</strong> (KV shard 1)</td><td><code>p[1][0]</code></td><td><code>p[1][1]</code> &starf;</td><td><code>p[1][2]</code></td><td><code>p[1][3]</code></td></tr>
+      <tr><td><strong>rank 2</strong> (KV shard 2)</td><td><code>p[2][0]</code></td><td><code>p[2][1]</code></td><td><code>p[2][2]</code> &starf;</td><td><code>p[2][3]</code></td></tr>
+      <tr><td><strong>rank 3</strong> (KV shard 3)</td><td><code>p[3][0]</code></td><td><code>p[3][1]</code></td><td><code>p[3][2]</code></td><td><code>p[3][3]</code> &starf;</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The goal: rank <code>h</code> must end up owning the <strong>merged column
+    <code>h</code></strong> &mdash; the LSE-combine of <code>p[0][h], p[1][h],
+    p[2][h], p[3][h]</code> &mdash; because that's the head it carries into
+    <code>o_proj</code>. (&starf; marks the diagonal partial each rank already has
+    for its own head.)
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3><code>ag_rs</code>: reduce the columns in place</h3>
+      <ol class="steps">
+        <li>
+          <strong>AllGather the LSE.</strong> Each rank sends its row's 4 LSE
+          scalars; afterwards every rank holds the full 4&times;4 LSE table (the
+          <em>outputs</em> <code>O</code> stay put &mdash; only the tiny
+          <code>L</code> is gathered).
+        </li>
+        <li>
+          <strong>Local rescale.</strong> Rank <code>r</code> now knows, for each
+          head <code>h</code>, the global <code>L_h = log&Sigma;_s exp(L[s][h])</code>,
+          so it scales its own row entry by
+          <code>w[r][h] = exp(L[r][h] &minus; L_h)</code>. Rank 0's row becomes
+          <code>w[0][0]&middot;O[0][0], w[0][1]&middot;O[0][1], &hellip;</code>
+        </li>
+        <li>
+          <strong>ReduceScatter over the head dim.</strong> This sums each
+          <em>column</em> across the 4 ranks (the sum <em>is</em> the merge, since
+          the weights were already applied) and hands column <code>h</code> only
+          to rank <code>h</code>:
+          <div class="formula">rank h receives &nbsp; &Sigma;<sub>r</sub> w[r][h]&middot;O[r][h] &nbsp;=&nbsp; merged head h</div>
+        </li>
+      </ol>
+      <p><strong>2 collectives.</strong> Big <code>O</code> moves once (the RS); the AG carries only LSE.</p>
+    </div>
+    <div class="box">
+      <h3><code>a2a</code>: transpose, then merge locally</h3>
+      <ol class="steps">
+        <li>
+          <strong>Pack by destination.</strong> Rank <code>r</code> splits its row
+          into 4 pieces and labels piece <code>h</code> for rank <code>h</code>
+          &mdash; carrying <code>O</code> <em>and</em> <code>L</code> together.
+          (The diagonal piece <code>p[r][r]</code> is destined for itself.)
+        </li>
+        <li>
+          <strong>One All2All.</strong> This <em>transposes</em> the matrix: rank
+          <code>h</code> collects the whole of <em>column</em> <code>h</code> &mdash;
+          <code>p[0][h], p[1][h], p[2][h], p[3][h]</code> &mdash; from the four
+          ranks. "Every rank has all heads / own shard" becomes "every rank has
+          own head / all shards."
+        </li>
+        <li>
+          <strong>Local LSE merge.</strong> Rank <code>h</code> now has all 4
+          partials for its head and combines them with no further comm &rarr;
+          merged head <code>h</code>.
+        </li>
+      </ol>
+      <p><strong>1 collective.</strong> Each rank ships 3 of its 4 pieces out (keeps the diagonal), <code>O</code>+<code>L</code> together.</p>
+    </div>
+  </div>
+
+  <p>
+    Both land rank <code>h</code> with the identical merged column <code>h</code>.
+    With <code>k</code> heads per rank instead of 1, every <code>p[r][h]</code>
+    above is a <code>k</code>-head block and the picture is unchanged. The matrix
+    view also makes the names literal: <code>ag_rs</code> = <u>A</u>ll<u>G</u>ather
+    (LSE) + <u>R</u>educe<u>S</u>catter (outputs); <code>a2a</code> =
+    <u>a</u>ll-to-<u>a</u>ll (the transpose).
+  </p>
+
+  <h2 id="dcp">DCP: Decode Context Parallel</h2>
+
+  <p>
+    DCP stripes the <em>cached KV</em> of a sequence across the DCP ranks. The
+    name says "decode" because long-context decode is the workload that motivated
+    it, but the same machinery runs during (chunked) prefill too &mdash; what DCP
+    never shards is the <em>query</em>.
+  </p>
+
+  <h3>DCP in decode</h3>
+
+  <p>
+    During decode each step produces 1 new token per request:
+  </p>
+
+  <ul>
+    <li>Q is the single new token's projection.</li>
+    <li>K, V are the entire past sequence (cached) plus this new token.</li>
+  </ul>
+
+  <p>
+    With DCP=4, the KV cache for a long context is striped across 4 ranks. Each
+    rank computes attention against its slice of K/V, returning <code>(O_i, L_i)</code>.
+    The merge step turns into one collective:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">DCP decode forward, one attention layer</div>
+    <ol class="steps">
+      <li>QKV projection (Q replicated since this is the new token; KV partial because each rank only updated its own slice last step).</li>
+      <li>Per-rank flash-attention against the rank's K/V shard, returning LSE so we get both <code>O_i</code> and <code>L_i</code>.</li>
+      <li>
+        <strong>DCP collective</strong>:
+        <ul>
+          <li><code>"ag_rs"</code>: AllGather the (tiny) LSE, rescale locally, then ReduceScatter the weighted outputs to split heads for the next layer (<span class="fileref">vllm/v1/attention/ops/common.py</span>:212, <code>cp_lse_ag_out_rs</code>). See <a href="#comm-pattern">comm pattern</a> below.</li>
+          <li><code>"a2a"</code>: one All2All ships each partial to its head-owner + local merge (<span class="fileref">vllm/v1/attention/ops/dcp_alltoall.py</span>:393, <code>dcp_a2a_lse_reduce</code>). Lower latency, MLA-friendly.</li>
+        </ul>
+      </li>
+      <li>o_proj (RowParallel) + AllReduce as in normal TP.</li>
+    </ol>
+  </div>
+
+  <h3 id="dcp-prefill">DCP in prefill: the two-region split</h3>
+
+  <p>
+    GQA (unlike MLA) doesn't structurally separate prefill and decode in the
+    forward pass, so the DCP prefill path splits each sequence into two regions
+    and computes attention separately for each:
+  </p>
+
+  <div class="formula">
+    |---------- context_len ----------|--- query_len ---|<br>
+    |------ KV sharded across DCP -----|-- new tokens ---|
+  </div>
+
+  <p>
+    These two regions need <em>different</em> handling, which is exactly why
+    FlashInfer's <code>BatchDCPPrefillWrapper</code> holds <em>two</em> inner
+    wrappers (<span class="fileref">flashinfer.py</span>:224-227):
+  </p>
+
+  <ul>
+    <li>
+      <strong>Context region</strong> &mdash; a paged-KV wrapper
+      (<code>_context</code>, <code>causal=False</code>). The cached KV is
+      distributed across DCP ranks, so this follows the MLA-DCP recipe:
+      <em>AllGather Q across the DCP group</em> so every rank holds all query
+      heads, run attention against the rank-local KV shard, then combine the
+      partial outputs/LSE with AllGather-out + ReduceScatter (or A2A).
+    </li>
+    <li>
+      <strong>New-tokens region</strong> &mdash; a ragged-KV wrapper
+      (<code>_new_tokens</code>, <code>causal=True</code>). The new query tokens
+      attend to themselves; this KV is purely local, so
+      <em>no DCP collective is required here at all</em>.
+    </li>
+  </ul>
+
+  <p>
+    The two partial results are then stitched with LSE
+    (<code>merge_attn_states</code>):
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">BatchDCPPrefillWrapper.run() &mdash; flashinfer.py:281</div>
+    <ol class="steps">
+      <li><code>prefill_query_across_dcp = get_dcp_group().all_gather(prefill_query, dim=1)</code> &mdash; gather Q over the head dim so each rank has the full query.</li>
+      <li><code>output_context_tmp, lse_context_tmp = _context.run(..., return_lse=True)</code> against the rank's paged KV shard.</li>
+      <li><code>output_context, lse_context = _dcp_combine(...)</code> &mdash; the AG-out+RS (or A2A) collective; this is the only cross-rank step.</li>
+      <li><code>output_query, lse_query = _new_tokens.run(prefill_query, key, value, return_lse=True)</code> &mdash; local causal attention, no comm.</li>
+      <li><code>merge_attn_states(out, output_context, lse_context, output_query, lse_query)</code> &mdash; LSE-merge the two regions.</li>
+    </ol>
+  </div>
+
+  <div class="callout info">
+    <strong>Why AllGather Q at all?</strong> Inside a DCP group, Q and KV are
+    sharded along <em>different</em> axes. The QKV projection is column-parallel
+    over the whole TP group (DCP ranks included), so each rank natively produces
+    Q for only <em>its</em> heads (<code>num_qo_heads</code> local). KV, by
+    contrast, can't be split by head &mdash; that's the GQA wall DCP exists to get
+    past &mdash; so it's sharded by <em>context token</em>: each rank holds the
+    same KV heads but only ~<code>1/N</code> of the positions. The LSE merge needs
+    every head to attend the <em>whole</em> context, i.e. every rank must compute
+    a partial for <em>all</em> heads against its local KV shard (a full row of the
+    <a href="#comm-example">matrix</a>) &mdash; which requires every head's Q to be
+    present everywhere. So we AllGather Q (cheap: 1 token in decode,
+    <code>query_len</code> in prefill) rather than shuffle the KV cache (huge and
+    pinned per-rank). Move Q to the data, not the data to Q. In the code, the
+    local <code>num_qo_heads</code> becomes <code>num_qo_heads &times;
+    dcp_world_size</code> for the context wrapper after the gather
+    (<span class="fileref">flashinfer.py</span>:254, 290).
+  </div>
+
+  <div class="callout warn">
+    <strong>The caveat that catches everyone</strong>: DCP only shards the
+    <em>context</em>. Notice step&nbsp;1 AllGathers Q &mdash; every rank ends up
+    computing the new-token attention for the <em>whole</em> query, so that
+    compute is <em>replicated, not parallelised</em>, across the DCP group. So
+    running DCP through a prefill batch buys you (a) less KV duplication and
+    (b) sharded context attention &mdash; genuinely useful for chunked-prefill of
+    a request that already has a long <em>cached</em> context. It does
+    <strong>not</strong> reduce the compute or TTFT of prefilling a long
+    <em>new</em> sequence. If cutting TTFT on a long new prompt is the goal,
+    that's PCP, below.
+  </div>
+
+  <div class="callout warn">
+    <strong>The constraint</strong>:
+    <code>tensor_parallel_size % decode_context_parallel_size == 0</code>
+    (<span class="fileref">vllm/config/parallel.py</span>:485). DCP <em>reuses TP
+    ranks</em>; it doesn't add new ones &mdash; it is a subdivision <em>within</em>
+    the TP domain. With TP=8 and DCP=4, each TP group of 8 ranks is split into two
+    DCP groups of 4, where the DCP dimension shards context tokens and the
+    remaining TP dimension shards heads. The world size stays 8. DCP size must lie
+    in <code>[1, tp_size / num_kv_heads]</code>.
+  </div>
+
+  <h2 id="pcp">PCP: Prefill Context Parallel</h2>
+
+  <p>
+    PCP is the follow-up to DCP that closes the gap above: it <em>also</em> shards
+    the query tokens of a prefill, so the new-token compute is split across ranks
+    and TTFT on a long new prompt drops. Sharding the query is harder than
+    sharding the context because:
+  </p>
+
+  <ul>
+    <li>Q is a long sequence (not 1 token), partitioned across the PCP ranks.</li>
+    <li>K and V also span the whole prompt.</li>
+    <li>The attention is causal &mdash; rank <code>r</code>'s tokens attend to all earlier tokens (which live on lower-rank shards), so somebody has to hold complete sequence information at merge time.</li>
+  </ul>
+
+  <p>
+    PCP doesn't replace DCP &mdash; it <em>wraps</em> it. Inside each PCP group it
+    first runs the ordinary DCP computation, then, before the final LSE update,
+    performs an <strong>AllGather within the PCP group</strong> to recover the
+    complete-sequence information the causal merge needs. Because one side of the
+    prefill merge must hold complete info, there are three implementation
+    strategies:
+  </p>
+
+  <ul>
+    <li><strong>AllGatherQ</strong> &mdash; gather the query shards (the GQA-backend approach).</li>
+    <li><strong>AllGatherKV</strong> &mdash; gather the K/V shards (the MLA-backend approach).</li>
+    <li><strong>Ring-Attention</strong> &mdash; cycle K/V around the ring instead of gathering all at once.</li>
+  </ul>
+
+  <p>
+    The ring-attention variant looks like:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">PCP=4 ring attention (prefill, 4 sequence shards)</div>
+    <ol class="steps">
+      <li>Each rank starts with its own Q, K, V shard. Compute local attention <code>Q_local &middot; K_local</code> &rarr; (O, L).</li>
+      <li>Rotate K, V to the next rank in the ring. Receive K, V from the previous rank.</li>
+      <li>Compute Q_local &middot; K_received, merge into (O, L) via LSE update.</li>
+      <li>Repeat <code>N&minus;1</code> times until every rank has seen every other rank's K/V.</li>
+      <li>Apply causal masking based on global token positions: rank <code>r</code> only attends to tokens with positions &le; its own.</li>
+    </ol>
+  </div>
+
+  <div class="callout warn">
+    <strong>PCP adds GPUs; DCP doesn't.</strong> This is the structural
+    difference. DCP is a subdivision <em>within</em> the TP domain
+    (<code>TP % DCP == 0</code>, world size unchanged). PCP's communication domain
+    stands <em>alongside</em> DP/PP/TP &mdash; it is a factor of the world size:
+    <code>world_size = PP &times; TP &times; PCP</code>
+    (<span class="fileref">vllm/config/parallel.py</span>:774-778). PCP=2 on a
+    TP=8 job means 16 GPUs, not 8.
+  </div>
+
+  <p>
+    PCP can be combined with DCP &mdash; they are orthogonal axes (PCP outer, DCP
+    inner). The total context-parallel rank is
+    <code>pcp_rank * dcp_world_size + dcp_rank</code> over a total CP world of
+    <code>pcp_world_size * dcp_world_size</code>
+    (<span class="fileref">vllm/config/parallel.py</span>:343-344), and the KV
+    interleaving (below) is defined over that combined total-CP rank.
+  </p>
+
+  <div class="callout info">
+    <strong>Status in this tree</strong>: the PCP config knob and process groups
+    exist (<span class="fileref">parallel.py</span>:116,
+    <span class="fileref">parallel_state.py</span>:1297/1628), but no attention
+    backend calls <code>get_pcp_group()</code> yet &mdash; the query-sharding
+    attention path (AllGatherQ / AllGatherKV / Ring) is still landing. DCP,
+    including the FlashInfer prefill wrapper above, is fully wired.
+  </div>
+
+  <h2 id="kv-cache">KV cache interleaving</h2>
+
+  <p>
+    The KV cache layout has to agree with the CP layout. The relevant knob is
+    <code>cp_kv_cache_interleave_size</code>:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>interleave_size</th><th>Layout</th><th>When to use</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>1</code></td>
+        <td>Token-level: token <code>i</code> on rank <code>i % CP</code></td>
+        <td>Most even load. Default for short blocks.</td>
+      </tr>
+      <tr>
+        <td><code>= block_size</code></td>
+        <td>Block-level: whole KV blocks rotate through ranks</td>
+        <td>Friendly to kernel alignment; one block per rank avoids strided gather.</td>
+      </tr>
+      <tr>
+        <td>between</td>
+        <td>Stripe of <em>interleave_size</em> tokens per rank, repeating</td>
+        <td>Tuning knob; rarely needed.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Constraint: <code>cp_kv_cache_interleave_size &le; block_size</code> and
+    <code>block_size % cp_kv_cache_interleave_size == 0</code>, enforced in
+    <span class="fileref">vllm/config/vllm.py</span>:2087-2091. The interleave is
+    defined over the combined total-CP rank, so it governs both DCP and PCP
+    striping at once.
+  </p>
+
+  <h2 id="config">Config and code pointers</h2>
+
+  <pre><code># DCP only — shards context KV, reuses the 8 TP ranks (still 8 GPUs).
+# Runs in decode AND chunked-prefill; with the FlashInfer backend now
+# returning LSE, prefill batches shard their context KV correctly.
+vllm serve meta-llama/Llama-3-70B-Instruct \
+  --tensor-parallel-size 8 \
+  --decode-context-parallel-size 4
+
+# PCP only — shards the prefill query to cut TTFT. PCP multiplies world
+# size: TP=8 * PCP=4 = 32 GPUs.
+vllm serve ... \
+  --tensor-parallel-size 8 \
+  --prefill-context-parallel-size 4
+
+# Combined — PCP outer, DCP inner. TP=8 * PCP=2 = 16 GPUs; DCP=4 then
+# subdivides each group of 8.
+vllm serve ... \
+  --tensor-parallel-size 8 \
+  --decode-context-parallel-size 4 \
+  --prefill-context-parallel-size 2
+
+# Pick the lower-latency DCP backend for MLA models
+vllm serve deepseek-ai/DeepSeek-V3 \
+  --decode-context-parallel-size 4 \
+  --dcp-comm-backend a2a</code></pre>
+
+  <ul>
+    <li>
+      <span class="fileref">vllm/config/parallel.py</span>:116
+      &mdash; <code>prefill_context_parallel_size</code>.<br>
+      :321 &mdash; <code>decode_context_parallel_size</code>.<br>
+      :326 &mdash; <code>dcp_kv_cache_interleave_size</code> (deprecated alias).<br>
+      :333 &mdash; <code>dcp_comm_backend</code> (ag_rs vs a2a).<br>
+      :341 &mdash; <code>cp_kv_cache_interleave_size</code>.<br>
+      :485 &mdash; <code>TP % DCP == 0</code> validator;
+      :491 &mdash; <code>a2a</code> requires DCP&gt;1.
+    </li>
+    <li>
+      <span class="fileref">vllm/distributed/parallel_state.py</span>:1246 (_DCP),
+      :1297 (_PCP), :1607/1620 (DCP group init), :1628/1643 (PCP group init).
+    </li>
+    <li>
+      <span class="fileref">vllm/v1/attention/backends/flashinfer.py</span>:214
+      &mdash; <code>BatchDCPPrefillWrapper</code> (the LSE-merged prefill path);
+      :281 &mdash; its <code>run()</code> two-region merge.
+    </li>
+    <li>
+      <span class="fileref">vllm/v1/attention/ops/common.py</span>:212
+      &mdash; <code>cp_lse_ag_out_rs</code> (ag_rs combine);
+      <span class="fileref">vllm/v1/attention/ops/dcp_alltoall.py</span>:393
+      &mdash; <code>dcp_a2a_lse_reduce</code> (a2a combine).
+    </li>
+    <li>
+      <span class="fileref">vllm/v1/attention/ops/merge_attn_states.py</span>
+      &mdash; the LSE merge that stitches the context and new-token regions.
+    </li>
+  </ul>
+
+  <h2 id="limits">Limits and gotchas</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>DCP reuses TP ranks</h3>
+      <p>
+        <code>TP % DCP == 0</code> is hard-enforced. Increasing DCP doesn't add
+        GPUs; it changes how the existing TP group's GPUs slice work. Memory
+        for KV is what's saved, not memory for weights.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Mamba / linear-attention has no CP</h3>
+      <p>
+        Sequence sharding only works because softmax-attention has the LSE
+        merge identity. Mamba's recurrence has no equivalent &mdash; the SSM
+        state at position <code>i</code> depends causally on every earlier
+        position, with no log-sum-exp decomposition.
+      </p>
+    </div>
+    <div class="box">
+      <h3>a2a backend requires DCP &gt; 1</h3>
+      <p>
+        With <code>DCP=1</code> there's no merge to do. The validator catches
+        misconfigurations: <code>parallel.py</code>:491.
+      </p>
+    </div>
+    <div class="box">
+      <h3>Tail imbalance at small sequences</h3>
+      <p>
+        For decode at a small batch where the prefix is shorter than CP, some
+        ranks have nothing to attend to. The collective still has to run; you
+        pay latency for no work. CP shines when the typical context is
+        &ge; 16k tokens.
+      </p>
+    </div>
+  </div>
+
+  <h2>Next</h2>
+
+  <p>
+    Read <a href="PP.html">PP.html</a> for the multi-node serving story and the
+    chunked-prefill scheduler pattern that's spiritually similar to pipeline
+    parallel.
+  </p>
+
+</main>
+</body>
+</html>

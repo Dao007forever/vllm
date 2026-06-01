@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vLLM Parallelism &mdash; Learning Notes</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .reading-paths {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin: 20px 0;
+  }
+  .reading-paths .box h3 { color: var(--violet); }
+  .doc-list { padding-left: 0; list-style: none; margin: 8px 0; }
+  .doc-list li { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+  .doc-list li:last-child { border-bottom: none; }
+  .doc-list a { font-weight: 650; }
+  .doc-list .blurb { color: var(--muted); display: block; font-size: 0.92em; margin-top: 2px; }
+  .tier {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    margin: 8px 0;
+  }
+  .tier .t {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-align: center;
+    font-size: 0.85em;
+    background: var(--panel);
+  }
+  .tier .t strong { display: block; }
+  .tier .t small { color: var(--muted); display: block; margin-top: 2px; font-size: 0.88em; }
+  .tier .t.tp { border-left: 4px solid var(--blue); }
+  .tier .t.dp { border-left: 4px solid var(--green); }
+  .tier .t.ep { border-left: 4px solid var(--amber); }
+  .tier .t.cp { border-left: 4px solid var(--red); }
+  .tier .t.pp { border-left: 4px solid var(--violet); }
+  .at-a-glance th { width: 16%; }
+  .at-a-glance th:first-child { width: 14%; }
+  @media (max-width: 820px) {
+    .reading-paths { grid-template-columns: 1fr; }
+    .tier { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>vLLM Parallelism &mdash; Learning Notes</h1>
+  <p class="subtitle">
+    Five flavours of parallelism plus the collective communication primitives
+    they're built from. Read these to develop a mental model for how vLLM splits
+    a single forward pass across many GPUs &mdash; and why the right choice
+    depends on whether you're memory-bound, bandwidth-bound, or latency-bound.
+  </p>
+
+  <section class="tldr">
+    <strong>What's here</strong>
+    <p>
+      Six docs: one foundation (collective communication primitives) and five
+      parallelism strategies (TP, DP, EP, CP, PP). Each strategy doc has worked
+      examples, the matching collective ops, and code pointers into
+      <span class="fileref">vllm/distributed/</span> and
+      <span class="fileref">vllm/model_executor/</span>.
+    </p>
+    <p>
+      <em>New here?</em> Start with
+      <a href="COMMUNICATION.html">COMMUNICATION.html</a>. Every parallel layer
+      in vLLM is built out of seven NCCL/Gloo primitives; once those click, the
+      rest of the docs read mechanically.
+    </p>
+  </section>
+
+  <h2>The five strategies, at a glance</h2>
+
+  <div class="tier">
+    <div class="t tp">
+      <strong>TP</strong>
+      <small>shard a layer</small>
+    </div>
+    <div class="t dp">
+      <strong>DP</strong>
+      <small>replicate the model</small>
+    </div>
+    <div class="t ep">
+      <strong>EP</strong>
+      <small>shard the experts</small>
+    </div>
+    <div class="t cp">
+      <strong>CP</strong>
+      <small>shard the sequence</small>
+    </div>
+    <div class="t pp">
+      <strong>PP</strong>
+      <small>shard by layer</small>
+    </div>
+  </div>
+
+  <table class="at-a-glance">
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>What's split</th>
+        <th>Primary collective</th>
+        <th>Memory effect</th>
+        <th>Latency effect</th>
+        <th>Use when</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a href="TP.html">TP</a></td>
+        <td>Weight matrix (heads/hidden)</td>
+        <td>AllReduce</td>
+        <td>Weights split 1/N</td>
+        <td>Best on NVLink</td>
+        <td>Single node, model doesn't fit one GPU</td>
+      </tr>
+      <tr>
+        <td><a href="DP.html">DP</a></td>
+        <td>Requests (not the model)</td>
+        <td>Minimal sync; All2All for MoE</td>
+        <td>Full model per rank</td>
+        <td>Single-GPU latency</td>
+        <td>Model fits; you want throughput</td>
+      </tr>
+      <tr>
+        <td><a href="EP.html">EP</a></td>
+        <td>MoE expert population</td>
+        <td>All2All</td>
+        <td>1/N experts per rank</td>
+        <td>FLOP-optimal for MoE</td>
+        <td>MoE models &mdash; basically required</td>
+      </tr>
+      <tr>
+        <td><a href="CP.html">CP</a></td>
+        <td>Sequence (token) dimension</td>
+        <td>AllGather+RS or All2All; ring Send/Recv for prefill</td>
+        <td>KV cache split 1/N</td>
+        <td>One extra collective per attention</td>
+        <td>Long context; GQA wall hit at TP</td>
+      </tr>
+      <tr>
+        <td><a href="PP.html">PP</a></td>
+        <td>Layer blocks across stages</td>
+        <td>Send/Recv</td>
+        <td>Layers split 1/N</td>
+        <td>Bubble (mitigated by microbatching)</td>
+        <td>Multi-node; slow interconnect between nodes</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Reading paths</h2>
+
+  <div class="reading-paths">
+    <div class="box">
+      <h3>1. On-ramp</h3>
+      <p>You've heard the terms but the differences blur together. One doc to bootstrap the mental model.</p>
+      <ol>
+        <li><a href="COMMUNICATION.html">COMMUNICATION.html</a> &mdash; the seven collectives</li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>2. Serving engineer</h3>
+      <p>You're tuning a deployment. Read in order of "most likely knob you'll touch."</p>
+      <ol>
+        <li><a href="TP.html">TP.html</a></li>
+        <li><a href="DP.html">DP.html</a></li>
+        <li><a href="PP.html">PP.html</a></li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>3. MoE / long-context</h3>
+      <p>You're deploying DeepSeek-V3 / Mixtral / a long-context Llama. The harder cases.</p>
+      <ol>
+        <li><a href="EP.html">EP.html</a></li>
+        <li><a href="CP.html">CP.html</a></li>
+        <li><a href="DP.html">DP.html</a> (MoE section)</li>
+      </ol>
+    </div>
+  </div>
+
+  <h2>All notes</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Foundation</h3>
+      <ul class="doc-list">
+        <li>
+          <a href="COMMUNICATION.html">COMMUNICATION.html</a>
+          <span class="blurb">Broadcast, AllReduce, AllGather, ReduceScatter, All2All, Send/Recv: the seven NCCL/Gloo primitives every parallelism strategy is built from. Cheat-sheet, worked examples, useful algebraic identities, and where vLLM exposes them.</span>
+        </li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Strategies</h3>
+      <ul class="doc-list">
+        <li>
+          <a href="TP.html">TP.html</a> &mdash; Tensor Parallelism
+          <span class="blurb">Column/Row parallel linear layers, the Q&middot;K&middot;V to o_proj &amp; gate_up to down pattern, sequence-parallel optimisation, and why you can't shard softmax-attention by hidden dim.</span>
+        </li>
+        <li>
+          <a href="DP.html">DP.html</a> &mdash; Data Parallelism
+          <span class="blurb">Replicate the model. Trivial for dense, coupled for MoE (where DP defines the All2All batch). Internal/external/hybrid load balancers, padding, dual-batch overlap.</span>
+        </li>
+        <li>
+          <a href="EP.html">EP.html</a> &mdash; Expert Parallelism
+          <span class="blurb">Each rank owns whole experts. All2All dispatch/combine. The seven All2All backends. EPLB load balancing. Elastic EP for scale-up/down.</span>
+        </li>
+        <li>
+          <a href="CP.html">CP.html</a> &mdash; Context Parallelism (DCP + PCP)
+          <span class="blurb">Shard the sequence dimension. LSE merge algebra. DCP for decode reuses TP ranks; PCP for prefill uses ring attention. KV cache interleaving.</span>
+        </li>
+        <li>
+          <a href="PP.html">PP.html</a> &mdash; Pipeline Parallelism &amp; Chunked Pipeline Parallel
+          <span class="blurb">Layer-block stages connected by Send/Recv. The bubble problem and microbatching. CPP narrow (rbln #5: async Send removes Bubble 0) vs broad (vLLM RFC #28912: four-bubble taxonomy, FLOPs-balanced chunking, async scheduler + async isend/irecv).</span>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>How these docs relate</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">Concept dependencies</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:8px;align-items:start">
+      <div style="grid-column:1/2;text-align:center">
+        <a href="COMMUNICATION.html" style="text-decoration:none">
+          <div style="background:var(--violet-soft);border:2px solid var(--violet);border-radius:8px;padding:10px;font-weight:650;color:var(--violet)">
+            COMMUNICATION
+            <div style="font-size:0.78em;color:var(--muted);font-weight:400;margin-top:2px">primitives &amp; cheat sheet</div>
+          </div>
+        </a>
+      </div>
+      <div style="grid-column:2/4;font-size:1.3em;color:var(--muted);align-self:center;text-align:center">&rarr; supplies vocabulary for all five strategies &rarr;</div>
+
+      <div style="grid-column:1/4;display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:14px">
+        <a href="TP.html" style="text-decoration:none">
+          <div style="background:#f6f9ff;border:1px solid #cdd9e8;border-radius:8px;padding:10px;text-align:center">
+            <strong>TP</strong>
+            <div style="font-size:0.74em;color:var(--muted);margin-top:2px">shard a layer<br><em>AllReduce</em></div>
+          </div>
+        </a>
+        <a href="DP.html" style="text-decoration:none">
+          <div style="background:#eaf6ee;border:1px solid #abd1bb;border-radius:8px;padding:10px;text-align:center">
+            <strong>DP</strong>
+            <div style="font-size:0.74em;color:var(--muted);margin-top:2px">replicate model<br><em>barrier sync</em></div>
+          </div>
+        </a>
+        <a href="EP.html" style="text-decoration:none">
+          <div style="background:#fff5e6;border:1px solid #f7d599;border-radius:8px;padding:10px;text-align:center">
+            <strong>EP</strong>
+            <div style="font-size:0.74em;color:var(--muted);margin-top:2px">shard experts<br><em>All2All</em></div>
+          </div>
+        </a>
+        <a href="CP.html" style="text-decoration:none">
+          <div style="background:#fae9e7;border:1px solid #e0b3ae;border-radius:8px;padding:10px;text-align:center">
+            <strong>CP</strong>
+            <div style="font-size:0.74em;color:var(--muted);margin-top:2px">shard sequence<br><em>LSE merge</em></div>
+          </div>
+        </a>
+        <a href="PP.html" style="text-decoration:none">
+          <div style="background:#f0eaf7;border:1px solid #c9b8dc;border-radius:8px;padding:10px;text-align:center">
+            <strong>PP</strong>
+            <div style="font-size:0.74em;color:var(--muted);margin-top:2px">shard by layer<br><em>Send/Recv</em></div>
+          </div>
+        </a>
+      </div>
+
+      <div style="grid-column:1/4;text-align:center;font-size:1.1em;color:var(--muted);margin-top:14px">
+        Composition: <code>world_size = DP &times; PP &times; PCP &times; TP</code> &mdash; the strategies are orthogonal and stack multiplicatively.
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Each strategy is a different choice of <em>what to shard</em> and <em>which collective handles the join</em>. The communication doc enumerates the joins; the strategy docs use them.
+    </div>
+  </div>
+
+  <h2>Mental model</h2>
+
+  <div class="callout info">
+    <ul>
+      <li><strong>COMMUNICATION</strong> &mdash; the alphabet. Every parallel layer in vLLM is a sentence in this alphabet.</li>
+      <li><strong>TP</strong> &mdash; shard <em>within a layer</em>; pay AllReduce per Column&rarr;Row pair.</li>
+      <li><strong>DP</strong> &mdash; shard <em>requests</em>; pay almost nothing (until MoE forces a per-step All2All).</li>
+      <li><strong>EP</strong> &mdash; shard <em>experts</em>; pay All2All dispatch and combine per MoE layer.</li>
+      <li><strong>CP</strong> &mdash; shard <em>tokens</em>; pay one LSE merge per attention layer (DCP reuses TP ranks, PCP uses ring SendRecv).</li>
+      <li><strong>PP</strong> &mdash; shard <em>by layer-block</em>; pay one Send/Recv per stage boundary, mind the bubble.</li>
+    </ul>
+  </div>
+
+  <h2>Where to find the code</h2>
+
+  <ul>
+    <li>
+      <strong>Group construction</strong>:
+      <span class="fileref">vllm/distributed/parallel_state.py</span>
+      &mdash; <code>initialize_model_parallel()</code> builds all five
+      groups (TP/DP/PP/PCP/DCP, plus EP/EPLB for MoE) from one
+      <code>ExternalDP &times; DP &times; PP &times; PCP &times; TP</code> rank
+      grid.
+    </li>
+    <li>
+      <strong>Collectives</strong>:
+      <span class="fileref">vllm/distributed/communication_op.py</span> &mdash;
+      wrapper functions like <code>tensor_model_parallel_all_reduce</code>.
+    </li>
+    <li>
+      <strong>Device-specific kernels</strong>:
+      <span class="fileref">vllm/distributed/device_communicators/</span> &mdash;
+      All2All managers (DeepEP, Mori, NIXL, FlashInfer, etc.) and the custom-AR
+      CUDA kernel.
+    </li>
+    <li>
+      <strong>Parallel layers</strong>:
+      <span class="fileref">vllm/model_executor/layers/linear.py</span> &mdash;
+      <code>ColumnParallelLinear</code>, <code>RowParallelLinear</code>,
+      <code>QKVParallelLinear</code>, etc.
+    </li>
+    <li>
+      <strong>MoE</strong>:
+      <span class="fileref">vllm/model_executor/layers/fused_moe/</span> &mdash;
+      <code>FusedMoE</code> and its dispatcher.
+    </li>
+    <li>
+      <strong>Config</strong>:
+      <span class="fileref">vllm/config/parallel.py</span> &mdash; every knob
+      mentioned in this folder, with its default and validation.
+    </li>
+  </ul>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Companion to the KV-cache notes at
+    <a href="../kv_cache/index.html"><span class="fileref">learnings/kv_cache/</span></a>.
+    Together they cover "how a single forward pass works" (KV cache) and "how
+    that pass is spread across many GPUs" (parallelism).
+  </p>
+</main>
+</body>
+</html>

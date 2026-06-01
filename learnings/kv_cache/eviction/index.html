@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KV-Cache LRU Eviction (HMA, SWA, Mamba)</title>
+<link rel="stylesheet" href="../../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="../index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <span class="fileref">vllm/v1/core/{block_pool,kv_cache_utils,single_type_kv_cache_manager,kv_cache_coordinator}.py</span>
+  </div>
+
+  <h1>KV-Cache LRU Eviction</h1>
+  <p class="subtitle">
+    How the Hybrid Memory Allocator orders, evicts, and rescues prefix-cache
+    blocks &mdash; the reverse-on-free trick, the hash/no-hash split, and how
+    SWA, Mamba, and <code>RETENTION_INTERVAL</code> change the rules.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      Free blocks live in a <b>doubly-linked LRU queue</b>. The <em>head</em> is
+      evicted first, the <em>tail</em> last. Allocation pops from the head;
+      freeing appends to the tail. A block whose request finished but still
+      carries a <code>block_hash</code> is an <em>eviction candidate</em>: it sits
+      in the queue but is still in the prefix-cache hash map, so it can still
+      score a hit &mdash; until it reaches the head and gets popped (real
+      eviction) or a new request <em>touches</em> it (rescue).
+    </p>
+    <p>
+      To keep prefix-cache hit rate high, vLLM <b>frees a request's blocks in
+      reverse</b> (tail-first) and <b>splits freed blocks by hash</b>: blocks that
+      can never match (no hash) are <em>prepended</em> to the very front
+      (evicted first); cacheable blocks are <em>appended</em> to the back. The
+      net effect: a request's reusable <em>prefix</em> blocks survive longest,
+      its request-specific <em>suffix</em> blocks die first.
+    </p>
+    <p>
+      SWA and Mamba additionally free blocks <em>mid-request</em> (they only need
+      a tail window / a single recurrent state), and cache <em>sparsely</em>.
+      <code>VLLM_PREFIX_CACHE_RETENTION_INTERVAL</code> thins SWA's cached
+      checkpoints even further to free pool capacity for full-attention prefixes.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#cast">The cast: four data structures</a></li>
+      <li><a href="#queue">The free queue <em>is</em> the LRU order</a></li>
+      <li><a href="#lifecycle">A block's lifecycle</a></li>
+      <li><a href="#evict-touch">Eviction vs. rescue (touch)</a></li>
+      <li><a href="#reverse">Trick #1: reverse-on-free</a></li>
+      <li><a href="#split">Trick #2: hash / no-hash split</a></li>
+      <li><a href="#hma">HMA &amp; align mode</a></li>
+      <li><a href="#swa">SWA eviction</a></li>
+      <li><a href="#mamba">Mamba eviction</a></li>
+      <li><a href="#retention">RETENTION_INTERVAL</a></li>
+      <li><a href="#summary">Summary table</a></li>
+    </ol>
+  </nav>
+
+  <!-- ============================================================ -->
+  <h2 id="cast">The cast: four data structures</h2>
+
+  <p>
+    All eviction logic lives in the <b>BlockPool</b> and the structures it owns.
+    Everything below is per-engine (per worker), in plain Python &mdash; no GPU
+    work happens here, only bookkeeping of which physical block holds whose KV.
+  </p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>KVCacheBlock</h3>
+      <p>One physical block's metadata.</p>
+      <ul>
+        <li><code>block_id</code> &mdash; index into the GPU tensor</li>
+        <li><code>ref_cnt</code> &mdash; how many live requests use it</li>
+        <li><code>_block_hash</code> &mdash; set iff the block is full + cached</li>
+        <li><code>prev/next_free_block</code> &mdash; links for the free queue</li>
+        <li><code>is_null</code> &mdash; the placeholder block 0</li>
+      </ul>
+      <span class="fileref">kv_cache_utils.py:117</span>
+    </div>
+    <div class="box">
+      <h3>FreeKVCacheBlockQueue</h3>
+      <p>Doubly-linked list of free blocks, in <b>eviction order</b>.</p>
+      <ul>
+        <li>head = least-recently-used &rarr; <b>evicted first</b></li>
+        <li>tail = most-recently-used &rarr; evicted last</li>
+        <li>O(1) removal from the <em>middle</em> (needed for rescue)</li>
+        <li>fake head/tail sentinels remove branchy edge cases</li>
+      </ul>
+      <span class="fileref">kv_cache_utils.py:165</span>
+    </div>
+    <div class="box">
+      <h3>BlockHashToBlockMap</h3>
+      <p>The prefix cache itself: <code>{block_hash &rarr; block(s)}</code>.</p>
+      <ul>
+        <li>A block being <em>free</em> does <b>not</b> remove it from here</li>
+        <li>So a freed-but-not-yet-evicted block can still serve a hit</li>
+        <li>Eviction = pop from <em>both</em> the queue and this map</li>
+      </ul>
+      <span class="fileref">block_pool.py:34</span>
+    </div>
+    <div class="box">
+      <h3>BlockPool</h3>
+      <p>Owns the above + the master <code>blocks[]</code> list.</p>
+      <ul>
+        <li><code>get_new_blocks</code> &mdash; allocate (popleft + evict)</li>
+        <li><code>touch</code> &mdash; rescue a candidate from the queue</li>
+        <li><code>free_blocks</code> &mdash; return blocks to the queue</li>
+        <li><code>null_block</code> popped at init, never freed</li>
+      </ul>
+      <span class="fileref">block_pool.py:130</span>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The key insight that makes prefix caching work</strong>
+    Freeing a block (ref_cnt &rarr; 0) and <em>evicting</em> it from the prefix
+    cache are <b>two separate events</b>. Between them, the block is an
+    <em>eviction candidate</em>: physically reclaimable, but still hashed and
+    still matchable. The whole LRU machinery exists to delay that second event
+    for the blocks most likely to be reused.
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="queue">The free queue <em>is</em> the LRU order</h2>
+
+  <p>
+    There is no separate priority list or timestamp. A block's eviction priority
+    <b>is its position</b> in <code>FreeKVCacheBlockQueue</code>. Closer to the
+    head &rArr; evicted sooner.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">FreeKVCacheBlockQueue &mdash; doubly linked, head = next victim</div>
+    <div class="linked-list">
+      <div class="ll-node sentinel">HEAD<span class="ll-tag">sentinel</span></div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node head">B7<span class="ll-tag">evict 1st (LRU)</span></div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node">B2</div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node">B5</div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node tail">B1<span class="ll-tag">evict last (MRU)</span></div>
+      <span class="ll-arrow">&harr;</span>
+      <div class="ll-node sentinel">TAIL<span class="ll-tag">sentinel</span></div>
+    </div>
+    <div class="diagram-caption">
+      <code>popleft()</code> takes B7 (allocate / evict). <code>append()</code> adds after B1.
+      <code>remove(B5)</code> splices B5 out in O(1) when a hit rescues it.
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Operation</th><th>Where in queue</th><th>When</th><th>Code</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>popleft</code> / <code>popleft_n</code></td>
+        <td>from the <b>head</b></td>
+        <td>allocating new blocks (the LRU victim is taken first)</td>
+        <td><span class="fileref">utils:217,254</span></td>
+      </tr>
+      <tr>
+        <td><code>append</code> / <code>append_n</code></td>
+        <td>at the <b>tail</b></td>
+        <td>freeing cacheable blocks (kept longest)</td>
+        <td><span class="fileref">utils:307,351</span></td>
+      </tr>
+      <tr>
+        <td><code>prepend_n</code></td>
+        <td>at the <b>head</b></td>
+        <td>freeing un-cacheable blocks (killed first)</td>
+        <td><span class="fileref">utils:330</span></td>
+      </tr>
+      <tr>
+        <td><code>remove</code></td>
+        <td>from the <b>middle</b> (O(1))</td>
+        <td>a prefix hit <em>touches</em> a candidate &rarr; pull it out</td>
+        <td><span class="fileref">utils:287</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout code-ref">
+    <strong>Why a hand-rolled linked list instead of <code>collections.deque</code>?</strong>
+    Rescue (<code>remove</code>) must delete an arbitrary middle node in O(1) &mdash;
+    deque can't. The class also mutates <code>prev/next_free_block</code> on the
+    blocks themselves and allocates <b>zero</b> Python objects per op, closing the
+    gap to deque's C implementation.
+    <span class="fileref">kv_cache_utils.py:165&ndash;185</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="lifecycle">A block's lifecycle</h2>
+
+  <div class="flow">
+    <div class="flow-step b"><span class="num">STATE 1</span><b>FREE</b><br>in queue, no hash, ref_cnt 0</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step g"><span class="num">STATE 2</span><b>USED</b><br>popped, ref_cnt &ge; 1</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step a"><span class="num">STATE 3</span><b>CACHED + USED</b><br>full block, hash set</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step v"><span class="num">STATE 4</span><b>CANDIDATE</b><br>ref_cnt 0, hash kept, back in queue</div>
+  </div>
+  <div class="flow">
+    <div class="flow-step v" style="max-width:240px"><span class="num">FROM STATE 4</span><b>Two exits</b></div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step r"><span class="num">EXIT A</span><b>EVICTED</b><br>reaches head, <code>get_new_blocks</code> pops it, hash cleared &rarr; back to STATE 2 for a new owner</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step g"><span class="num">EXIT B</span><b>RESCUED</b><br>a hit <code>touch</code>es it, <code>remove</code>d from queue, ref_cnt++ &rarr; back to STATE 3</div>
+  </div>
+
+  <p>
+    State 4 is the heart of prefix caching. A finished request's blocks are
+    <em>free</em> (reclaimable) yet <em>still cached</em> (matchable). The longer
+    a valuable block survives in State 4, the higher the hit rate. Every trick on
+    this page is about <b>controlling how fast each block drifts toward the
+    head</b> (Exit A).
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="evict-touch">Eviction vs. rescue (touch)</h2>
+
+  <h3>Eviction happens lazily, at allocation time</h3>
+  <p>
+    There is no background evictor. Eviction is a side effect of
+    <code>get_new_blocks</code>: pop <code>n</code> blocks from the head, and for
+    each, call <code>_maybe_evict_cached_block</code> &mdash; if it still carries a
+    hash, drop that hash from <code>BlockHashToBlockMap</code> and
+    <code>reset_hash()</code>. Only now is the cached prefix gone.
+  </p>
+  <div class="callout code-ref">
+    <strong><span class="fileref">block_pool.py:333&ndash;400</span></strong>
+<pre><code><span class="k">def</span> <span class="fn">get_new_blocks</span>(self, num_blocks):
+    ret = self.free_block_queue.<span class="fn">popleft_n</span>(num_blocks)   <span class="c"># take LRU victims</span>
+    <span class="k">for</span> block <span class="k">in</span> ret:
+        self.<span class="fn">_maybe_evict_cached_block</span>(block)         <span class="c"># drop its hash if any</span>
+        block.ref_cnt += <span class="n">1</span>
+    <span class="k">return</span> ret</code></pre>
+  </div>
+
+  <h3>Rescue: a hit pulls a candidate back out</h3>
+  <p>
+    When a new request's <code>find_longest_cache_hit</code> matches a candidate
+    block, the block must leave the free queue before it can be reused.
+    <code>touch</code> does exactly that: if <code>ref_cnt == 0</code> it
+    <code>remove</code>s the block from the queue (the O(1) middle splice), then
+    bumps <code>ref_cnt</code>. The block is now shared, hash intact, no
+    recomputation needed.
+  </p>
+  <div class="callout code-ref">
+    <strong><span class="fileref">block_pool.py:402&ndash;417</span></strong>
+<pre><code><span class="k">def</span> <span class="fn">touch</span>(self, blocks):
+    <span class="k">for</span> block <span class="k">in</span> blocks:
+        <span class="k">if</span> block.ref_cnt == <span class="n">0</span> <span class="k">and</span> <span class="k">not</span> block.is_null:
+            self.free_block_queue.<span class="fn">remove</span>(block)   <span class="c"># rescue from eviction</span>
+        block.ref_cnt += <span class="n">1</span></code></pre>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="reverse">Trick #1: reverse-on-free keeps prefixes alive</h2>
+
+  <p>
+    Blocks are allocated <b>front-to-back</b>: block 0 holds the first prompt
+    tokens (often a shared system prompt), the last block holds the
+    request-specific tail. For future hit rate, the <em>front</em> blocks are
+    gold (many requests share them) and the <em>tail</em> blocks are nearly
+    worthless (unique to this request).
+  </p>
+  <p>
+    So when a request finishes, vLLM frees its blocks <b>in reverse order</b> &mdash;
+    tail block first. Because <code>free_blocks</code> appends to the queue
+    <em>tail</em> (the MRU / evict-last end), feeding it tail-first lands the
+    request-tail nearest the head (dies first) and the shared prefix nearest the
+    tail (dies last).
+  </p>
+
+  <div class="callout code-ref">
+    <strong>The reversal &mdash; <span class="fileref">single_type_kv_cache_manager.py:401&ndash;409</span></strong>
+<pre><code><span class="k">def</span> <span class="fn">free</span>(self, request_id):
+    <span class="c"># Free blocks in reverse order so that the tail blocks are freed first.</span>
+    self.block_pool.<span class="fn">free_blocks</span>(<span class="fn">reversed</span>(self.<span class="fn">pop_blocks_for_free</span>(request_id)))</code></pre>
+    <code>pop_blocks_for_free</code> returns blocks in <em>allocation</em> order;
+    <code>reversed()</code> hands them to the pool tail-first. The top-level
+    <code>KVCacheManager.free</code> documents the same intent
+    (<span class="fileref">kv_cache_manager.py:460</span>).
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Request R1 = [B0 prefix &hellip; B3 tail], then freed</div>
+
+    <div class="diagram-row"><span class="cell label">allocated</span>
+      <div class="cell cached">B0<span class="lo">"You are"</span></div>
+      <div class="cell cached">B1<span class="lo">"a help…"</span></div>
+      <div class="cell cached">B2<span class="lo">user msg</span></div>
+      <div class="cell cached">B3<span class="lo">tail</span></div>
+    </div>
+
+    <div class="diagram-row"><span class="cell label">reversed&rarr;free</span>
+      <div class="cell dirty">B3</div>
+      <div class="cell dirty">B2</div>
+      <div class="cell dirty">B1</div>
+      <div class="cell dirty">B0</div>
+    </div>
+
+    <div class="diagram-row"><span class="cell label">queue after</span>
+      <span class="cell" style="border:none;background:transparent;color:var(--muted)">HEAD&rarr;</span>
+      <div class="cell evicted">B3<span class="lo">evict 1st</span></div>
+      <div class="cell used">B2</div>
+      <div class="cell used">B1</div>
+      <div class="cell match">B0<span class="lo">evict last</span></div>
+      <span class="cell" style="border:none;background:transparent;color:var(--muted)">&larr;TAIL</span>
+    </div>
+    <div class="diagram-caption">
+      Next request R2 shares "You are a helpful…" &rarr; it matches B0/B1, which
+      sit at the survive-longest end. Result: <b>prefix hit</b> instead of recompute.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>The invariant, stated</strong> (<span class="fileref">kv_cache_utils.py:174&ndash;181</span>)
+    <p style="margin:6px 0 0">
+      "(1) The least recently used block is at the front. (2) If two blocks have
+      the same last accessed time (allocated by the same sequence), the one with
+      <b>more hash tokens (the tail of a block chain)</b> is at the front. &hellip;
+      we maintain this order by <b>reversing the block order</b> when freeing
+      blocks of a request."
+    </p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="split">Trick #2: hash / no-hash split inside <code>free_blocks</code></h2>
+
+  <p>
+    Reversal orders blocks <em>within</em> a request. <code>free_blocks</code> adds
+    a second axis: a partial (non-full) block never got a hash, so it can
+    <b>never</b> match in the prefix cache. Keeping it around only wastes a
+    survive-long slot. So <code>free_blocks</code> sorts the freed blocks into two
+    bins and places them at opposite ends:
+  </p>
+
+  <div class="callout code-ref">
+    <strong><span class="fileref">block_pool.py:419&ndash;440</span></strong>
+<pre><code><span class="k">def</span> <span class="fn">free_blocks</span>(self, ordered_blocks):
+    blocks_with_hash, blocks_without_hash = [], []
+    <span class="k">for</span> block <span class="k">in</span> ordered_blocks:
+        block.ref_cnt -= <span class="n">1</span>
+        <span class="k">if</span> block.ref_cnt == <span class="n">0</span> <span class="k">and</span> <span class="k">not</span> block.is_null:
+            (blocks_without_hash <span class="k">if</span> block.block_hash <span class="k">is</span> <span class="k">None</span>
+             <span class="k">else</span> blocks_with_hash).<span class="fn">append</span>(block)
+    <span class="c"># no-hash blocks can never match → evict them first (front)</span>
+    self.free_block_queue.<span class="fn">prepend_n</span>(blocks_without_hash)
+    <span class="c"># cacheable blocks → keep them longest (back)</span>
+    self.free_block_queue.<span class="fn">append_n</span>(blocks_with_hash)</code></pre>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Two ends of the queue after a free</div>
+    <div class="cell-row" style="justify-content:center;align-items:center">
+      <span class="cell" style="border:none;background:transparent;color:var(--muted)">HEAD</span>
+      <div class="cell evicted">no-hash<span class="lo">prepend</span></div>
+      <div class="cell free">…older free…</div>
+      <div class="cell cached">hashed tail</div>
+      <div class="cell match">hashed prefix<span class="lo">append last</span></div>
+      <span class="cell" style="border:none;background:transparent;color:var(--muted)">TAIL</span>
+    </div>
+    <div class="diagram-caption">
+      Eviction priority, left&rarr;right: un-cacheable junk first, then old free
+      blocks, then this request's cacheable suffix, finally its reusable prefix.
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="hma">HMA &amp; align mode</h2>
+
+  <p>
+    The <b>Hybrid Memory Allocator</b> (HMA, the <code>HybridKVCacheCoordinator</code>)
+    drives models that mix attention types &mdash; e.g. full attention + sliding
+    window, or attention + Mamba. Each type is its own <b>KV cache group</b> with
+    its own <code>block_size</code> and its own <code>SingleTypeKVCacheManager</code>,
+    but they all share <b>one</b> <code>BlockPool</code> and therefore one free
+    queue. Eviction is global; the per-group managers only decide <em>what</em> to
+    free and <em>what</em> to cache.
+  </p>
+
+  <h3>Alignment: making heterogeneous groups agree on a prefix</h3>
+  <p>
+    Groups have different block sizes, so a "prefix of length N tokens" lands on
+    different block boundaries in each group. HMA forces every cross-request hit
+    to a length that is a multiple of <code>scheduler_block_size</code> = the
+    <b>LCM of all group block sizes</b>
+    (<span class="fileref">kv_cache_utils.py:593&ndash;627</span>). That shared
+    <code>alignment_tokens</code> value is threaded into every group's
+    <code>find_longest_cache_hit</code> and <code>cache_blocks</code>, so all
+    groups commit to and resume from the <em>same</em> token boundaries.
+  </p>
+
+  <div class="eq">
+    scheduler_block_size = lcm(block_size of every group)<br>
+    e.g. full attn = <b>32</b>, SWA = <b>8</b> &nbsp;&rarr;&nbsp; lcm = <b>32</b><br>
+    every cross-request cache hit length &equiv; 0 (mod 32)
+  </div>
+
+  <h3>Mamba "align" cache mode</h3>
+  <p>
+    For attention+Mamba hybrids, <code>--mamba-cache-mode</code> picks how Mamba
+    participates in prefix caching (<span class="fileref">config/cache.py:133&ndash;141</span>):
+  </p>
+  <table>
+    <thead><tr><th>mode</th><th>meaning</th><th>blocks reserved / request</th></tr></thead>
+    <tbody>
+      <tr><td><code>none</code></td><td>prefix caching off for Mamba</td><td><code>page &times; (1 + spec)</code></td></tr>
+      <tr><td><code>all</code></td><td>cache the Mamba state at every <code>i&middot;block_size</code> (default when PC on)</td><td><code>page &times; (cdiv(max_len,bs) + spec)</code></td></tr>
+      <tr>
+        <td><code>align</code></td>
+        <td>cache the state only at the <b>last token of each scheduler step</b>
+            <em>and</em> at <code>i&middot;block_size</code>; Mamba's block_size is
+            forced equal to the attention block_size so hashes line up</td>
+        <td><code>page &times; (2 + spec)</code> &mdash; only ~2 live blocks ever</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    In <code>align</code> mode Mamba's <code>block_size == cache_config.block_size</code>,
+    which keeps the hash granularity divisible across groups; otherwise hashing
+    backs off to <code>scheduler_block_size</code>
+    (<span class="fileref">kv_cache_utils.py:636&ndash;644</span>). The
+    <code>page &times; 2</code> reservation is the eviction story below: Mamba never
+    holds the whole sequence, just the current state block plus one source block.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="swa">SWA eviction</h2>
+
+  <p>
+    Sliding-window attention only attends to the last <code>sliding_window</code>
+    tokens, so blocks that fall out the back of the window are dead weight. SWA
+    therefore evicts on <b>two</b> timelines.
+  </p>
+
+  <h3>(a) Mid-request: <code>remove_skipped_blocks</code></h3>
+  <p>
+    As the request decodes, blocks that slid out of the window are freed back to
+    the pool <em>immediately</em> and replaced with the null block in the
+    request's block list. The number skipped is
+    <code>max(0, num_computed_tokens &minus; sliding_window + 1)</code>.
+  </p>
+  <div class="diagram">
+    <div class="diagram-title">sliding_window = 4, after computing token 7</div>
+    <div class="cell-row" style="justify-content:flex-start">
+      <div class="cell evicted">t0</div>
+      <div class="cell evicted">t1</div>
+      <div class="cell evicted">t2</div>
+      <div class="cell evicted">t3</div>
+      <div class="cell used hot">t4</div>
+      <div class="cell used">t5</div>
+      <div class="cell used">t6</div>
+      <div class="cell used">t7</div>
+    </div>
+    <div class="diagram-caption">
+      t0&ndash;t3 are outside the window &rarr; their blocks are freed mid-flight
+      (<code>get_num_skipped_tokens(7) = 4</code>). SWA's peak live blocks &asymp;
+      one window, which is why it carries a recycling-aware admission cap
+      (<span class="fileref">single_type_kv_cache_manager.py:770&ndash;796</span>).
+    </div>
+  </div>
+  <p>
+    <code>remove_skipped_blocks</code> walks the skipped range <b>back-to-front</b>,
+    frees each real block, and stops at the first already-null block (everything
+    before it was nulled on a prior call)
+    (<span class="fileref">single_type_kv_cache_manager.py:479&ndash;520</span>).
+  </p>
+
+  <h3>(b) On hit: right-to-left search</h3>
+  <p>
+    A SWA prefix hit doesn't need the whole prefix &mdash; only the last window's
+    worth of contiguous cached blocks. <code>find_longest_cache_hit</code> scans
+    <b>right to left</b>, needs <code>sliding_window_contiguous_blocks</code> in a
+    row, and returns <code>[NULL, NULL, &hellip;, blk, blk]</code> with everything
+    before the window nulled out
+    (<span class="fileref">single_type_kv_cache_manager.py:619&ndash;704</span>).
+  </p>
+
+  <h3>(c) Sparse caching: <code>reachable_block_mask</code></h3>
+  <p>
+    Because only the tail window is ever consulted at any aligned boundary, most
+    interior blocks of a long prompt can <b>never</b> serve a hit. Caching them
+    would just burn hash-map slots and add eviction pressure. SWA overrides
+    <code>reachable_block_mask</code> to mark only the <code>need</code> contiguous
+    blocks just before each boundary as cacheable; <code>cache_full_blocks</code>
+    skips the rest (treated like null blocks)
+    (<span class="fileref">single_type_kv_cache_manager.py:706&ndash;768</span>,
+    <span class="fileref">block_pool.py:211&ndash;283</span>).
+    <code>RETENTION_INTERVAL</code> tunes <em>how many</em> of those tails survive
+    &mdash; see below.
+  </p>
+
+  <!-- ============================================================ -->
+  <h2 id="mamba">Mamba eviction</h2>
+
+  <p>
+    Mamba is recurrent: it carries a single fixed-size state, not a per-token KV
+    history. So "the past" is one block, not N.
+    <code>get_num_skipped_tokens(n) = n &minus; 1</code> &mdash; everything except the
+    most recent state is skippable
+    (<span class="fileref">single_type_kv_cache_manager.py:1206&ndash;1212</span>).
+  </p>
+
+  <h3>The 2-block dance in align mode</h3>
+  <p>
+    In <code>align</code> mode the new step's state is computed <em>from</em> the
+    previous step's block, so for one step two blocks must coexist: the
+    <b>source</b> (previous) and the <b>destination</b> (current).
+    <code>last_state_block_idx</code> tracks the block from <em>two</em> steps ago;
+    once the current state has moved past it, that block is freed and nulled
+    (<span class="fileref">single_type_kv_cache_manager.py:1021&ndash;1049</span>).
+    That is exactly the <code>page &times; (2 + spec)</code> reservation.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">align-mode state hand-off (num_speculative_blocks = 0)</div>
+    <div class="diagram-row"><span class="cell label">step k</span>
+      <div class="cell null">B0 null</div>
+      <div class="cell null">B1 null</div>
+      <div class="cell evicted">B2<span class="lo">2-ago: free</span></div>
+      <div class="cell used hot">B3<span class="lo">state</span></div>
+    </div>
+    <div class="diagram-row"><span class="cell label">step k+1</span>
+      <div class="cell null">B0 null</div>
+      <div class="cell null">B1 null</div>
+      <div class="cell null">B2 null</div>
+      <div class="cell cached">B3<span class="lo">source</span></div>
+      <div class="cell used hot">B4<span class="lo">new state</span></div>
+    </div>
+    <div class="diagram-caption">
+      Only ever ~2 non-null blocks live, regardless of sequence length. Skipped
+      positions hold the shared null block.
+    </div>
+  </div>
+
+  <h3>On hit: last match only</h3>
+  <p>
+    Since only the latest state matters, <code>find_longest_cache_hit</code> scans
+    right-to-left and <b>early-stops on the first match</b>, returning
+    <code>[NULL]&times;i + [cached]</code>
+    (<span class="fileref">single_type_kv_cache_manager.py:973&ndash;1019</span>).
+  </p>
+
+  <div class="callout warn">
+    <strong>Cross-step hazard: can't reuse a state cached this very step</strong>
+    A Mamba block's state cached by <em>another</em> request in the
+    <em>current</em> scheduler step isn't materialized yet, so it can't be reused
+    until next step. <code>get_num_blocks_to_allocate</code> detects this
+    (<code>cached_blocks_this_step</code>) and returns
+    <code>num_gpu_blocks + 1</code> &mdash; an impossible demand &mdash; to force the
+    scheduler to defer the request to the next step
+    (<span class="fileref">single_type_kv_cache_manager.py:1067&ndash;1075</span>).
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="retention">How <code>RETENTION_INTERVAL</code> helps</h2>
+
+  <p>
+    <code>VLLM_PREFIX_CACHE_RETENTION_INTERVAL</code> tunes <b>how sparsely SWA
+    checkpoints are cached</b>. It only affects sliding-window groups &mdash; setting
+    it on a model with no SWA group is rejected, and the value must be a
+    non-negative multiple of <code>scheduler_block_size</code>
+    (<span class="fileref">kv_cache_coordinator.py:30&ndash;57</span>;
+    env at <span class="fileref">envs.py:282,1056</span>).
+  </p>
+
+  <h3>First: what is a "checkpoint"?</h3>
+  <p>
+    A <b>checkpoint</b> is a <em>resumable prefix boundary</em> for the SWA group:
+    an aligned prefix length <b>L</b> (a multiple of
+    <code>scheduler_block_size</code>) together with the run of cached SWA blocks
+    that lets a <em>future</em> request rebuild the window at L and continue &mdash;
+    i.e. score a prefix-cache hit there.
+  </p>
+  <p>
+    Why SWA needs the concept at all: full attention keeps the <em>entire</em>
+    prefix, so <b>every</b> block boundary is automatically resumable. SWA keeps
+    only a sliding window, so a boundary is resumable <b>only if the window's
+    worth of blocks ending at it are still cached</b>. That run is exactly
+    <code>need</code> blocks:
+  </p>
+  <div class="eq">
+    need = cdiv(sliding_window &minus; 1, block_size)&nbsp;&nbsp;(+1 if EAGLE)
+    &nbsp;&nbsp;<span style="color:var(--muted)"># single_type_kv_cache_manager.py:606</span>
+  </div>
+  <p>
+    So a checkpoint physically <b>is</b> those <code>need</code> contiguous blocks
+    ("the tail") sitting just before boundary L. Everything between checkpoints is
+    interior context that can never be the tail of an aligned boundary, so it
+    could never serve a hit anyway &mdash; no point caching it.
+  </p>
+
+  <h3>How checkpoints are created (and the default, interval = <code>None</code>)</h3>
+  <p>
+    Checkpoints are minted at <b>cache time</b>, not eviction time. When a request
+    commits its full blocks, <code>cache_blocks</code> &rarr;
+    <code>reachable_block_mask</code> returns a per-block True/False mask, and
+    <code>cache_full_blocks</code> only assigns a <code>block_hash</code> to
+    mask-True blocks and inserts them into the prefix-cache map. Mask-False blocks
+    never get a hash &rarr; never matchable &rarr; first to be evicted (no-hash &rarr;
+    <code>prepend_n</code> to the queue front). <b>Creating a checkpoint = marking
+    its <code>need</code> tail blocks True.</b>
+  </p>
+  <div class="callout code-ref">
+    <strong>Default path, <code>retention_interval is None</code> &mdash;
+      <span class="fileref">single_type_kv_cache_manager.py:737&ndash;753</span></strong>
+<pre><code>segment_tokens = alignment_tokens          <span class="c"># == scheduler_block_size</span>
+per_segment    = scheduler_block_size // block_size
+<span class="c"># mark the last `need` blocks of EVERY segment:</span>
+<span class="k">if</span> (i - shift) % per_segment &gt;= per_segment - need:
+    mask[i] = <span class="k">True</span></code></pre>
+  </div>
+  <p>
+    So <b>the default puts one checkpoint at every <code>scheduler_block_size</code>
+    boundary</b> &mdash; the densest setting. Two consequences worth noting:
+  </p>
+  <ul>
+    <li>The replay-boundary special case (part 2 below) is <b>skipped</b> when
+      interval is <code>None</code> (<code>if retention_interval is not None</code>):
+      every boundary, including the prompt's end, is <em>already</em> a checkpoint,
+      so there is nothing extra to pin.</li>
+    <li>If the window spans a whole segment (<code>need &ge; per_segment</code> &mdash;
+      e.g. a pure SWA model where <code>scheduler_block_size == block_size</code> so
+      <code>per_segment == 1</code>), the function short-circuits to
+      <code>return None</code> = <b>cache every block</b>. Sparsification only bites
+      when the SWA block is finer than the scheduler block (hybrid) or you set an
+      interval larger than one segment.</li>
+  </ul>
+
+  <div class="callout info">
+    <strong><code>start_block</code> / <code>end_block</code> are <em>not</em> a window</strong>
+    <p style="margin:6px 0 0">
+      The mask is computed over <code>[start_block, end_block)</code> =
+      <code>[num_cached_blocks, num_full_blocks)</code>
+      (<span class="fileref">single_type_kv_cache_manager.py:342</span>) &mdash; the
+      blocks that became full <em>since the last step</em>. <code>cache_blocks</code>
+      runs once per scheduler step and only re-hashes that fresh slice, then
+      advances <code>num_cached_block</code>. So <b>all</b> blocks from token 0 to
+      the current token still pass through the mask &mdash; just incrementally,
+      across calls, never re-examined twice.
+    </p>
+    <p style="margin:6px 0 0">
+      The checkpoint <em>decision</em> uses the <b>absolute</b> index <code>i</code>
+      (<code>(i - shift) % per_segment</code>); only the output is offset
+      (<code>mask[i - start_block]</code>). So checkpoints land at the same absolute
+      positions regardless of where a slice begins. What actually keeps SWA from
+      caching every block is the mask's <em>sparsity</em> (above) and, separately,
+      <code>remove_skipped_blocks</code> freeing out-of-window blocks during the
+      live request &mdash; not these two bounds.
+    </p>
+  </div>
+
+  <h3>What the interval changes</h3>
+  <p>
+    <code>RETENTION_INTERVAL</code> simply swaps what <code>segment_tokens</code> is.
+    A larger segment means fewer, sparser checkpoints; <code>0</code> drops periodic
+    checkpoints entirely and keeps only the one explicitly-pinned replay boundary.
+    For very long prompts, "a tail at <em>every</em> 32-token boundary" adds up to
+    many cached SWA blocks competing in the shared pool against full-attention
+    prefixes (which must be kept in full). Thinning SWA checkpoints frees pool
+    capacity for those more-reusable prefixes and cuts eviction churn, at the cost
+    of coarser SWA resume granularity.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">
+      Same 16-block SWA prompt, three settings (block 8, window 8, sched-block 32 &rArr; need 1, per-seg 4)
+    </div>
+    <div class="diagram-row"><span class="cell label">blocks</span>
+      <div class="cell sm">0</div><div class="cell sm">1</div><div class="cell sm">2</div><div class="cell sm">3</div>
+      <div class="cell sm">4</div><div class="cell sm">5</div><div class="cell sm">6</div><div class="cell sm">7</div>
+      <div class="cell sm">8</div><div class="cell sm">9</div><div class="cell sm">10</div><div class="cell sm">11</div>
+      <div class="cell sm">12</div><div class="cell sm">13</div><div class="cell sm">14</div><div class="cell sm">15</div>
+    </div>
+    <div class="diagram-row"><span class="cell label">None (dense)</span>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm match">3</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm match">7</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm match">11</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm match">15</div>
+    </div>
+    <div class="diagram-row"><span class="cell label">interval 64</span>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm match">7</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm cached">11</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm match">15</div>
+    </div>
+    <div class="diagram-row"><span class="cell label">interval 0</span>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm cached">11</div>
+      <div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div><div class="cell sm free">.</div>
+    </div>
+    <div class="diagram-caption">
+      <span style="color:var(--green)">&#9632;</span> segment-boundary checkpoint &nbsp;
+      <span style="color:var(--green)">&#9633;</span> replay-boundary checkpoint (block 11, pinned by part 2).
+      Dense keeps 4 checkpoints; interval 64 keeps the 64-token boundaries (7, 15)
+      plus the replay tail (11); interval 0 keeps only the replay tail.
+    </div>
+  </div>
+
+  <h3>Before / after at scale: a 1024-token prompt</h3>
+  <p>
+    The 16-block sketch shows the mechanics; the savings only stand out on a long
+    prompt. Take a hybrid model with SWA <b>block 16</b>, <b>window 32</b>
+    (<code>need = cdiv(31,16) = 2</code> blocks per checkpoint) and a <b>64-token
+    scheduler block</b> (<code>per_segment = 4</code>). A 1024-token prompt is
+    <b>64 SWA blocks</b> with a scheduler boundary every 64 tokens
+    (<b>b1 = token 64 &hellip; b16 = token 1024</b>).
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Checkpoint placement &mdash; one cell per 64-token boundary (b1 &hellip; b16)</div>
+
+    <div class="diagram-row"><span class="cell label">None (dense)</span>
+      <div class="cell sm match">1</div><div class="cell sm match">2</div><div class="cell sm match">3</div><div class="cell sm match">4</div>
+      <div class="cell sm match">5</div><div class="cell sm match">6</div><div class="cell sm match">7</div><div class="cell sm match">8</div>
+      <div class="cell sm match">9</div><div class="cell sm match">10</div><div class="cell sm match">11</div><div class="cell sm match">12</div>
+      <div class="cell sm match">13</div><div class="cell sm match">14</div><div class="cell sm match">15</div><div class="cell sm match">16</div>
+    </div>
+
+    <div class="diagram-row"><span class="cell label">interval 256</span>
+      <div class="cell sm free">1</div><div class="cell sm free">2</div><div class="cell sm free">3</div><div class="cell sm match">4</div>
+      <div class="cell sm free">5</div><div class="cell sm free">6</div><div class="cell sm free">7</div><div class="cell sm match">8</div>
+      <div class="cell sm free">9</div><div class="cell sm free">10</div><div class="cell sm free">11</div><div class="cell sm match">12</div>
+      <div class="cell sm free">13</div><div class="cell sm free">14</div><div class="cell sm cached">15</div><div class="cell sm match">16</div>
+    </div>
+
+    <div class="diagram-row"><span class="cell label">interval 0</span>
+      <div class="cell sm free">1</div><div class="cell sm free">2</div><div class="cell sm free">3</div><div class="cell sm free">4</div>
+      <div class="cell sm free">5</div><div class="cell sm free">6</div><div class="cell sm free">7</div><div class="cell sm free">8</div>
+      <div class="cell sm free">9</div><div class="cell sm free">10</div><div class="cell sm free">11</div><div class="cell sm free">12</div>
+      <div class="cell sm free">13</div><div class="cell sm free">14</div><div class="cell sm cached">15</div><div class="cell sm free">16</div>
+    </div>
+
+    <div class="legend">
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green)"></span> segment checkpoint</span>
+      <span class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span> replay checkpoint (b15 = token 960, pinned by part 2)</span>
+      <span class="legend-item"><span class="legend-sw" style="background:#f1f1ee"></span> not cached</span>
+    </div>
+    <div class="diagram-caption">
+      Dense pins all 16 boundaries; interval 256 keeps only every 256-token
+      boundary (b4, b8, b12, b16) plus the replay tail (b15); interval 0 keeps
+      only the replay tail.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">SWA blocks held in the prefix cache for this prompt (of 64)</div>
+    <div class="bar-stack">
+      <div class="bar-row">
+        <span class="bar-label">None (dense)</span>
+        <div class="bar-track"><div class="bar-fill" style="width:50%">32 blocks</div></div>
+        <span class="bar-num">16 ckpts &times; 2</span>
+      </div>
+      <div class="bar-row">
+        <span class="bar-label">interval 256</span>
+        <div class="bar-track"><div class="bar-fill green" style="width:15.6%">10</div></div>
+        <span class="bar-num">3.2&times; fewer</span>
+      </div>
+      <div class="bar-row">
+        <span class="bar-label">interval 0</span>
+        <div class="bar-track"><div class="bar-fill green" style="width:3.1%">2</div></div>
+        <span class="bar-num">16&times; fewer</span>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Each checkpoint costs <code>need = 2</code> blocks. Dense = 16&times;2 = 32;
+      interval 256 = 4 periodic + 1 replay = 5&times;2 = 10; interval 0 = 1 replay
+      = 2. The freed blocks go back to the shared pool for full-attention prefixes.
+      (Verified: <code>block_ids</code> = <code>[14,15,30,31,46,47,58,59,62,63]</code>
+      for interval 256, <code>[58,59]</code> for interval 0.)
+    </div>
+  </div>
+
+  <h4>The cost: where a partial-prefix follow-up can resume</h4>
+  <p>
+    Suppose a follow-up request shares the first <b>700 tokens</b> (same document,
+    new question). The SWA hit lands on the largest checkpoint at or below the
+    64-aligned match length (640). Because HMA takes the <b>minimum hit across all
+    groups</b>, that SWA resume point caps the <em>whole</em> request &mdash; even
+    though full attention cached all 700 tokens.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Setting</th><th>SWA checkpoints &le; 640</th><th>Resume at</th><th>SWA prefix reused</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>None (dense)</td><td>&hellip;, 512, 576, <b>640</b></td><td><b>640</b></td><td>640 / 700 tok</td></tr>
+      <tr><td>interval 256</td><td>256, <b>512</b></td><td><b>512</b></td><td>512 / 700 tok</td></tr>
+      <tr><td>interval 0</td><td><em>(none &mdash; only 960)</em></td><td><b>0</b></td><td>recompute all 700</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <strong>Read the two charts together</strong>
+    Aggressive retention (interval 0) cuts the SWA cache 16&times; &mdash; great for
+    pool pressure &mdash; but a request that doesn't re-send the <em>full</em> prompt
+    gets no SWA reuse at all, and the min-across-groups rule drags the whole hit
+    down with it. An identical full re-submission still hits at the replay boundary
+    (960) in every setting, so retention only ever costs <em>partial</em>-prefix
+    sharing.
+  </div>
+
+  <div class="grid three">
+    <div class="box">
+      <h3>None (default)</h3>
+      <p><b>Dense.</b> A tail at <em>every</em> <code>scheduler_block_size</code>
+      boundary. Best hit granularity, most SWA blocks cached.</p>
+    </div>
+    <div class="box">
+      <h3>&gt; 0</h3>
+      <p><b>Sparse.</b> One tail per <code>interval</code>-sized segment, plus the
+      replay boundary. Fewer SWA blocks, coarser resume.</p>
+    </div>
+    <div class="box">
+      <h3>0</h3>
+      <p><b>Latest only.</b> No periodic tails &mdash; just the single replay
+      boundary (the most-useful full-prompt-resume checkpoint).</p>
+    </div>
+  </div>
+
+  <p>
+    Two contributions feed the mask
+    (<span class="fileref">single_type_kv_cache_manager.py:737&ndash;768</span>):
+    <b>(1) segment tails</b> &mdash; the <code>need</code> blocks before each segment
+    boundary (segment = <code>alignment_tokens</code> when None, else
+    <code>interval</code>; suppressed when 0); and <b>(2) the replay-boundary
+    tail</b> &mdash; <code>get_computed_blocks</code> caps hits at
+    <code>num_prompt&minus;1</code> (to recompute the last token's logits), so a full
+    re-submission can only resume at the latest fine-aligned boundary. Sparse
+    retention would skip it, so it is always pinned explicitly.
+  </p>
+
+  <div class="callout code-ref">
+    <strong>Worked example &mdash; from <span class="fileref">tests/v1/core/test_prefix_caching.py:2995</span></strong>
+    <p style="margin:6px 0">
+      block_size 8, SWA window 8, full-attn block 32 &rArr;
+      <code>scheduler_block_size = lcm(32,8) = 32</code>, <code>need = cdiv(8&minus;1,8) = 1</code>
+      block. Prompt = 16 blocks (128 tokens).
+    </p>
+<pre><code>INTERVAL = 64  (= 8 blocks/segment)
+  segment tails: i % 8 == 7        → blocks {7, 15}
+  replay tail  : (128-1)//32*32=96 → block 96/8 = {11}
+  cached SWA blocks = {7, 11, 15}        ← test asserts exactly this
+
+INTERVAL = 0   (latest only)
+  segment tails: (suppressed)
+  replay tail  : {11}
+  cached SWA blocks = {11}                ← test asserts exactly this</code></pre>
+  </div>
+
+  <div class="callout good">
+    <strong>Net effect</strong>
+    Retained checkpoints survive block recycling and are reused by later requests
+    (test <code>..._survives_recycling</code>). You trade fine-grained SWA resume
+    points for a smaller SWA cache footprint &mdash; which, in the shared pool, buys
+    a higher overall prefix-cache hit rate for the full-attention prefixes that
+    matter most. (Mamba/linear attention ignore the knob for now &mdash; explicit
+    TODO at <span class="fileref">kv_cache_coordinator.py:41</span>.)
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="summary">Summary table</h2>
+
+  <table>
+    <thead>
+      <tr><th>Mechanism</th><th>Goal</th><th>How</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LRU free queue</td>
+        <td>cheap, position-based eviction priority</td>
+        <td>doubly-linked list; head popped on alloc, candidates appended on free</td>
+      </tr>
+      <tr>
+        <td>Eviction-candidate state</td>
+        <td>reuse finished requests' blocks</td>
+        <td>free &ne; evict; hash kept in the map until the block reaches the head</td>
+      </tr>
+      <tr>
+        <td>Reverse-on-free</td>
+        <td>protect shared prefixes</td>
+        <td><code>free(reversed(blocks))</code> &rarr; tail dies first, prefix last</td>
+      </tr>
+      <tr>
+        <td>Hash / no-hash split</td>
+        <td>don't waste survive-long slots</td>
+        <td><code>prepend_n</code> un-cacheable to head, <code>append_n</code> cacheable to tail</td>
+      </tr>
+      <tr>
+        <td>HMA alignment</td>
+        <td>shared prefix across groups</td>
+        <td><code>alignment_tokens = lcm(block sizes)</code> on every hit/cache</td>
+      </tr>
+      <tr>
+        <td>SWA <code>remove_skipped_blocks</code></td>
+        <td>reclaim out-of-window blocks mid-request</td>
+        <td>free + null blocks older than <code>n &minus; window + 1</code></td>
+      </tr>
+      <tr>
+        <td>SWA <code>reachable_block_mask</code></td>
+        <td>only cache blocks that can match</td>
+        <td>mark <code>need</code> tails per boundary; skip the rest</td>
+      </tr>
+      <tr>
+        <td>Mamba skip / 2-block dance</td>
+        <td>recurrent state needs O(1) blocks</td>
+        <td>keep last state (+ source in align); free the rest</td>
+      </tr>
+      <tr>
+        <td><code>RETENTION_INTERVAL</code></td>
+        <td>thin SWA cache to free pool for prefixes</td>
+        <td>segment tails + pinned replay boundary in the mask</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="foot">
+    <p><strong>Primary sources</strong> (grep-verified, vLLM <code>v1</code> core):</p>
+    <p>
+      <span class="fileref">vllm/v1/core/block_pool.py</span> &mdash; BlockPool, get_new_blocks, touch, free_blocks<br>
+      <span class="fileref">vllm/v1/core/kv_cache_utils.py</span> &mdash; KVCacheBlock, FreeKVCacheBlockQueue, scheduler/hash block sizing<br>
+      <span class="fileref">vllm/v1/core/single_type_kv_cache_manager.py</span> &mdash; per-group free/cache, SWA &amp; Mamba managers, reachable_block_mask<br>
+      <span class="fileref">vllm/v1/core/kv_cache_coordinator.py</span> &mdash; HMA coordinator, alignment, RETENTION_INTERVAL plumbing<br>
+      <span class="fileref">vllm/config/cache.py</span>, <span class="fileref">vllm/v1/kv_cache_interface.py</span> &mdash; mamba_cache_mode, MambaSpec<br>
+      <span class="fileref">tests/v1/core/test_prefix_caching.py</span> &mdash; retention-interval behavior assertions
+    </p>
+  </div>
+
+</main>
+</body>
+</html>

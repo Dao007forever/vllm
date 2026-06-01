@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vLLM KV Cache &mdash; Learning Notes</title>
+<link rel="stylesheet" href="../_shared.css" />
+<style>
+  .reading-paths {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin: 20px 0;
+  }
+  .reading-paths .box h3 { color: var(--violet); }
+  .doc-list { padding-left: 0; list-style: none; margin: 8px 0; }
+  .doc-list li { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+  .doc-list li:last-child { border-bottom: none; }
+  .doc-list a { font-weight: 650; }
+  .doc-list .blurb { color: var(--muted); display: block; font-size: 0.92em; margin-top: 2px; }
+  @media (max-width: 820px) {
+    .reading-paths { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>vLLM KV Cache &mdash; Learning Notes</h1>
+  <p class="subtitle">
+    Notes on how vLLM allocates, hashes, and reuses KV memory. Generated
+    from the markdowns in <span class="fileref">learnings/kv_cache/</span>.
+  </p>
+
+  <section class="tldr">
+    <strong>What's here</strong>
+    <p>
+      Seven docs covering: the prefix-caching design, the
+      block/group/column-packing layout, fifteen invariants you can't
+      break without silent corruption, the kernel-tile alignment that
+      forces inflated <code>block_size</code>, and how Mamba's recurrence
+      reuses the same allocator with completely different semantics.
+    </p>
+    <p>
+      <em>New here?</em> Start with the
+      <a href="BEGINNER_GUIDE.html">Beginner's Guide</a>.
+      It builds the intuition for everything else.
+    </p>
+  </section>
+
+  <h2>Reading paths</h2>
+
+  <div class="reading-paths">
+    <div class="box">
+      <h3>1. On-ramp</h3>
+      <p>You've never touched this code. Want one document to bootstrap context.</p>
+      <ol>
+        <li><a href="BEGINNER_GUIDE.html">BEGINNER_GUIDE.html</a></li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>2. Engineer's path</h3>
+      <p>You're going to modify something. Read the design, then the assumptions, then the layout.</p>
+      <ol>
+        <li><a href="KV_CACHE.html">KV_CACHE.html</a></li>
+        <li><a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a></li>
+        <li><a href="KV_CACHE_ASSUMPTIONS.html">KV_CACHE_ASSUMPTIONS.html</a></li>
+      </ol>
+    </div>
+    <div class="box">
+      <h3>3. Hybrid / Mamba</h3>
+      <p>You're working on Jamba, Granite-Hybrid, or linear-attention variants.</p>
+      <ol>
+        <li><a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a></li>
+        <li><a href="MAMBA.html">MAMBA.html</a></li>
+        <li><a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT.html</a></li>
+      </ol>
+    </div>
+  </div>
+
+  <h2>All notes</h2>
+
+  <div class="grid">
+    <div class="box">
+      <h3>Top-level (this folder)</h3>
+      <ul class="doc-list">
+        <li>
+          <a href="BEGINNER_GUIDE.html">BEGINNER_GUIDE.html</a>
+          <span class="blurb">15-section on-ramp: blocks, prefix cache, groups, column packing, free list, ref counting, preemption, sentinels, linear attention, end-to-end walk-through.</span>
+        </li>
+        <li>
+          <a href="KV_CACHE.html">KV_CACHE.html</a>
+          <span class="blurb">Prefix caching design (local + connector). The receptive-field wall: why "suffix-digest" hashing is silently unsound for any transformer of depth &ge; 2.</span>
+        </li>
+        <li>
+          <a href="KV_CACHE_ALLOCATION.html">KV_CACHE_ALLOCATION.html</a>
+          <span class="blurb">Why groups exist, why they need uniform physical block size, how column packing pools physical memory across groups. Includes a hybrid Full+SWA worked example.</span>
+        </li>
+        <li>
+          <a href="KV_CACHE_ASSUMPTIONS.html">KV_CACHE_ASSUMPTIONS.html</a>
+          <span class="blurb">15 hidden assumptions and what would silently break if you changed them: blocks, block_size, layout, sentinels, post-forward hashing, free queue, lock-free ref counts, NONE_HASH randomization, min-clamp, preemption.</span>
+        </li>
+        <li>
+          <a href="KERNEL_BLOCK_ALIGNMENT.html">KERNEL_BLOCK_ALIGNMENT.html</a>
+          <span class="blurb">Why CUTLASS MLA on SM100 asserts <code>block_num % (128 / PAGE_SIZE) == 0</code>, and how vLLM inflates <code>block_size</code> to satisfy it (vs the page-table padding alternative).</span>
+        </li>
+        <li>
+          <a href="EAGLE.html">EAGLE.html</a>
+          <span class="blurb">PR #44082: how a memory optimization for SWA prefix caching silently broke <em>all</em> EAGLE/MTP cache hits, and the fix that caches exactly the one lookahead block past each aligned boundary.</span>
+        </li>
+        <li>
+          <a href="MTP_EAGLE_NEED_SHIFT.html">MTP_EAGLE_NEED_SHIFT.html</a>
+          <span class="blurb">PR #43447: chart-first explanation of SWA <code>need</code> and <code>shift</code>, using the 127-token MTP/EAGLE replay-boundary example.</span>
+        </li>
+        <li>
+          <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a>
+          <span class="blurb">Why Mamba/RWKV/RetNet break the cache abstraction's positional retrieval. Eight properties trace what changes and what stays the same.</span>
+        </li>
+        <li>
+          <a href="MAMBA.html">MAMBA.html</a>
+          <span class="blurb">What's awkward about Mamba <em>specifically</em>: two state tensors, selectivity, two kernels, conv-state alignment, spec-decode rollback, no DCP/PCP.</span>
+        </li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Subfolders (markdown only, for now)</h3>
+      <ul class="doc-list">
+        <li>
+          <strong><span class="fileref">offloading/</span></strong>
+          <span class="blurb">
+            <a href="offloading/SIMPLE_CACHE_PROBLEM.md">SIMPLE_CACHE_PROBLEM.md</a>,
+            <a href="offloading/SIMPLE_KV_OFFLOAD.md">SIMPLE_KV_OFFLOAD.md</a>,
+            <a href="offloading/TRITON_COPY_BLOCKS_KERNEL.md">TRITON_COPY_BLOCKS_KERNEL.md</a>,
+            <a href="offloading/VLLM_VS_SGLANG.md">VLLM_VS_SGLANG.md</a>
+          </span>
+        </li>
+        <li>
+          <strong><span class="fileref">connector/</span></strong>
+          <span class="blurb">
+            <a href="connector/BEGINNER_GUIDE.md">BEGINNER_GUIDE.md</a>,
+            <a href="connector/MOONCAKE.md">MOONCAKE.md</a>,
+            <a href="connector/vllm_v1_mooncake_store_arch.html">vllm_v1_mooncake_store_arch.html</a>
+            (already-rendered architecture doc)
+          </span>
+        </li>
+        <li>
+          <strong><span class="fileref">types/</span></strong>
+          <span class="blurb">
+            <a href="types/KV_SPECS.html">KV_SPECS.html</a> &mdash;
+            the <code>KVCacheSpec</code> type zoo (Full / TQ / MLA / Sink /
+            SlidingWindow / ChunkedLocal / Mamba / Cross), how each lays out a
+            block, and exactly which specs require freshly-allocated blocks to be
+            zeroed (and why the Sink subclass was silently dropped).
+          </span>
+        </li>
+        <li>
+          <strong><span class="fileref">events/</span></strong>
+          <span class="blurb">
+            <a href="events/KV_CACHE_EVENTS.html">KV_CACHE_EVENTS.html</a> &mdash;
+            the three KV-cache events vLLM emits (<code>BlockStored</code> /
+            <code>BlockRemoved</code> / <code>AllBlocksCleared</code>), what
+            MooncakeStore adds (cpu-tier stores), and what it takes to feed them
+            into Nvidia Dynamo's KV-cache-aware router.
+          </span>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>How these docs relate</h2>
+
+  <div class="diagram">
+    <div class="diagram-title">Concept dependencies</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:8px;align-items:start">
+      <div style="grid-column:1/2;text-align:center">
+        <a href="BEGINNER_GUIDE.html" style="text-decoration:none">
+          <div style="background:var(--violet-soft,#f0eaff);border:2px solid var(--violet,#7b5fbb);border-radius:8px;padding:10px;font-weight:650;color:var(--violet,#7b5fbb)">
+            BEGINNER_GUIDE
+            <div style="font-size:0.78em;color:var(--muted);font-weight:400;margin-top:2px">vocabulary &amp; mental model</div>
+          </div>
+        </a>
+      </div>
+      <div style="grid-column:2/4;font-size:1.3em;color:var(--muted);align-self:center;text-align:center">&rarr; provides shared vocabulary for &rarr;</div>
+      <div style="grid-column:1/4;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px">
+        <a href="KV_CACHE.html" style="text-decoration:none">
+          <div style="background:#f6f9ff;border:1px solid #cdd9e8;border-radius:8px;padding:10px;text-align:center">
+            <strong>KV_CACHE</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">design: prefix-cache correctness</div>
+          </div>
+        </a>
+        <a href="KV_CACHE_ALLOCATION.html" style="text-decoration:none">
+          <div style="background:#f6f9ff;border:1px solid #cdd9e8;border-radius:8px;padding:10px;text-align:center">
+            <strong>KV_CACHE_ALLOCATION</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">layout: groups &amp; column packing</div>
+          </div>
+        </a>
+        <a href="KV_CACHE_ASSUMPTIONS.html" style="text-decoration:none">
+          <div style="background:#f6f9ff;border:1px solid #cdd9e8;border-radius:8px;padding:10px;text-align:center">
+            <strong>KV_CACHE_ASSUMPTIONS</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">contracts: 15 invariants</div>
+          </div>
+        </a>
+      </div>
+      <div style="grid-column:1/4;text-align:center;font-size:1.3em;color:var(--muted);margin-top:10px">&darr; specialized into &darr;</div>
+      <div style="grid-column:1/4;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:4px">
+        <a href="KERNEL_BLOCK_ALIGNMENT.html" style="text-decoration:none">
+          <div style="background:#eaf6ee;border:1px solid #abd1bb;border-radius:8px;padding:10px;text-align:center">
+            <strong>KERNEL_BLOCK_ALIGNMENT</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">kernel constraint &rarr; block_size</div>
+          </div>
+        </a>
+        <a href="LINEAR_ATTENTION.html" style="text-decoration:none">
+          <div style="background:#fff5e6;border:1px solid #f7d599;border-radius:8px;padding:10px;text-align:center">
+            <strong>LINEAR_ATTENTION</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">recurrent state reframes cache</div>
+          </div>
+        </a>
+        <a href="MAMBA.html" style="text-decoration:none">
+          <div style="background:#fff5e6;border:1px solid #f7d599;border-radius:8px;padding:10px;text-align:center">
+            <strong>MAMBA</strong>
+            <div style="font-size:0.78em;color:var(--muted);margin-top:2px">the concrete linear-attention case</div>
+          </div>
+        </a>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <strong>Blue tier</strong> covers the original-design (softmax-attention) lineage. <strong>Green tier</strong> is a kernel-side correction. <strong>Orange tier</strong> generalizes the abstraction to recurrent state. Skipping the violet tier and diving into orange directly is the most common reason readers get confused &mdash; the terminology and the abstraction boundary are different at every layer.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Mental model</strong>
+    <ul>
+      <li><strong>BEGINNER_GUIDE</strong> teaches the vocabulary &mdash; blocks, groups, slots, column tensors, ref counts, null blocks.</li>
+      <li><strong>KV_CACHE</strong> is the design doc: the prefix-cache flow and the correctness argument for why today's hash is the only sound one.</li>
+      <li><strong>KV_CACHE_ALLOCATION</strong> is the layout doc: from "why have groups" to "why column packing is the unique solution."</li>
+      <li><strong>KV_CACHE_ASSUMPTIONS</strong> is the contracts doc: 15 invariants whose violation produces silent corruption.</li>
+      <li><strong>KERNEL_BLOCK_ALIGNMENT</strong> zooms into one specific kernel-side constraint (CUTLASS MLA) and how vLLM resolves it.</li>
+      <li><strong>LINEAR_ATTENTION</strong> reframes the cache problem for recurrent state.</li>
+      <li><strong>MAMBA</strong> is the most concrete linear-attention case &mdash; selectivity, two kernels, conv-state subtlety.</li>
+    </ul>
+  </div>
+
+  <p class="subtitle" style="margin-top: 28px">
+    Source markdowns live alongside these HTMLs at
+    <span class="fileref">learnings/kv_cache/</span>. Code references
+    target a recent commit; some line numbers may drift as the codebase
+    evolves but file paths and concepts remain accurate.
+  </p>
+</main>
+</body>
+</html>

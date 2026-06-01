@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kernel Block Alignment Constraint</title>
+<link rel="stylesheet" href="../_shared.css" />
+</head>
+<body>
+<main>
+  <div class="crumb">
+    <a href="index.html">&larr; learnings/kv_cache</a> &nbsp;|&nbsp;
+    source: <a href="KERNEL_BLOCK_ALIGNMENT.md">KERNEL_BLOCK_ALIGNMENT.md</a>
+  </div>
+
+  <h1>Kernel Block Alignment Constraint</h1>
+  <p class="subtitle">
+    Why the CUTLASS MLA kernel asserts
+    <code>block_num % (128 / PAGE_SIZE) == 0</code>,
+    and how vLLM keeps that true.
+  </p>
+
+  <section class="tldr">
+    <strong>TL;DR</strong>
+    <p>
+      CUTLASS MLA on SM100 (Blackwell) processes KV in fixed 128-token
+      tiles. Each tile spans <code>128 / PAGE_SIZE</code> pages. The
+      kernel's inner loop has no boundary check (warp divergence would
+      hurt throughput), so it requires the page-table width
+      <code>block_num</code> to be pre-aligned to tile units.
+      vLLM solves this by <em>inflating <code>block_size</code></em> to a
+      multiple of 128 &mdash; which costs prefix-cache resolution.
+      An alternative path 2 (page-table padding with <code>NULL_BLOCK_ID</code>)
+      preserves fine granularity but isn't the current default.
+    </p>
+  </section>
+
+  <nav class="nav">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#assertion">The assertion</a></li>
+      <li><a href="#vars">What each variable means</a></li>
+      <li><a href="#why">Why the kernel needs this</a></li>
+      <li><a href="#path1">Path 1: <code>block_size</code> inflation (current)</a></li>
+      <li><a href="#path2">Path 2: page-table padding</a></li>
+      <li><a href="#connection">Connection to block-size inflation</a></li>
+      <li><a href="#worked">Worked example end-to-end</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="assertion">The assertion</h2>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/v1/attention/backends/mla/cutlass_mla.py:203</span></strong>
+<pre><code>_, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
+assert block_num % (128 / PAGE_SIZE) == 0</code></pre>
+  </div>
+
+  <p>This fires when, for example, <code>PAGE_SIZE=32</code> and <code>block_num=295</code>:</p>
+<pre><code>128 / PAGE_SIZE = 128 / 32 = 4   (pages per kernel tile)
+295 % 4 = 3  &ne; 0  &rarr;  AssertionError</code></pre>
+
+  <h2 id="vars">What each variable means</h2>
+
+  <table>
+    <thead><tr><th>Variable</th><th>Source</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>PAGE_SIZE</code></td><td>vLLM's <code>block_size</code> in tokens (KV cache config)</td><td>32 tokens</td></tr>
+      <tr><td><code>128</code></td><td>CUTLASS MLA kernel's internal tile size in tokens</td><td>fixed at 128</td></tr>
+      <tr><td><code>128 / PAGE_SIZE</code></td><td>Pages per kernel tile</td><td>4 pages</td></tr>
+      <tr><td><code>block_num</code></td><td>Width of page table tensor: <code>max_model_len // block_size</code></td><td>295</td></tr>
+    </tbody>
+  </table>
+
+  <p><code>block_num = 295</code> arises from e.g. <code>max_model_len = 9440</code> tokens and <code>block_size = 32</code>: <code>9440 / 32 = 295</code>.</p>
+
+  <h2 id="why">Why the kernel needs this</h2>
+
+  <p>
+    <code>sm100_cutlass_mla_decode</code> processes the KV cache in
+    <strong>tiles of 128 tokens</strong>. Each tile consists of
+    <code>128 / PAGE_SIZE</code> consecutive pages from the page table.
+    The inner loop iterates over these page groups without a boundary check:
+  </p>
+
+<pre><code>for tile_idx in range(block_num // pages_per_tile):
+    pages = page_table[:, tile_idx * pages_per_tile : (tile_idx + 1) * pages_per_tile]
+    # load 128 tokens, compute attention partial sum</code></pre>
+
+  <div class="callout warn">
+    <strong>Why no boundary check?</strong>
+    Adding a bounds check would cause warp divergence and hurt throughput.
+    The kernel requires the page-table width to be pre-aligned.
+  </div>
+
+  <p>If <code>block_num</code> is not divisible by <code>pages_per_tile</code>, the last tile is <strong>partial</strong> &mdash; it would read past the end of the page table into garbage memory:</p>
+
+<pre><code>block_num = 295  &rarr;  295 / 4 = 73.75 tiles  &rarr;  last tile is 3/4 full  &rarr;  reads 32 garbage slots
+block_num = 296  &rarr;  296 / 4 = 74.0  tiles  &rarr;  every tile is full     &rarr;  safe</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">CUTLASS MLA tile structure: 4 pages of 32 tokens = 128 tokens per tile</div>
+    <div class="diagram-row">
+      <span class="cell label">tile 0</span>
+      <div class="cell-row">
+        <div class="cell sm cached">p0</div><div class="cell sm cached">p1</div><div class="cell sm cached">p2</div><div class="cell sm cached">p3</div>
+      </div>
+      <span class="cell label">tile 1</span>
+      <div class="cell-row">
+        <div class="cell sm cached">p4</div><div class="cell sm cached">p5</div><div class="cell sm cached">p6</div><div class="cell sm cached">p7</div>
+      </div>
+      <span class="cell label">tile 2</span>
+      <div class="cell-row">
+        <div class="cell sm cached">p8</div><div class="cell sm cached">p9</div><div class="cell sm cached">p10</div><div class="cell sm cached">p11</div>
+      </div>
+      <span style="color:var(--muted);font-size:0.85em">&hellip;</span>
+    </div>
+    <div class="diagram-caption">
+      Each page holds 32 tokens (PAGE_SIZE). Each tile bundles 4 contiguous pages and processes 128 tokens in one kernel-internal step. The kernel's inner loop has no bounds check &mdash; if the last tile is partial, it reads <em>past</em> the page table.
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">block_num=295 vs 296 &mdash; the alignment failure mode</div>
+    <div class="diagram-row" style="margin-bottom:6px">
+      <span class="cell label" style="color:var(--red)">295 pages</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">p0</div><div class="cell xs cached">p1</div><div class="cell xs cached">p2</div><div class="cell xs cached">p3</div>
+        <div class="cell xs" style="background:#eee;color:var(--muted);min-width:36px;border-style:dashed">tile 1..72</div>
+        <div class="cell xs cached">p292</div><div class="cell xs cached">p293</div><div class="cell xs cached">p294</div>
+        <div class="cell xs evicted" style="border-style:dashed">???</div>
+      </div>
+    </div>
+    <div class="diagram-row">
+      <span class="cell label" style="color:var(--green)">296 pages</span>
+      <div class="cell-row tight">
+        <div class="cell xs cached">p0</div><div class="cell xs cached">p1</div><div class="cell xs cached">p2</div><div class="cell xs cached">p3</div>
+        <div class="cell xs" style="background:#eee;color:var(--muted);min-width:36px;border-style:dashed">tile 1..72</div>
+        <div class="cell xs cached">p292</div><div class="cell xs cached">p293</div><div class="cell xs cached">p294</div>
+        <div class="cell xs cached">p295</div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-sw" style="background:var(--green-soft);border-color:#abd1bb"></span>real page in page table</div>
+      <div class="legend-item"><span class="legend-sw" style="background:var(--red-soft);border-color:#e0b3ae;border-style:dashed"></span>out-of-bounds read</div>
+    </div>
+    <div class="diagram-caption">
+      <strong>295 pages</strong>: last tile contains pages 292, 293, 294, and one slot past the page table &mdash; garbage memory, possibly into another tensor. <strong>296 pages</strong>: 74 perfect tiles, the kernel is happy. <em>The assertion catches the misalignment before the kernel runs &mdash; it doesn't fix it.</em>
+    </div>
+  </div>
+
+  <h2 id="path1">Path 1: <code>block_size</code> inflation (current approach)</h2>
+
+  <div class="callout code-ref">
+    <strong>Source: <span class="fileref">vllm/platforms/interface.py:620</span></strong>
+<pre><code>kernel_block_alignment_size = max(
+    min(s.base if isinstance(s, MultipleOf) else s
+        for s in backend_cls.get_supported_kernel_block_sizes()),
+    cache_config.block_size,
+)</code></pre>
+  </div>
+
+  <p>For CUTLASS MLA, <code>get_supported_kernel_block_sizes()</code> returns <code>[128]</code>, so <code>kernel_block_alignment_size = 128</code>. The attention <code>block_size</code> is then forced to a multiple of 128:</p>
+
+<pre><code>attn_block_size = kernel_block_alignment_size * cdiv(
+    mamba_page_size,
+    kernel_block_alignment_size * attn_page_size_1_token,
+)</code></pre>
+
+  <p>If <code>block_size</code> becomes 128 and <code>max_model_len = 9440</code>:</p>
+<pre><code>block_num = 9440 / 128 = 73.75 &rarr; ceiled to 74 (padded by vLLM)
+74 % (128 / 128) = 74 % 1 = 0  &#10003;</code></pre>
+
+  <div class="callout good">
+    <strong>Why this works</strong>
+    Inflation guarantees alignment because <code>block_size</code> itself
+    is a multiple of the kernel tile size, so <code>block_num =
+    max_model_len / block_size</code> is already in kernel-tile units &mdash;
+    the modulus check trivially passes.
+  </div>
+
+  <h2 id="path2">Path 2: page-table padding (the alternative)</h2>
+
+  <p>Instead of inflating <code>block_size</code>, pad the page table to the next aligned width at construction time:</p>
+
+<pre><code>pages_per_tile = 128 // block_size           # e.g. 128 // 32 = 4
+block_num_padded = cdiv(block_num, pages_per_tile) * pages_per_tile
+# 295 &rarr; cdiv(295, 4) * 4 = 74 * 4 = 296
+page_table = F.pad(page_table, (0, block_num_padded - block_num), value=NULL_BLOCK_ID)</code></pre>
+
+  <p>
+    Padding with <code>NULL_BLOCK_ID</code> causes the kernel to read the
+    null block (whose K/V is zeroed), contributing nothing to the attention
+    sum. This is safe because attention weights at null slots are zeroed
+    out by sequence-length masking.
+  </p>
+
+  <div class="callout info">
+    <strong>Trade-off</strong>
+    <ul>
+      <li><strong>Path 1 (current)</strong>: simpler, inflates <code>block_size</code>, degrades prefix-cache resolution.</li>
+      <li><strong>Path 2</strong>: preserves fine <code>block_size = 32</code> for better prefix-cache hits but adds null-block padding logic.</li>
+    </ul>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">Two ways to make the 9440-token request kernel-safe</div>
+    <div class="compare">
+      <div class="side left">
+        <h4 style="margin-top:0">Path 1 &mdash; inflate block_size to 128</h4>
+        <p style="font-size:0.85em">Each block holds 128 tokens. 9440 tokens &rarr; <strong>74 blocks</strong>, one tile each.</p>
+        <div class="cell-row tight" style="margin-top:8px">
+          <div class="cell xs cached" style="min-width:46px">blk 0<br><span class="lo">128 tok</span></div>
+          <div class="cell xs cached" style="min-width:46px">blk 1<br><span class="lo">128 tok</span></div>
+          <div class="cell xs cached" style="min-width:46px">blk 2<br><span class="lo">128 tok</span></div>
+          <div class="cell xs" style="background:#eee;color:var(--muted);min-width:32px;border-style:dashed">&hellip;</div>
+          <div class="cell xs cached" style="min-width:46px">blk 73<br><span class="lo">128 tok</span></div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px"><strong>Cost:</strong> prefix-cache granularity is 4&times; coarser. A 100-token chat overlap hashes as 0 blocks instead of 3.</p>
+      </div>
+      <div class="vs">vs</div>
+      <div class="side right">
+        <h4 style="margin-top:0">Path 2 &mdash; keep block_size=32, pad the page table</h4>
+        <p style="font-size:0.85em">Each block holds 32 tokens. 9440 tokens &rarr; 295 blocks. Pad to <strong>296</strong> with NULL.</p>
+        <div class="cell-row tight" style="margin-top:8px">
+          <div class="cell xs cached" style="min-width:36px">p0</div>
+          <div class="cell xs cached" style="min-width:36px">p1</div>
+          <div class="cell xs cached" style="min-width:36px">p2</div>
+          <div class="cell xs" style="background:#eee;color:var(--muted);min-width:32px;border-style:dashed">&hellip;</div>
+          <div class="cell xs cached" style="min-width:36px">p294</div>
+          <div class="cell xs null" style="min-width:36px">NULL</div>
+        </div>
+        <p style="font-size:0.82em;color:var(--muted);margin-top:8px"><strong>Cost:</strong> one wasted page-table entry per request + the kernel does a no-op read on the NULL slot. Prefix cache preserves fine granularity.</p>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Path 1 inflates the unit. Path 2 inflates the count. Either way <code>block_num &times; PAGE_SIZE</code> reaches a multiple of 128. vLLM chose Path 1 because it composes more cleanly with the Mamba-page-size-matching rule in <code>resolve_kv_cache_block_sizes</code>.
+    </div>
+  </div>
+
+  <h2 id="connection">Connection to the block-size inflation problem</h2>
+
+  <p>
+    This constraint is one of the two reasons vLLM's
+    <code>resolve_kv_cache_block_sizes</code> inflates attention
+    <code>block_size</code> in hybrid models (alongside Mamba page size
+    matching). Even in a pure-attention model with CUTLASS MLA,
+    <code>block_size</code> must be a multiple of the kernel tile size
+    (128 tokens for CUTLASS MLA on SM100).
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Backend</th>
+        <th><code>get_supported_kernel_block_sizes()</code></th>
+        <th>Effective alignment</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>FlashInfer MLA</td><td><code>[32, 64]</code></td><td>32 or 64 tokens</td></tr>
+      <tr><td>CUTLASS MLA (SM100)</td><td><code>[128]</code></td><td>128 tokens</td></tr>
+      <tr><td>FlashMLA</td><td><code>[64]</code></td><td>64 tokens</td></tr>
+      <tr><td>Triton</td><td><code>[MultipleOf(1)]</code></td><td>any</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>Practical impact</strong>
+    The minimum <code>block_size</code> vLLM can use for a model depends
+    on which attention backend is selected, not just the model architecture.
+    Switching from CUTLASS MLA to FlashInfer MLA allows <code>block_size = 32</code>
+    instead of 128, recovering 4&times; finer prefix-cache granularity.
+  </div>
+
+  <h2 id="worked">Worked example end-to-end</h2>
+
+  <p>Model: DeepSeek-V3 (MLA), <code>max_model_len = 9440</code>, backend = CUTLASS MLA.</p>
+
+  <div class="grid">
+    <div class="box">
+      <h3>With CUTLASS MLA</h3>
+<pre><code>attn_page_size_1_token = 512 (bytes)
+kernel_block_alignment_size = 128
+
+block_size = 128  (smallest multiple of 128 that fits)
+block_num  = ceil(9440 / 128) = 74
+
+74 % (128 / 128) = 74 % 1 = 0  &#10003;  assertion passes</code></pre>
+    </div>
+    <div class="box">
+      <h3>With FlashInfer MLA instead</h3>
+<pre><code>kernel_block_alignment_size = 32
+
+block_size = 32
+block_num  = ceil(9440 / 32) = 295
+
+295 % (128 / 32) = 295 % 4 = 3  &#10007;
+   &mdash; would fire IF CUTLASS MLA were used,
+      but FlashInfer MLA has no such assertion &mdash;
+      it directly supports PAGE_SIZE = 32</code></pre>
+    </div>
+  </div>
+
+  <div class="callout bad">
+    <strong>When you'll see this error</strong>
+    The "<code>block_num=295 % (128/32=4) != 0</code>" error only appears
+    when CUTLASS MLA is the active backend but the configured
+    <code>block_size</code> is smaller than 128 (e.g. 32 from a previous
+    config or an override). Fix:
+    <ul>
+      <li>Use <code>block_size = 128</code> (default when CUTLASS MLA is selected), or</li>
+      <li>Switch to a backend that natively supports smaller page sizes (FlashInfer MLA, FlashMLA).</li>
+    </ul>
+  </div>
+
+  <p class="subtitle">
+    See also: <a href="KV_CACHE_ASSUMPTIONS.html#k2">KV_CACHE_ASSUMPTIONS &sect;2</a>
+    for the broader story of why <code>block_size</code> isn't free, and
+    <a href="LINEAR_ATTENTION.html">LINEAR_ATTENTION.html</a> for how
+    Mamba block_size is constrained by no kernel.
+  </p>
+</main>
+</body>
+</html>
