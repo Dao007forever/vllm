@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -35,18 +36,18 @@ def _validate_prefix_cache_retention_interval(
     if retention_interval is None:
         return
 
-    # Retention only sparsifies sliding-window checkpoints for now; every other
-    # manager (full attention, Mamba, chunked-local) caches densely and
-    # ignores it to be conservative.
-    # TODO: Support Mamba/linear attention.
+    # Retention sparsifies sliding-window and Mamba (linear-attention)
+    # checkpoints; full-attention and chunked-local groups cache densely and
+    # ignore it (their hit granularity must stay fine).
     if not any(
-        isinstance(g.kv_cache_spec, SlidingWindowSpec)
+        isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
         for g in kv_cache_config.kv_cache_groups
     ):
         raise ValueError(
             "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
-            "no sliding-window KV cache group, so retention has no effect. "
-            "Unset it (the feature only applies to sliding-window attention)."
+            "no sliding-window or Mamba KV cache group, so retention has no "
+            "effect. Unset it (it only applies to sliding-window and Mamba "
+            "attention)."
         )
 
     if retention_interval < 0 or retention_interval % scheduler_block_size != 0:
@@ -87,12 +88,24 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
+        # A group's logical block can span several base blocks in decoupled
+        # mode (``allocation_base_span`` = max-page / base-page ratio). The pool
+        # must size its allocator to carve the largest such span, or those
+        # allocations are unschedulable. Pass the layout-derived max span (a
+        # neutral base-block count); the allocator sizes itself, so enabling a
+        # variable-span allocator needs no manual tuning.
+        max_allocation_span = max(
+            (g.allocation_base_span for g in kv_cache_config.kv_cache_groups),
+            default=1,
+        )
+
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            max_allocation_span=max_allocation_span,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -114,6 +127,7 @@ class KVCacheCoordinator(ABC):
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
+                base_span=kv_cache_group.allocation_base_span,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -126,7 +140,7 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
-    def get_num_blocks_to_allocate(
+    def get_base_block_demand(
         self,
         request_id: str,
         num_tokens: int,
@@ -135,9 +149,21 @@ class KVCacheCoordinator(ABC):
         total_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
-    ) -> int:
+    ) -> tuple[int, dict[int, int]]:
         """
-        Get the number of blocks needed to be allocated for the request.
+        Compute the request's allocation demand for admission.
+
+        Returns a pair ``(total_base_blocks, demand_by_span)`` where:
+
+        * ``total_base_blocks`` is the total demand in base-block units (each
+          group's logical-block demand scaled by its allocation span), to be
+          compared against the block pool's base-block free count.
+        * ``demand_by_span`` maps a group's allocation span (base blocks per
+          logical block) to the number of logical blocks demanded at that span,
+          so the allocator can also check alignment/fragmentation feasibility.
+          In the uniform-page path every group spans one base block, so the
+          total equals the logical-block demand and the map has a single
+          ``{1: n}`` entry.
 
         Args:
             request_id: The request ID.
@@ -155,16 +181,14 @@ class KVCacheCoordinator(ABC):
                 per-request admission cap (SWA / chunked-local). Set only by
                 the full-sequence admission gate; per-step allocation must
                 leave it False so the predictor matches `allocate_new_blocks`.
-
-        Returns:
-            The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        total_base_blocks = 0
+        demand_by_span: dict[int, int] = {}
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_logical_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -173,7 +197,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_logical_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -181,7 +205,38 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+            base_span = manager.base_span
+            total_base_blocks += num_logical_blocks * base_span
+            if num_logical_blocks > 0:
+                demand_by_span[base_span] = (
+                    demand_by_span.get(base_span, 0) + num_logical_blocks
+                )
+        return total_base_blocks, demand_by_span
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        """Total allocation demand in base-block units (the block pool counts
+        base blocks). Thin wrapper over ``get_base_block_demand`` for callers
+        (e.g. the scheduler's reservation accounting) that only need the count;
+        equals the logical-block demand in the uniform-page path (span 1)."""
+        total_base_blocks, _ = self.get_base_block_demand(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
+        return total_base_blocks
 
     def allocate_new_computed_blocks(
         self,
@@ -251,18 +306,32 @@ class KVCacheCoordinator(ABC):
                 blocks for cross-attention.
 
         Returns:
-            The new allocated blocks.
+            The new allocated blocks, one list per group in group order.
         """
-        return tuple(
-            manager.allocate_new_blocks(
+        # Allocate larger-span groups first. Groups share one base-block
+        # address space; a larger span (e.g. a mamba group spanning several
+        # base blocks) needs an aligned multi-base-block chunk, while a span-1
+        # group (attention) can take any base block. Serving the larger spans
+        # before the span-1 groups prevents span-1 allocations from splitting
+        # the aligned chunks the larger spans require, so a request that passed
+        # the (base-weighted + feasibility) admission check always allocates
+        # successfully. Results are returned in the original group order.
+        order = sorted(
+            range(len(self.single_type_managers)),
+            key=lambda i: self.single_type_managers[i].base_span,
+            reverse=True,
+        )
+        results: list[list[KVCacheBlock]] = [[] for _ in self.single_type_managers]
+        for i in order:
+            manager = self.single_type_managers[i]
+            results[i] = manager.allocate_new_blocks(
                 request_id,
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
             )
-            for manager in self.single_type_managers
-        )
+        return tuple(results)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

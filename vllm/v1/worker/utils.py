@@ -356,6 +356,9 @@ def prepare_kernel_block_sizes(
             continue
         if isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
+            # Attention groups always allocate one base block per logical block
+            # (span 1) in decoupled hybrid mode, so kernel block sizing is the
+            # ordinary backend-driven split with no allocator-specific override.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
             selected_kernel_size = select_common_block_size(

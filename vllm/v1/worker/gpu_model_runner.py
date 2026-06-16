@@ -7070,6 +7070,12 @@ class GPUModelRunner(
         """
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
+        # In decoupled hybrid mode, the per-layer raw tensor is sized by
+        # base_page_bytes (the smallest group's page), not by spec.page_size_bytes.
+        # The kernel sees num_blocks base-units; one logical group block spans
+        # group.allocation_base_span base-units, but the kernel view's first-dim
+        # stride is base_page (so adjacent indices overlap for span > 1 groups).
+        base_page_bytes = getattr(self.kv_cache_config, "base_page_bytes", None)
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -7077,12 +7083,22 @@ class GPUModelRunner(
                 # There may be a last group for layers without kv cache.
                 continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            block_byte_stride = (
+                base_page_bytes
+                if base_page_bytes is not None
+                else kv_cache_spec.page_size_bytes
+            )
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                if base_page_bytes is not None:
+                    # Slab is padded by max-overhang for safe strided reads;
+                    # the logical block count is the config's num_blocks.
+                    num_blocks = self.kv_cache_config.num_blocks
+                else:
+                    assert raw_tensor.numel() % block_byte_stride == 0
+                    num_blocks = raw_tensor.numel() // block_byte_stride
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
@@ -7124,17 +7140,26 @@ class GPUModelRunner(
                     ]
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
-                    if kv_cache_spec.page_size_padded is not None:
-                        # Use strided view to handle page_size_bytes that
-                        # include padding. This follows
-                        # the same pattern as MambaSpec handling below.
+                    # Strided view is only needed when adjacent block indices
+                    # don't sit on adjacent kernel-block-sized strides in
+                    # memory: either (a) page-size padding inserts unused
+                    # bytes between blocks (`page_size_padded` set), or (b)
+                    # decoupled mode with span > 1 makes adjacent indices
+                    # overlap. For span == 1 attn groups under buddy, the
+                    # layout is contiguous and a plain .view() is correct (and
+                    # what baseline-attn uses outside buddy mode).
+                    needs_strided_view = kv_cache_spec.page_size_padded is not None or (
+                        base_page_bytes is not None
+                        and base_page_bytes < kv_cache_spec.page_size_bytes
+                    )
+                    if needs_strided_view:
                         # NOTE: This assumes kv_cache_shape[0] == num_blocks
                         # (i.e. the first physical dimension is the block
                         # index), which holds for MLA backends but NOT for
                         # standard attention backends whose shape starts with
                         # a K/V dimension of size 2.
                         dtype_size = get_dtype_size(dtype)
-                        page_stride = kv_cache_spec.page_size_bytes // dtype_size
+                        page_stride = block_byte_stride // dtype_size
                         strides = list(torch.empty(kv_cache_shape).stride())
                         strides[inv_order[0]] = page_stride
                         kv_cache = torch.as_strided(
@@ -7143,7 +7168,12 @@ class GPUModelRunner(
                             stride=tuple(strides),
                         )
                     else:
-                        # No padding — safe to use a contiguous view.
+                        # Contiguous view. Under buddy mode the slab may
+                        # have a max-overhang tail beyond what this group's
+                        # kernel view needs; trim before .view().
+                        view_numel = torch.Size(kv_cache_shape).numel()
+                        if raw_tensor.numel() != view_numel:
+                            raw_tensor = raw_tensor.narrow(0, 0, view_numel)
                         kv_cache = raw_tensor.view(kv_cache_shape)
                     kv_caches[layer_name] = kv_cache.permute(*inv_order)
 
@@ -7152,11 +7182,17 @@ class GPUModelRunner(
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
+                    # In decoupled mode the per-block byte stride is base_page,
+                    # which is < page_size_bytes for mamba. Adjacent indices
+                    # overlap but only chunk-aligned ones are ever referenced.
+                    mamba_block_stride_bytes = (
+                        base_page_bytes
+                        if base_page_bytes is not None
+                        else kv_cache_spec.page_size_bytes
+                    )
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
+                        num_element_per_page = mamba_block_stride_bytes // dtype_size
                         target_shape = (num_blocks, *shape)
                         stride = torch.empty(target_shape).stride()
                         target_stride = (num_element_per_page, *stride[1:])

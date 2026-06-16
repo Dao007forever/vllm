@@ -538,6 +538,7 @@ class Platform:
         """
         from math import lcm
 
+        from vllm import envs
         from vllm.config.vllm import set_current_vllm_config
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
@@ -553,6 +554,13 @@ class Platform:
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+
+        # Buddy + decoupled-page mode: skip the uniformization that inflates
+        # attn_block_size up to mamba's native page size. Attn keeps its
+        # kernel-natural block_size so prefix caching can hit at fine
+        # granularity; mamba keeps its native page_size (no padding).
+        # Downstream tensor allocation must handle non-uniform pages.
+        _buddy_decouple = envs.VLLM_USE_BUDDY_BLOCK_POOL
 
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
@@ -627,6 +635,47 @@ class Platform:
         ).page_size_bytes
 
         if mamba_page_size == 0:
+            return
+
+        if _buddy_decouple:
+            # In decoupled mode we let attn and mamba keep their native pages.
+            # We still need cache_config.mamba_block_size set for mamba kernels
+            # (and aligned to chunk_size under mamba_cache_mode='all'), but we
+            # do NOT inflate attn block_size and do NOT pad mamba's page.
+            with set_current_vllm_config(vllm_config):
+                kernel_block_alignment_size = max(
+                    min(
+                        s.base if isinstance(s, MultipleOf) else s
+                        for s in backend_cls.get_supported_kernel_block_sizes()
+                    ),
+                    cache_config.block_size,
+                )
+            if cache_config.mamba_cache_mode == "all":
+                # "all" caches mamba state for every chunk across the
+                # sequence, so mamba_block_size defines the chunk/page
+                # boundaries that MambaSpec.max_memory_usage_bytes later uses
+                # to count pages. Keep those boundaries aligned to the model's
+                # mamba chunk size and to the attention backend's kernel block
+                # alignment, without inflating the attention block_size.
+                base_chunk_size = (
+                    cache_config.mamba_block_size
+                    if cache_config.user_specified_mamba_block_size
+                    else model_config.get_mamba_chunk_size()
+                )
+                assert base_chunk_size is not None
+                cache_config.mamba_block_size = lcm(
+                    base_chunk_size, kernel_block_alignment_size
+                )
+            elif cache_config.mamba_cache_mode == "align":
+                cache_config.mamba_block_size = cache_config.block_size
+            logger.info(
+                "Decoupled hybrid page sizes: attn_block_size=%d, "
+                "mamba_block_size=%d, attn_page=%d B, mamba_native_page=%d B",
+                cache_config.block_size,
+                cache_config.mamba_block_size,
+                cache_config.block_size * attn_page_size_1_token,
+                mamba_page_size,
+            )
             return
 
         # mamba_block_size here should either be user specified value or None
