@@ -74,7 +74,7 @@ def test_mamba_span_is_allocator_normalized_natural_span(monkeypatch):
     normalize_span produces (the power-of-two rounding now lives there, not in
     the config)."""
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+    from vllm.v1.core.buddy_free_queue import BuddyAllocator
 
     monkeypatch.setenv("VLLM_USE_BUDDY_BLOCK_POOL", "1")
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
@@ -88,9 +88,7 @@ def test_mamba_span_is_allocator_normalized_natural_span(monkeypatch):
         vllm_config, groups, available_memory=attn.page_size_bytes * 4096
     )
     natural = cdiv(mamba.page_size_bytes, cfg.base_page_bytes)
-    assert groups[1].allocation_base_span == BuddyFreeKVCacheBlockQueue.normalize_span(
-        natural
-    )
+    assert groups[1].allocation_base_span == BuddyAllocator.normalize_span(natural)
 
 
 def test_memory_estimate_uses_same_effective_span_as_layout(monkeypatch):
@@ -98,7 +96,7 @@ def test_memory_estimate_uses_same_effective_span_as_layout(monkeypatch):
     allocator-normalized span the layout assigns, or admission drifts from real
     allocation."""
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+    from vllm.v1.core.buddy_free_queue import BuddyAllocator
     from vllm.v1.core.kv_cache_utils import _max_memory_usage_bytes_from_groups
 
     monkeypatch.setenv("VLLM_USE_BUDDY_BLOCK_POOL", "1")
@@ -116,7 +114,7 @@ def test_memory_estimate_uses_same_effective_span_as_layout(monkeypatch):
     expected_base_blocks = 0
     for g in groups:
         natural = cdiv(g.kv_cache_spec.page_size_bytes, base_page)
-        effective = BuddyFreeKVCacheBlockQueue.normalize_span(natural)
+        effective = BuddyAllocator.normalize_span(natural)
         logical = cdiv(
             g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             g.kv_cache_spec.page_size_bytes,

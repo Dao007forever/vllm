@@ -1442,7 +1442,12 @@ class SinkFullAttentionManager(FullAttentionManager):
         sink_len = kv_cache_spec.sink_len
         assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0
         num_sink_block = sink_len // self.block_size
-        self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
+        # Sink blocks are a one-time static grab held for the manager's
+        # lifetime. Route through the allocator's span-1 allocate so this works
+        # under any allocator (the buddy has no popleft_n).
+        self.sink_blocks = [
+            self.block_pool.allocator.allocate(1) for _ in range(num_sink_block)
+        ]
 
 
 def get_manager_for_kv_cache_spec(

@@ -12,7 +12,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_allocator import KVCacheBlockAllocator
+from vllm.v1.core.kv_cache_allocator import BlockAllocator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -165,14 +165,10 @@ class BlockPool:
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
-        # Experimental: swap the LRU free-queue for a buddy-allocator-backed
-        # one. Prefix caching coexists with buddy mode via an eviction
-        # callback: when the buddy queue splits a cached chunk (alloc walks
-        # up and needs a smaller piece) or coalesces two cached chunks (free
-        # merges siblings into a larger chunk), the affected chunks' hash
-        # entries are dropped from the cache map before the structural
-        # change. Touch/remove already work without a hash op because they
-        # operate on the block whose span is known.
+        # Experimental: swap the LRU free-queue for a buddy allocator that
+        # supports variable-span (multi-base-block) chunks. Either way the
+        # allocator owns its own eviction policy and reclaims cached candidates
+        # internally; BlockPool only calls allocate/free/reuse.
         self._buddy_mode = envs.VLLM_USE_BUDDY_BLOCK_POOL
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
@@ -180,35 +176,40 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # State the eviction callback reads — set BEFORE the queue is built.
+        # State the eviction hook reads — set BEFORE the allocator is built.
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
         self.metrics_collector = metrics_collector
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled). The allocator is held behind the KVCacheBlockAllocator
-        # interface so the strategy is swappable; nothing outside this pool
-        # needs to know which concrete allocator is in use.
-        self.free_block_queue: KVCacheBlockAllocator
+        # The allocator is held behind the BlockAllocator interface so the
+        # strategy is swappable; nothing outside this pool needs to know which
+        # concrete allocator is in use. The eviction hook drops a reclaimed
+        # block's prefix-cache hash from the map this pool owns.
+        self.allocator: BlockAllocator
         if self._buddy_mode:
-            from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+            from vllm.v1.core.buddy_free_queue import BuddyAllocator
+            from vllm.v1.core.eviction_policy import LRUEvictionPolicy
 
-            # The buddy queue owns the span->order translation; the pool only
-            # forwards the layout-derived max span, so spanned allocations
+            # The buddy allocator owns the span->order translation; the pool
+            # only forwards the layout-derived max span, so spanned allocations
             # always fit with no env tuning.
-            self.free_block_queue = BuddyFreeKVCacheBlockQueue.for_max_span(
+            self.allocator = BuddyAllocator.for_max_span(
                 self.blocks,
                 max_allocation_span,
-                on_evict=self._maybe_evict_cached_block,
+                evictor=LRUEvictionPolicy(on_evict=self._maybe_evict_cached_block),
             )
         else:
-            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+            self.allocator = FreeKVCacheBlockQueue(
+                self.blocks, on_evict=self._maybe_evict_cached_block
+            )
+        # Back-compat alias for the few consumers that reach the allocator
+        # directly (e.g. simple_kv_offload walks the default LRU queue).
+        self.free_block_queue = self.allocator
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = self.allocator.allocate(1)
         self.null_block.is_null = True
 
     def get_cached_block(
@@ -369,55 +370,30 @@ class BlockPool:
         that fit in raw base-block count but cannot be carved at the requested
         spans, so a request cannot pass admission and then fail to allocate.
         """
-        return self.free_block_queue.can_allocate_spans(demand_by_span)
+        return self.allocator.can_allocate(demand_by_span)
 
     def get_new_blocks(self, num_blocks: int, base_span: int = 1) -> list[KVCacheBlock]:
-        """Allocate ``num_blocks`` new logical blocks from the free pool.
+        """Allocate ``num_blocks`` new logical blocks from the allocator.
 
-        Each logical block spans ``base_span`` consecutive base blocks.
-        ``base_span == 1`` (the default) is the ordinary single-base-block path
-        used by the uniform-page layout and by attention groups. A
-        ``base_span > 1`` request (decoupled hybrid mode, e.g. a mamba group)
-        is served as an aligned multi-base-block chunk by the underlying
-        allocator and is all-or-nothing: if the full batch cannot be obtained,
-        any blocks acquired so far are returned and the call raises, leaving the
-        pool's free count and all ref counts unchanged.
+        Each logical block spans ``base_span`` consecutive base blocks
+        (``base_span == 1`` is the ordinary single-base-block path used by the
+        uniform-page layout and by attention groups). The allocator reclaims
+        cached eviction candidates internally when free memory is short and
+        returns memory that never carries a stale hash, so no eviction happens
+        here. Allocation is all-or-nothing: if the full batch cannot be
+        obtained, any blocks acquired so far are returned and the call raises,
+        leaving ref counts unchanged.
 
         Each returned block is identified by its starting base-block id; callers
         that index per-base-id use the start id and reserve the remaining
         ``base_span - 1`` ids. We do not check the prefix cache here.
         """
-        if base_span == 1:
-            if num_blocks > self.get_num_free_blocks():
-                raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
-            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
-            # In order to only iterate the list once, we duplicated code a bit
-            if self.enable_caching:
-                for block in ret:
-                    self._maybe_evict_cached_block(block)
-                    assert block.ref_cnt == 0
-                    block.ref_cnt += 1
-                    if self.metrics_collector:
-                        self.metrics_collector.on_block_allocated(block)
-            else:
-                for block in ret:
-                    assert block.ref_cnt == 0
-                    block.ref_cnt += 1
-                    if self.metrics_collector:
-                        self.metrics_collector.on_block_allocated(block)
-            return ret
-
-        # Variable-span (base_span > 1) path: allocate aligned chunks
-        # atomically so a mid-batch failure leaves the pool untouched.
-        ret = []
+        if num_blocks * base_span > self.get_num_free_blocks():
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        ret: list[KVCacheBlock] = []
         try:
             for _ in range(num_blocks):
-                # The variable-span allocator evicts a reclaimed cached chunk's
-                # hash through the on_evict callback (wired to
-                # _maybe_evict_cached_block) before reusing it, so the returned
-                # block never carries a stale hash and needs no extra eviction
-                # here.
-                block = self.free_block_queue.allocate_spanned_block(base_span)
+                block = self.allocator.allocate(base_span)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 ret.append(block)
@@ -426,7 +402,7 @@ class BlockPool:
             # whole batch succeeds (below), so there is nothing to reverse.
             for block in ret:
                 block.ref_cnt -= 1
-                self.free_block_queue.free_spanned_block(block)
+                self.allocator.free(block)
             raise
         if self.metrics_collector:
             for block in ret:
@@ -479,10 +455,10 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
+            # ref_cnt=0 means this block is free (a cached eviction candidate),
+            # so the prefix-cache hit reclaims it from the allocator.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                self.allocator.reuse(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -503,13 +479,14 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        freed_blocks = [
-            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
-        ]
-        if prepend:
-            self.free_block_queue.prepend_n(freed_blocks)
-        else:
-            self.free_block_queue.append_n(freed_blocks)
+        freed = [b for b in blocks_list if b.ref_cnt == 0 and not b.is_null]
+        # The allocator routes each freed block: a still-cached block becomes a
+        # reclaim candidate, an uncached block returns to truly-free memory.
+        # ``prepend`` prioritises the blocks for the next allocation; free in
+        # reverse so the batch ends up in ``freed`` order at the reuse-soon end
+        # (matching the old prepend_n/append_n batch semantics).
+        for block in reversed(freed) if prepend else freed:
+            self.allocator.free(block, prefer_reuse=prepend)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -571,7 +548,7 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.allocator.num_free_blocks
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

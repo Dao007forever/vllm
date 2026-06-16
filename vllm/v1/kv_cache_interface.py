@@ -858,7 +858,7 @@ class KVCacheGroupSpec:
     # ``allocation_base_span`` consecutive base blocks from the shared address
     # space. The value is allocator-agnostic (a base-block count); the rounding
     # rule and how a multi-base-block allocation is realised are the
-    # allocator's concern (see ``KVCacheBlockAllocator.normalize_span``).
+    # allocator's concern (see ``BlockAllocator.normalize_span``).
     allocation_base_span: int = 1
 
 

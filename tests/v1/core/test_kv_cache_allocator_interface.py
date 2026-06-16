@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The allocator-neutral KVCacheBlockAllocator interface (AC-5).
+"""The allocator-neutral BlockAllocator interface (AC-5).
 
 Both built-in allocators satisfy the runtime-checkable interface, a fresh
 third-party allocator with no buddy concepts can satisfy it, and the generic
 KV-cache surface (group spec, coordinator, manager) names no allocator-specific
-concepts.
+concepts. Prefix-cache eviction is a separate concern behind ``EvictionPolicy``.
 """
 
 import inspect
 
 import pytest
 
-from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
-from vllm.v1.core.kv_cache_allocator import KVCacheBlockAllocator
+from vllm.v1.core.buddy_free_queue import BuddyAllocator
+from vllm.v1.core.eviction_policy import LRUEvictionPolicy
+from vllm.v1.core.kv_cache_allocator import BlockAllocator, EvictionPolicy
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
 pytestmark = pytest.mark.cpu_test
@@ -21,19 +22,27 @@ pytestmark = pytest.mark.cpu_test
 
 def test_both_builtin_allocators_satisfy_protocol():
     lru = FreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(8)])
-    buddy = BuddyFreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(8)], max_order=2)
-    assert isinstance(lru, KVCacheBlockAllocator)
-    assert isinstance(buddy, KVCacheBlockAllocator)
+    buddy = BuddyAllocator(
+        [KVCacheBlock(i) for i in range(8)],
+        max_order=2,
+        evictor=LRUEvictionPolicy(),
+    )
+    assert isinstance(lru, BlockAllocator)
+    assert isinstance(buddy, BlockAllocator)
+
+
+def test_lru_eviction_policy_satisfies_protocol():
+    assert isinstance(LRUEvictionPolicy(), EvictionPolicy)
 
 
 def test_incomplete_allocator_is_not_an_instance():
     class Partial:
         num_free_blocks = 0
 
-        def popleft(self):  # missing the rest of the surface
+        def allocate(self, span=1):  # missing the rest of the surface
             ...
 
-    assert not isinstance(Partial(), KVCacheBlockAllocator)
+    assert not isinstance(Partial(), BlockAllocator)
 
 
 def test_trivial_third_party_allocator_conforms():
@@ -45,41 +54,21 @@ def test_trivial_third_party_allocator_conforms():
             self._free = list(blocks)
             self.num_free_blocks = len(blocks)
 
-        def popleft(self):
+        def allocate(self, span=1):
+            if span != 1:
+                raise ValueError("only span 1")
             self.num_free_blocks -= 1
             return self._free.pop()
 
-        def popleft_n(self, n):
-            return [self.popleft() for _ in range(n)]
-
-        def append(self, block):
+        def free(self, block, *, prefer_reuse=False):
             self._free.append(block)
             self.num_free_blocks += 1
 
-        def append_n(self, blocks):
-            for block in blocks:
-                self.append(block)
-
-        def prepend_n(self, blocks):
-            for block in blocks:
-                self.append(block)
-
-        def remove(self, block):
+        def reuse(self, block):
             self._free.remove(block)
             self.num_free_blocks -= 1
 
-        def get_all_free_blocks(self):
-            return list(self._free)
-
-        def allocate_spanned_block(self, base_span):
-            if base_span != 1:
-                raise ValueError("only span 1")
-            return self.popleft()
-
-        def free_spanned_block(self, block):
-            self.append(block)
-
-        def can_allocate_spans(self, demand_by_span):
+        def can_allocate(self, demand_by_span):
             return all(s == 1 for s, c in demand_by_span.items() if c > 0) and (
                 sum(demand_by_span.values()) <= self.num_free_blocks
             )
@@ -91,7 +80,7 @@ def test_trivial_third_party_allocator_conforms():
             raise ValueError("only span 1")
 
     alloc = TrivialAllocator([KVCacheBlock(i) for i in range(4)])
-    assert isinstance(alloc, KVCacheBlockAllocator)
+    assert isinstance(alloc, BlockAllocator)
 
 
 def test_generic_surface_has_no_allocator_specific_names():

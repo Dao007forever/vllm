@@ -127,7 +127,7 @@ class KVCacheBlock:
 
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue
-    # (LRU mode) or BuddyFreeKVCacheBlockQueue (buddy mode). A block lives in
+    # (LRU mode) or BuddyAllocator (buddy mode). A block lives in
     # exactly one queue at a time, so the pointers don't conflict.
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
@@ -192,9 +192,19 @@ class FreeKVCacheBlockQueue:
 
     Args:
         blocks: A list of KVCacheBlock objects.
+        on_evict: Fired when ``allocate`` hands out a block that still carries a
+            prefix-cache hash, before its memory is reused. Drops the block's
+            hash from the prefix-cache map (mirrors
+            ``BlockPool._maybe_evict_cached_block``). ``None`` when prefix
+            caching is disabled.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        on_evict: Callable[[KVCacheBlock], bool] | None = None,
+    ) -> None:
+        self._on_evict = on_evict
         self.num_free_blocks = len(blocks)
 
         # Initialize doubly links of consecutive blocks
@@ -403,31 +413,44 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
         return ret
 
-    # ------------------- allocator-neutral interface ------------------------
-    def allocate_spanned_block(self, base_span: int) -> KVCacheBlock:
-        """Allocate one logical block. This LRU allocator only supports
-        single-base-block allocations; variable-span allocation requires the
-        buddy allocator."""
-        if base_span != 1:
+    # ----------------------- BlockAllocator surface -------------------------
+    # This LRU queue is the default (fused) allocator: it is its own eviction
+    # policy. Cached eviction candidates stay in the queue (not a separate
+    # structure), so ``allocate`` may hand back a still-cached block and drop
+    # its hash via ``on_evict`` here. Only span 1 is supported; variable-span
+    # layouts require the buddy allocator (VLLM_USE_BUDDY_BLOCK_POOL=1).
+    def allocate(self, span: int = 1) -> KVCacheBlock:
+        if span != 1:
             raise ValueError(
-                "FreeKVCacheBlockQueue supports only base_span == 1; "
-                f"got {base_span}. Variable-span allocation requires "
-                "VLLM_USE_BUDDY_BLOCK_POOL=1."
+                f"FreeKVCacheBlockQueue supports only span == 1; got {span}. "
+                "Variable-span allocation requires VLLM_USE_BUDDY_BLOCK_POOL=1."
             )
-        return self.popleft()
+        block = self.popleft()
+        if self._on_evict is not None and block.block_hash is not None:
+            self._on_evict(block)
+        return block
 
-    def free_spanned_block(self, block: KVCacheBlock) -> None:
-        """Return a block to the free pool."""
-        self.append(block)
+    def free(self, block: KVCacheBlock, *, prefer_reuse: bool = False) -> None:
+        """Return a block to the queue. Cached and uncached blocks both stay in
+        the queue (this allocator is its own eviction policy); ``prefer_reuse``
+        puts it at the front so it is handed out next."""
+        if prefer_reuse:
+            self.prepend_n([block])
+        else:
+            self.append_n([block])
 
-    def can_allocate_spans(self, demand_by_span: dict[int, int]) -> bool:
-        """Whether a ``{base_span: num_blocks}`` demand fits. Only span 1 is
+    def reuse(self, block: KVCacheBlock) -> None:
+        """Prefix-cache hit: take a cached candidate out of the queue."""
+        self.remove(block)
+
+    def can_allocate(self, demand_by_span: dict[int, int]) -> bool:
+        """Whether a ``{span: num_blocks}`` demand fits. Only span 1 is
         supported, so any span > 1 demand is unsatisfiable here."""
         total = 0
-        for base_span, count in demand_by_span.items():
+        for span, count in demand_by_span.items():
             if count <= 0:
                 continue
-            if base_span != 1:
+            if span != 1:
                 return False
             total += count
         return total <= self.num_free_blocks
@@ -1318,9 +1341,9 @@ def _active_span_normalizer() -> Callable[[int], int]:
     than the buddy flag.
     """
     if envs.VLLM_USE_BUDDY_BLOCK_POOL:
-        from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+        from vllm.v1.core.buddy_free_queue import BuddyAllocator
 
-        return BuddyFreeKVCacheBlockQueue.normalize_span
+        return BuddyAllocator.normalize_span
     return FreeKVCacheBlockQueue.normalize_span
 
 
