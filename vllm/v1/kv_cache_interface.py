@@ -849,6 +849,17 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Decoupled hybrid mode: how many base blocks one logical block of this
+    # group spans. 1 (the default) means one base block per logical block. For
+    # mamba in decoupled hybrid mode this is the allocator-*normalized* span:
+    # the natural footprint ceil(spec.page_size / base_page_bytes) rounded by
+    # the selected allocator to a granularity it can carve and align (the buddy
+    # allocator rounds up to a power of two). A mamba allocation then consumes
+    # ``allocation_base_span`` consecutive base blocks from the shared address
+    # space. The value is allocator-agnostic (a base-block count); the rounding
+    # rule and how a multi-base-block allocation is realised are the
+    # allocator's concern (see ``KVCacheBlockAllocator.normalize_span``).
+    allocation_base_span: int = 1
 
 
 @dataclass
@@ -858,10 +869,24 @@ class KVCacheConfig:
     """
 
     num_blocks: int
-    """The number of KV cache blocks"""
+    """The number of KV cache blocks.
+
+    In decoupled hybrid mode, this is the number of *base* blocks; one base
+    block is base_page_bytes bytes per layer-tuple slab. A logical block of
+    group g spans g.allocation_base_span base blocks.
+    """
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
+    """The kv cache groups of the model."""
+    base_page_bytes: int | None = None
+    """When set: buddy-decoupled hybrid layout is in effect. Each tensor slab
+    is sized as num_blocks * base_page_bytes per layer, with first-dim stride
+    base_page_bytes. Each group's spec.page_size_bytes is the *logical* per-
+    block byte count (the kernel-visible size). The allocator hands out chunks
+    of group.allocation_base_span base blocks per logical block. When None:
+    legacy uniform-page layout (stride = spec.page_size_bytes /
+    page_size_padded)."""
     """
     The kv cache groups of the model.
     For models with only one type of attention, there is only one group that

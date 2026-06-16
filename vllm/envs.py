@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
+    VLLM_USE_BUDDY_BLOCK_POOL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1090,6 +1091,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (
         os.getenv("VLLM_USE_OINK_OPS", "False").lower() in ("true", "1")
+    ),
+    # Experimental: back the KV-cache free-block allocator with a power-of-two
+    # buddy allocator that supports variable-size (multi-base-block) chunks,
+    # enabling decoupled hybrid (attention + mamba) paging where groups keep
+    # their native page sizes. Disabled by default.
+    "VLLM_USE_BUDDY_BLOCK_POOL": lambda: (
+        os.getenv("VLLM_USE_BUDDY_BLOCK_POOL", "False").lower() in ("true", "1")
     ),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.

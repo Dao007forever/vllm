@@ -126,9 +126,19 @@ class KVCacheBlock:
     _block_hash: BlockHashWithGroupId | None = None
 
     # Used to construct a doubly linked list for free blocks.
-    # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
+    # These two attributes should only be manipulated by FreeKVCacheBlockQueue
+    # (LRU mode) or BuddyFreeKVCacheBlockQueue (buddy mode). A block lives in
+    # exactly one queue at a time, so the pointers don't conflict.
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
+
+    # Allocation span: when this block heads an allocated or free chunk, the
+    # chunk covers base-block ids [block_id, block_id + base_span). For the LRU
+    # allocator and for non-head base blocks this stays 1 (a single base
+    # block). Set by the variable-span allocator on alloc/split/coalesce. The
+    # value is the neutral base-block count; the buddy allocator converts it
+    # to/from its internal power-of-two order at its own boundaries.
+    base_span: int = 1
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
@@ -393,6 +403,47 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
         return ret
 
+    # ------------------- allocator-neutral interface ------------------------
+    def allocate_spanned_block(self, base_span: int) -> KVCacheBlock:
+        """Allocate one logical block. This LRU allocator only supports
+        single-base-block allocations; variable-span allocation requires the
+        buddy allocator."""
+        if base_span != 1:
+            raise ValueError(
+                "FreeKVCacheBlockQueue supports only base_span == 1; "
+                f"got {base_span}. Variable-span allocation requires "
+                "VLLM_USE_BUDDY_BLOCK_POOL=1."
+            )
+        return self.popleft()
+
+    def free_spanned_block(self, block: KVCacheBlock) -> None:
+        """Return a block to the free pool."""
+        self.append(block)
+
+    def can_allocate_spans(self, demand_by_span: dict[int, int]) -> bool:
+        """Whether a ``{base_span: num_blocks}`` demand fits. Only span 1 is
+        supported, so any span > 1 demand is unsatisfiable here."""
+        total = 0
+        for base_span, count in demand_by_span.items():
+            if count <= 0:
+                continue
+            if base_span != 1:
+                return False
+            total += count
+        return total <= self.num_free_blocks
+
+    @staticmethod
+    def normalize_span(natural_span: int) -> int:
+        """This allocator only hands out single base blocks, so the only
+        supported span is 1. A natural span > 1 cannot be represented."""
+        if natural_span <= 1:
+            return 1
+        raise ValueError(
+            "FreeKVCacheBlockQueue supports only span 1; got natural span "
+            f"{natural_span}. Variable-span layouts require "
+            "VLLM_USE_BUDDY_BLOCK_POOL=1."
+        )
+
 
 def need_extra_keys(request: Request) -> bool:
     """Check whether the blocks allocated to this request need extra hash keys.
@@ -636,7 +687,11 @@ def resolve_kv_cache_block_sizes(
     # Mamba groups with block_size != cache_config.block_size
     # (mamba_cache_mode != "align") break divisibility; back off to the
     # scheduler block size.
-    if any(
+    # In buddy-decoupled hybrid mode, attn keeps its small kernel-natural
+    # block_size while mamba uses chunk-aligned block_size; we still want
+    # prefix-cache hashing at attn's fine granularity, so don't back off.
+    decoupled = kv_cache_config.base_page_bytes is not None
+    if not decoupled and any(
         isinstance(g.kv_cache_spec, MambaSpec)
         and g.kv_cache_spec.block_size != cache_config.block_size
         for g in groups
@@ -908,10 +963,17 @@ def get_max_concurrency_for_kv_cache_config(
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
         vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
     )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
+    # Bytes per pool block. In decoupled hybrid mode every pool block is one
+    # ``base_page_bytes`` base unit (groups[0]'s native page can be smaller than
+    # the base page — e.g. a mamba/KDA group left un-padded — so reading its
+    # page_size_bytes here would under-state the per-block cost and under-report
+    # concurrency by the base-page/native-page ratio). Fall back to groups[0]'s
+    # page when not decoupled (base_page_bytes is None).
+    per_block_bytes = (
+        kv_cache_config.base_page_bytes
+        or kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
     )
+    memory_per_block = per_block_bytes * num_layer_per_group
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
     return max_concurrency
@@ -1244,6 +1306,59 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _active_span_normalizer() -> Callable[[int], int]:
+    """Resolve the span-rounding policy of the currently-selected allocator.
+
+    The decoupled layout requests a *natural* span (the base-block count a
+    group's page needs); the allocator owns how that span is rounded to a
+    granularity it can carve and align. The buddy allocator rounds up to a
+    power of two; the LRU allocator only supports span 1. Resolving the policy
+    here keeps the rounding rule out of the layout code. When the registry
+    refactor lands this should resolve from the selected allocator kind rather
+    than the buddy flag.
+    """
+    if envs.VLLM_USE_BUDDY_BLOCK_POOL:
+        from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
+
+        return BuddyFreeKVCacheBlockQueue.normalize_span
+    return FreeKVCacheBlockQueue.normalize_span
+
+
+def _decoupled_base_page_and_spans(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[int, list[int]]:
+    """Base page and per-group allocation span for the decoupled hybrid layout.
+
+    Single source of truth shared by the tensor layout
+    (``get_kv_cache_config_from_groups``) and the capacity estimate
+    (``_max_memory_usage_bytes_from_groups``), so admission planning cannot
+    drift from the realized layout.
+
+    ``base_page`` is anchored to the smallest *attention* page: attention
+    groups read through a strided view that requires one base block per logical
+    block (span 1), so the base page must equal their page. When there are no
+    attention groups it falls back to the smallest page overall. Non-attention
+    (e.g. mamba) groups request ``ceil(page / base_page)`` base blocks, rounded
+    by the active allocator's ``normalize_span``. Returns ``(base_page, spans)``
+    with ``spans[i]`` the span for ``kv_cache_groups[i]``.
+    """
+    normalize_span = _active_span_normalizer()
+    attn_pages = [
+        g.kv_cache_spec.page_size_bytes
+        for g in kv_cache_groups
+        if not isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    all_pages = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
+    base_page = min(attn_pages) if attn_pages else min(all_pages)
+    spans = [
+        1
+        if not isinstance(g.kv_cache_spec, MambaSpec)
+        else normalize_span(cdiv(g.kv_cache_spec.page_size_bytes, base_page))
+        for g in kv_cache_groups
+    ]
+    return base_page, spans
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1307,11 +1422,88 @@ def get_kv_cache_config_from_groups(
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        assert group_size > 0, "group_size must be greater than 0"
+
+        _buddy_decouple = envs.VLLM_USE_BUDDY_BLOCK_POOL
+        # Buddy-decoupled hybrid mode: groups may have different page sizes.
+        # Anchor base_page to the smallest ATTENTION group's page. Attention
+        # groups go through the kernel-block-expansion strided view (which
+        # requires uniform per-block strides), so they must end up at span 1;
+        # any span > 1 on an attn group would mean the kernel pages within one
+        # logical block aren't laid out at a uniform stride and the strided
+        # view can't represent it.
+        # Non-attention (e.g. mamba) groups handle stride independently in
+        # their own reshape branch and tolerate base_page > their native
+        # page (they pay a one-time per-block over-allocation equal to the
+        # gap). This mirrors what baseline does post-`_align_hybrid_block_
+        # size`: pick the larger natural page as the uniform anchor and pad
+        # the smaller side up.
+        all_page_sizes = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
+        decouple_active = _buddy_decouple and len(set(all_page_sizes)) > 1
+        if decouple_active:
+            # base_page anchor and per-group span come from the shared helper
+            # so the realized layout matches the capacity estimate exactly
+            # (see `_decoupled_base_page_and_spans`). Groups whose native page
+            # is <= base_page collapse to span 1 (they over-allocate by
+            # `base_page - native` per block; that's the "pad mamba up" cost).
+            base_page, spans = _decoupled_base_page_and_spans(kv_cache_groups)
+            max_overhang_bytes = 0
+            for g, span in zip(kv_cache_groups, spans):
+                page = g.kv_cache_spec.page_size_bytes
+                is_attention = not isinstance(g.kv_cache_spec, MambaSpec)
+                # Attention groups must allocate exactly one base block per
+                # logical block (span 1). Attention kernels read through a
+                # strided view whose first physical dimension is the block
+                # index; that view only represents adjacent blocks that sit one
+                # base page apart, so a span>1 attention group cannot be laid
+                # out safely (standard-attention shapes start with a K/V
+                # dimension, not the block index). base_page is anchored to the
+                # smallest attention page, so any attention group whose page
+                # exceeds base_page cannot be represented here.
+                if is_attention and page != base_page:
+                    raise ValueError(
+                        "Decoupled hybrid KV cache requires all attention "
+                        f"groups to share one page size, but found an "
+                        f"attention page of {page} B != base page "
+                        f"{base_page} B. Attention groups must allocate one "
+                        "base block per logical block (span 1)."
+                    )
+                g.allocation_base_span = span
+                # The strided kernel view reads page_size_bytes at offset
+                # block_id * base_page, so the last usable block_id is
+                # num_blocks - (page_size_bytes / base_page). Tensors must
+                # have room for that overhang on the tail. Groups whose
+                # native page is <= base_page contribute zero overhang.
+                overhang = page - base_page
+                if overhang > max_overhang_bytes:
+                    max_overhang_bytes = overhang
+            # num_blocks counts base units. The buddy address space is one
+            # block_id per base unit; each layer-tuple slab holds
+            # num_blocks * base_page bytes plus max_overhang for safe strided
+            # reads at the tail.
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, base_page
+            )
+            tensor_size_bytes = base_page * num_blocks + max_overhang_bytes
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=tensor_size_bytes, shared_by=shared_by)
+                )
+            return KVCacheConfig(
+                num_blocks=num_blocks,
+                kv_cache_tensors=kv_cache_tensors,
+                kv_cache_groups=kv_cache_groups,
+                base_page_bytes=base_page,
+            )
 
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
-        assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(
             vllm_config, group_size, available_memory, page_size
         )
@@ -1680,7 +1872,13 @@ def get_kv_cache_groups(
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    # In buddy-decoupled mode, groups keep their native page sizes; the buddy
+    # allocator handles per-group block sizes by issuing variable-order chunks
+    # over a fine-grained base address space. See base_page_bytes handling in
+    # get_kv_cache_config_from_groups.
+    _buddy_decouple = envs.VLLM_USE_BUDDY_BLOCK_POOL
+    if not _buddy_decouple:
+        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
@@ -1782,6 +1980,23 @@ def _max_memory_usage_bytes_from_groups(
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    page_sizes = [g.kv_cache_spec.page_size_bytes for g in kv_cache_groups]
+    if len(set(page_sizes)) > 1:
+        # Buddy-decoupled hybrid: per-group native pages differ. Anchor the
+        # base page and per-group span with the SAME helper the tensor layout
+        # uses (`_decoupled_base_page_and_spans`), so the estimated base-block
+        # count matches what the layout actually allocates. Per-base-block cost
+        # below is group_size * base_page, so we count base-blocks per group.
+        base_page, spans = _decoupled_base_page_and_spans(kv_cache_groups)
+        base_blocks_needed = 0
+        for g, span in zip(kv_cache_groups, spans):
+            logical_blocks = cdiv(
+                g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                g.kv_cache_spec.page_size_bytes,
+            )
+            base_blocks_needed += logical_blocks * span
+        return group_size * base_page * base_blocks_needed
+
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
     )
@@ -2061,9 +2276,17 @@ def get_kv_cache_configs(
         kv_cache_config.num_blocks = min_num_blocks
 
         # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        if kv_cache_config.base_page_bytes is not None:
+            # Decoupled hybrid: tensor.size = num_blocks * base_page + overhang.
+            # Preserve the overhang; shrink only the base-blocks portion.
+            base_page = kv_cache_config.base_page_bytes
+            for tensor in kv_cache_config.kv_cache_tensors:
+                overhang = tensor.size - num_blocks_old * base_page
+                tensor.size = min_num_blocks * base_page + overhang
+        else:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -11,6 +12,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_allocator import KVCacheBlockAllocator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -144,6 +146,12 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        max_allocation_span: Largest per-logical-block allocation span (in base
+            blocks) any group will request, derived by the caller from the
+            layout's per-group ``allocation_base_span``. Allocator-neutral: a
+            span-1-only allocator ignores it; a variable-span allocator sizes
+            itself to support spans up to this value. Defaults to 1 (single
+            base block per logical block).
     """
 
     def __init__(
@@ -153,33 +161,55 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        max_allocation_span: int = 1,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        # Experimental: swap the LRU free-queue for a buddy-allocator-backed
+        # one. Prefix caching coexists with buddy mode via an eviction
+        # callback: when the buddy queue splits a cached chunk (alloc walks
+        # up and needs a smaller piece) or coalesces two cached chunks (free
+        # merges siblings into a larger chunk), the affected chunks' hash
+        # entries are dropped from the cache map before the structural
+        # change. Touch/remove already work without a hash op because they
+        # operate on the block whose span is known.
+        self._buddy_mode = envs.VLLM_USE_BUDDY_BLOCK_POOL
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
+        # State the eviction callback reads — set BEFORE the queue is built.
+        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        self.enable_kv_cache_events = enable_kv_cache_events
+        self.kv_event_queue: list[KVCacheEvent] = []
+        self.metrics_collector = metrics_collector
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # enabled). The allocator is held behind the KVCacheBlockAllocator
+        # interface so the strategy is swappable; nothing outside this pool
+        # needs to know which concrete allocator is in use.
+        self.free_block_queue: KVCacheBlockAllocator
+        if self._buddy_mode:
+            from vllm.v1.core.buddy_free_queue import BuddyFreeKVCacheBlockQueue
 
-        # Cache for block lookup
-        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+            # The buddy queue owns the span->order translation; the pool only
+            # forwards the layout-derived max span, so spanned allocations
+            # always fit with no env tuning.
+            self.free_block_queue = BuddyFreeKVCacheBlockQueue.for_max_span(
+                self.blocks,
+                max_allocation_span,
+                on_evict=self._maybe_evict_cached_block,
+            )
+        else:
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
-
-        self.enable_kv_cache_events = enable_kv_cache_events
-        self.kv_event_queue: list[KVCacheEvent] = []
-
-        self.metrics_collector = metrics_collector
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -330,36 +360,77 @@ class BlockPool:
                 )
             )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """Get new blocks from the free block pool.
+    def can_allocate_demands(self, demand_by_span: dict[int, int]) -> bool:
+        """Whether the allocator can satisfy a joint ``{base_span: num_blocks}``
+        demand, accounting for any alignment/fragmentation it imposes.
 
-        Note that we do not check block cache in this function.
-
-        Args:
-            num_blocks: The number of blocks to allocate.
-
-        Returns:
-            A list of new block.
+        The uniform LRU allocator supports only span 1 and gates on the raw
+        free count; the variable-span allocator additionally rejects demands
+        that fit in raw base-block count but cannot be carved at the requested
+        spans, so a request cannot pass admission and then fail to allocate.
         """
-        if num_blocks > self.get_num_free_blocks():
-            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        return self.free_block_queue.can_allocate_spans(demand_by_span)
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+    def get_new_blocks(self, num_blocks: int, base_span: int = 1) -> list[KVCacheBlock]:
+        """Allocate ``num_blocks`` new logical blocks from the free pool.
 
-        # In order to only iterate the list once, we duplicated code a bit
-        if self.enable_caching:
-            for block in ret:
-                self._maybe_evict_cached_block(block)
+        Each logical block spans ``base_span`` consecutive base blocks.
+        ``base_span == 1`` (the default) is the ordinary single-base-block path
+        used by the uniform-page layout and by attention groups. A
+        ``base_span > 1`` request (decoupled hybrid mode, e.g. a mamba group)
+        is served as an aligned multi-base-block chunk by the underlying
+        allocator and is all-or-nothing: if the full batch cannot be obtained,
+        any blocks acquired so far are returned and the call raises, leaving the
+        pool's free count and all ref counts unchanged.
+
+        Each returned block is identified by its starting base-block id; callers
+        that index per-base-id use the start id and reserve the remaining
+        ``base_span - 1`` ids. We do not check the prefix cache here.
+        """
+        if base_span == 1:
+            if num_blocks > self.get_num_free_blocks():
+                raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+            # In order to only iterate the list once, we duplicated code a bit
+            if self.enable_caching:
+                for block in ret:
+                    self._maybe_evict_cached_block(block)
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            else:
+                for block in ret:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            return ret
+
+        # Variable-span (base_span > 1) path: allocate aligned chunks
+        # atomically so a mid-batch failure leaves the pool untouched.
+        ret = []
+        try:
+            for _ in range(num_blocks):
+                # The variable-span allocator evicts a reclaimed cached chunk's
+                # hash through the on_evict callback (wired to
+                # _maybe_evict_cached_block) before reusing it, so the returned
+                # block never carries a stale hash and needs no extra eviction
+                # here.
+                block = self.free_block_queue.allocate_spanned_block(base_span)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
-        else:
+                ret.append(block)
+        except Exception:
+            # All-or-nothing rollback. Metrics are recorded only after the
+            # whole batch succeeds (below), so there is nothing to reverse.
             for block in ret:
-                assert block.ref_cnt == 0
-                block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+                block.ref_cnt -= 1
+                self.free_block_queue.free_spanned_block(block)
+            raise
+        if self.metrics_collector:
+            for block in ret:
+                self.metrics_collector.on_block_allocated(block)
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
