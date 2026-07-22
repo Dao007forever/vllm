@@ -84,7 +84,12 @@ resolve_master_bin() {
     local wrapper_dir
     local candidate
 
-    wrapper_bin="$(command -v mooncake_master)"
+    wrapper_bin="$(command -v mooncake_master || true)"
+    if [[ -z "$wrapper_bin" ]]; then
+        echo "Error: mooncake_master was not found on PATH." >&2
+        echo "Install Mooncake or activate the environment that provides mooncake_master." >&2
+        return 1
+    fi
     wrapper_dir="$(cd "$(dirname "$wrapper_bin")" && pwd)"
 
     shopt -s nullglob
@@ -100,7 +105,7 @@ resolve_master_bin() {
     printf '%s\n' "$wrapper_bin"
 }
 
-MASTER_BIN="$(resolve_master_bin)"
+MASTER_BIN="$(resolve_master_bin)" || exit 1
 
 
 write_master_env_file() {
