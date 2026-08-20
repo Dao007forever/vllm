@@ -14,7 +14,7 @@
     <span>NIXL</span>
   </div>
 
-  <h1>NIXL &mdash; D Pulls KV From P</h1>
+  <h1>NIXL KV Transfer &mdash; From Blocks to RDMA READs</h1>
   <p class="subtitle">
     The decode worker initiates a NIXL <code>READ</code> directly against
     the prefill worker's registered KV memory. ZMQ-based side-channel
@@ -25,15 +25,19 @@
   <section class="tldr">
     <strong>TL;DR</strong>
     <p>
-      NIXL is the pull-model transport. D's worker registers all local KV
-      memory with NIXL <em>eagerly</em> at startup, then on each new
+      This page follows the default pull connector. D's worker registers all
+      local KV memory with NIXL <em>eagerly</em> at startup, then on each new
       remote engine it (1) ZMQ-handshakes to fetch P's agent metadata,
-      (2) registers P as a remote NIXL agent, and (3) issues a single
-      async <code>READ</code> xfer that copies P's KV blocks directly
-      into D's blocks. P doesn't push &mdash; P just keeps the blocks
-      alive on a 30-second lease that D's heartbeat refreshes. When D's
-      transfer completes, NIXL delivers a notification to P which lets
-      P free the lease early.
+      (2) registers P as a remote NIXL agent, and (3) issues a single async
+      <code>READ</code> xfer that copies P's KV blocks directly into D's
+      blocks. P doesn't push &mdash; P just keeps the blocks alive on a
+      30-second lease that D's heartbeat refreshes. When D's transfer
+      completes, NIXL delivers a notification to P which lets P free the lease
+      early. With the default <code>UCX</code> backend, that high-level READ
+      becomes registered GPU memory + an exchanged remote key +
+      <code>ucp_get_nbx</code> operations + UCX completion progress. On an
+      RDMA-capable UCX path, those operations become NIC-issued RDMA READ work
+      requests.
     </p>
   </section>
 
@@ -45,7 +49,7 @@
       <li><a href="#handshake">3. The ZMQ side-channel handshake</a></li>
       <li><a href="#registration">4. Memory registration: eager local, lazy remote</a></li>
       <li><a href="#blockids">5. Where the block IDs come from</a></li>
-      <li><a href="#xfer">6. The <code>READ</code> transfer</a></li>
+      <li><a href="#xfer">6. The <code>READ</code>, down to RDMA primitives</a></li>
       <li><a href="#completion">7. Completion: polling + NIXL notifs</a></li>
       <li><a href="#lease">8. The lease + heartbeat lifetime contract</a></li>
       <li><a href="#failures">9. Failure modes</a></li>
@@ -1690,12 +1694,12 @@ if num_local_blocks &lt; len(remote_group):
     </p>
   </div>
 
-  <h2 id="xfer">6. The <code>READ</code> transfer</h2>
+  <h2 id="xfer">6. The <code>READ</code>, down to RDMA primitives</h2>
 
   <p>
     On <code>start_load_kv</code>, after the handshake has completed,
     <code>_read_blocks_for_req</code>
-    (<span class="fileref">nixl/worker.py:2021-2095</span>) computes the
+    (<span class="fileref">nixl/pull_worker.py:116-204</span>) computes the
     full plan and emits one <code>READ</code> per remote rank that holds
     a piece of this request's KV.
   </p>
@@ -1722,6 +1726,478 @@ for spec in read_specs:
     request's blocks go in one NIXL transfer per source rank.
   </p>
 
+  <div class="callout info">
+    <strong>Scope: NIXL is the API; UCX is the default transport.</strong>
+    <p>
+      vLLM defaults <code>backends</code> to <code>["UCX"]</code>
+      (<span class="fileref">nixl/base_worker.py:217-219</span>) and pins
+      NIXL at <code>1.3.1</code>
+      (<span class="fileref">requirements/kv_connectors.txt</span>).
+      The walk-through below follows that path. NIXL can also select
+      LIBFABRIC, GDS, POSIX, or another installed plugin; in those cases the
+      same NIXL calls do <em>not</em> necessarily turn into RDMA verbs. Even
+      with UCX, topology and configuration can select CUDA IPC, shared memory,
+      or TCP instead of RDMA. So read
+      &ldquo;RDMA READ&rdquo; below as the common cross-host UCX fast path,
+      not as a promise made by the Python API.
+    </p>
+    <p>
+      vLLM also has an explicit <code>NixlPushConnector</code>. It reuses the
+      same registration and handshake machinery but makes P issue NIXL
+      <code>WRITE</code> operations. This page follows
+      <code>NixlPullConnector</code>, where D issues the READ.
+    </p>
+  </div>
+
+  <h3>6.1 The API ladder: the same copy at four levels</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Layer</th>
+        <th>Object / primitive</th>
+        <th>What it means for one KV pull</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>vLLM</td>
+        <td><code>local_block_ids</code> paired with
+          <code>remote_block_ids</code></td>
+        <td>Copy these logical KV pages on P into these slots on D.</td>
+      </tr>
+      <tr>
+        <td>NIXL Python</td>
+        <td><code>make_prepped_xfer("READ", ...)</code> then
+          <code>transfer(handle)</code></td>
+        <td>Select entries from two pre-built descriptor lists and submit one
+          asynchronous transfer request.</td>
+      </tr>
+      <tr>
+        <td>NIXL UCX plugin</td>
+        <td><code>ucp_get_nbx(ep, local_addr, len, remote_addr, rkey)</code></td>
+        <td>Issue one UCX one-sided GET for each descriptor pair (after any
+          descriptor coalescing).</td>
+      </tr>
+      <tr>
+        <td>RDMA-capable UCX lane</td>
+        <td>QP/WQE + remote virtual address + rkey; completion on a CQ</td>
+        <td>The NIC on D reads P's registered memory and places the bytes in
+          D's registered destination. UCX owns the QPs, WQEs, CQs, rails, and
+          protocol choice.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout code-ref">
+    <strong>One NIXL handle is not necessarily one RDMA work request.</strong>
+    <p>
+      vLLM submits one handle per <code>(D worker, P worker, request)</code>,
+      but that handle selects many descriptors: layers &times; K/V regions
+      &times; blocks. NIXL may merge adjacent descriptors, and UCX may split,
+      stripe, or choose a different lane. The stable contract is
+      <em>one asynchronous NIXL request</em>; the number of wire operations is
+      a transport detail.
+    </p>
+  </div>
+
+  <h3>6.2 Primitive 1 &mdash; register and pin both GPU buffers</h3>
+
+  <p>
+    RDMA cannot safely target an arbitrary CUDA pointer. Before any request,
+    both P and D hand their long-lived KV allocations to NIXL:
+  </p>
+
+<pre><code><span class="c"># vLLM, once during worker initialization</span>
+reg_descs = nixl.get_reg_descs(
+    [(base_addr, region_bytes, gpu_id, <span class="s">""</span>), ...],
+    <span class="s">"VRAM"</span>,
+)
+nixl.register_memory(reg_descs, backends=[<span class="s">"UCX"</span>])
+
+<span class="c"># NIXL UCX plugin (conceptual C API path)</span>
+ucp_mem_map(context, {
+    .address = base_addr,
+    .length  = region_bytes,
+}, &amp;memh)
+ucp_rkey_pack(context, memh, &amp;packed_rkey, &amp;size)</code></pre>
+
+  <p>
+    <code>ucp_mem_map</code> gives UCX a memory handle
+    (<code>ucp_mem_h</code>). For VRAM, UCX's CUDA support arranges the
+    device-memory registration needed by the selected transport. On the
+    GPUDirect RDMA path that ultimately gives the NIC DMA access to HBM;
+    the KV payload does not bounce through a vLLM CPU buffer. UCX then packs
+    the region's transport key into an opaque blob. At the verbs level the
+    important capability is an <strong>rkey</strong>: permission for a remote
+    peer to access a registered address range.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Registration turns a CUDA allocation into an RDMA-capable region</div>
+    <div class="flow">
+      <div class="flow-step b">
+        <span class="num">vLLM</span>
+        <code>(GPU VA, length, device)</code>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step v">
+        <span class="num">NIXL / UCX</span>
+        <code>ucp_mem_map</code>
+      </div>
+      <div class="flow-arrow">&rarr;</div>
+      <div class="flow-step g">
+        <span class="num">TWO OUTPUTS</span>
+        <code>memh</code>
+        <span class="lo" style="display:block;color:var(--muted)">local, used to post I/O</span>
+        <code style="margin-top:5px">packed rkey</code>
+        <span class="lo" style="display:block;color:var(--muted)">exported in agent metadata</span>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      Registration is expensive and tied to allocation lifetime, so vLLM does
+      it eagerly for the entire KV arena, not once per request. The
+      <code>memh</code> stays local; only public connection information and
+      packed keys leave the process.
+    </div>
+  </div>
+
+  <p>
+    This is also why the lease is non-negotiable: an rkey does not make stale
+    memory safe. P must keep the same allocation registered, and must not
+    recycle a source block, until D's READ is complete. Deregistration maps to
+    <code>ucp_mem_unmap</code> during connector teardown, not request
+    completion.
+  </p>
+
+  <h3>6.3 Primitive 2 &mdash; exchange endpoint addresses and remote keys</h3>
+
+  <p>
+    <code>get_agent_metadata()</code> serializes the NIXL agent's public state.
+    For UCX this includes its worker address plus public metadata for registered
+    regions (including packed rkeys). vLLM nests that opaque blob beside its KV
+    layout metadata and sends it over the ZMQ bootstrap described in
+    <a href="#handshake">section&nbsp;3</a>.
+  </p>
+
+<pre><code><span class="c"># D, after receiving P's ZMQ reply</span>
+remote_agent = nixl.add_remote_agent(p_agent_metadata)
+remote_dlist = nixl.prep_xfer_dlist(remote_agent, p_block_descriptors)
+
+<span class="c"># UCX work hidden by loadRemoteMD()</span>
+ucp_ep_create(d_worker, p_worker_address, &amp;endpoint)
+ucp_ep_rkey_unpack(endpoint, p_packed_rkey, &amp;remote_rkey)</code></pre>
+
+  <p>
+    The endpoint is UCX's connection object. On an RDMA lane, UCX creates and
+    connects the necessary queue pairs under it; vLLM never creates a QP or
+    chooses RC versus DC directly. The packed key is endpoint-specific when
+    unpacked, so NIXL caches the resulting remote metadata together with that
+    connection. The remote transfer descriptor is now effectively:
+  </p>
+
+<pre><code>remote KV slice = (
+    P virtual address + block offset,
+    byte length,
+    P endpoint,
+    unpacked P rkey,
+)</code></pre>
+
+  <p>
+    Notice the division of labor: ZMQ transports the <em>capabilities</em>
+    needed to establish the data plane; it never transports KV bytes. After
+    this first-contact exchange, subsequent requests reuse the endpoint,
+    unpacked keys, and prepared descriptor lists.
+  </p>
+
+  <h3>6.4 Primitive 3 &mdash; turn block IDs into local/remote scatter-gather pairs</h3>
+
+  <p>
+    At registration time, vLLM constructs a prepared descriptor array for the
+    whole arena. A descriptor is just <code>(address, length, device)</code>.
+    At request time, block IDs become indices into those arrays:
+  </p>
+
+<pre><code>remote_desc_id = remote_region * P.num_blocks + P.block_id
+local_desc_id  = local_region  * D.num_blocks + D.block_id
+
+handle = nixl.make_prepped_xfer(
+    <span class="s">"READ"</span>,
+    d_local_dlist, local_desc_ids,
+    p_remote_dlist, remote_desc_ids,
+    notif_msg=f<span class="s">"{remote_request_id}:{D.tp_size}"</span>.encode(),
+)
+nixl.transfer(handle)</code></pre>
+
+  <p>
+    NIXL validates that the selected local and remote lists have the same
+    number of entries and matching lengths. Entry <em>i</em> on P is copied to
+    entry <em>i</em> on D. This is the scatter-gather layer: a request whose KV
+    blocks are physically fragmented still becomes one logical transfer
+    handle. The current call site is
+    <span class="fileref">nixl/pull_worker.py:310-342</span>.
+  </p>
+
+  <h3>6.5 Primitive 4 &mdash; post one-sided GETs</h3>
+
+  <p>
+    The NIXL UCX backend walks the paired descriptors. For a
+    <code>NIXL_READ</code>, each pair becomes:
+  </p>
+
+<pre><code>ucp_get_nbx(
+    endpoint_to_P,
+    d_local_addr,       <span class="c">// destination in D's HBM</span>
+    bytes,
+    p_remote_addr,      <span class="c">// source virtual address in P's HBM</span>
+    p_remote_rkey,      <span class="c">// permission created by P's registration</span>
+    { .memh = d_local_memh },
+)</code></pre>
+
+  <div class="diagram">
+    <div class="diagram-title">What the RDMA fast path does for one descriptor pair</div>
+    <svg class="diagram-svg" viewBox="0 0 860 318" role="img"
+         aria-label="RDMA READ from prefill GPU memory into decode GPU memory">
+      <defs>
+        <marker id="rdma-arrow-blue" markerWidth="11" markerHeight="11"
+                refX="8.5" refY="3.5" orient="auto"
+                markerUnits="userSpaceOnUse">
+          <path d="M0,0 L9,3.5 L0,7 Z" fill="var(--blue)"/>
+        </marker>
+        <marker id="rdma-arrow-violet" markerWidth="9" markerHeight="9"
+                refX="7.5" refY="3" orient="auto"
+                markerUnits="userSpaceOnUse">
+          <path d="M0,0 L8,3 L0,6 Z" fill="var(--violet)"/>
+        </marker>
+        <marker id="rdma-arrow-green" markerWidth="9" markerHeight="9"
+                refX="7.5" refY="3" orient="auto"
+                markerUnits="userSpaceOnUse">
+          <path d="M0,0 L8,3 L0,6 Z" fill="var(--green)"/>
+        </marker>
+      </defs>
+
+      <rect x="24" y="24" width="356" height="250" rx="10"
+            fill="var(--blue-soft)" stroke="#a6c8df"/>
+      <rect x="480" y="24" width="356" height="250" rx="10"
+            fill="var(--violet-soft)" stroke="#c9b8dc"/>
+      <text x="202" y="49" text-anchor="middle" font-size="13"
+            font-weight="700" fill="var(--blue)">D · initiator / requester</text>
+      <text x="658" y="49" text-anchor="middle" font-size="13"
+            font-weight="700" fill="var(--violet)">P · passive data source</text>
+
+      <rect x="56" y="74" width="126" height="56" rx="6"
+            fill="var(--panel)" stroke="var(--border)"/>
+      <text x="119" y="96" text-anchor="middle" font-size="11"
+            fill="var(--fg)">CPU / UCX worker</text>
+      <text x="119" y="114" text-anchor="middle" font-size="10"
+            fill="var(--muted)">posts GET; polls CQ</text>
+
+      <rect x="222" y="74" width="126" height="56" rx="6"
+            fill="var(--panel)" stroke="var(--border)"/>
+      <text x="285" y="96" text-anchor="middle" font-size="11"
+            fill="var(--fg)">D NIC</text>
+      <text x="285" y="114" text-anchor="middle" font-size="10"
+            fill="var(--muted)">owns QP / WQE</text>
+
+      <rect x="512" y="74" width="126" height="56" rx="6"
+            fill="var(--panel)" stroke="var(--border)"/>
+      <text x="575" y="96" text-anchor="middle" font-size="11"
+            fill="var(--fg)">P NIC</text>
+      <text x="575" y="114" text-anchor="middle" font-size="10"
+            fill="var(--muted)">checks rkey</text>
+
+      <rect x="678" y="74" width="126" height="56" rx="6"
+            fill="var(--panel)" stroke="var(--border)"/>
+      <text x="741" y="96" text-anchor="middle" font-size="11"
+            fill="var(--fg)">P CPU</text>
+      <text x="741" y="114" text-anchor="middle" font-size="10"
+            fill="var(--muted)">not on payload path</text>
+
+      <rect x="118" y="194" width="176" height="54" rx="6"
+            fill="var(--panel)" stroke="var(--blue)" stroke-width="1.5"/>
+      <text x="206" y="215" text-anchor="middle" font-size="11"
+            fill="var(--blue)">D HBM · local destination</text>
+      <text x="206" y="233" text-anchor="middle" font-size="10"
+            fill="var(--muted)">local VA + memh</text>
+
+      <rect x="566" y="194" width="176" height="54" rx="6"
+            fill="var(--panel)" stroke="var(--violet)" stroke-width="1.5"/>
+      <text x="654" y="215" text-anchor="middle" font-size="11"
+            fill="var(--violet)">P HBM · remote source</text>
+      <text x="654" y="233" text-anchor="middle" font-size="10"
+            fill="var(--muted)">remote VA + rkey</text>
+
+      <line x1="182" y1="102" x2="216" y2="102"
+            stroke="var(--violet)" stroke-width="1.7"
+            marker-end="url(#rdma-arrow-violet)"/>
+      <text x="199" y="89" text-anchor="middle" font-size="9"
+            fill="var(--violet)">doorbell</text>
+
+      <path d="M575 132 C575 157, 620 158, 638 188"
+            fill="none" stroke="var(--violet)" stroke-width="1.5"
+            marker-end="url(#rdma-arrow-violet)"/>
+      <text x="616" y="158" font-size="9" fill="var(--violet)">DMA read</text>
+
+      <path d="M566 221 C470 221, 390 221, 300 221"
+            fill="none" stroke="var(--blue)" stroke-width="3"
+            marker-end="url(#rdma-arrow-blue)"/>
+      <text x="432" y="211" text-anchor="middle" font-size="11"
+            font-weight="650" fill="var(--blue)">KV bytes · P → D</text>
+
+      <path d="M285 136 C285 158, 254 164, 235 188"
+            fill="none" stroke="var(--blue)" stroke-width="1.5"
+            marker-end="url(#rdma-arrow-blue)"/>
+      <text x="286" y="169" text-anchor="start" font-size="9"
+            fill="var(--blue)">DMA write</text>
+
+      <line x1="216" y1="122" x2="188" y2="122"
+            stroke="var(--green)" stroke-width="1.5"
+            marker-end="url(#rdma-arrow-green)"/>
+      <text x="202" y="137" text-anchor="middle" font-size="9"
+            fill="var(--green)">CQE</text>
+    </svg>
+    <div class="diagram-caption">
+      The READ is initiated at D. P's NIC services it using the address and
+      rkey; P's CPU does not copy, serialize, or receive the KV payload.
+      &ldquo;Zero copy&rdquo; means no application staging copy&mdash;the NIC
+      still performs DMA from P HBM and into D HBM.
+    </div>
+  </div>
+
+  <p>
+    In verbs terms, D's NIC consumes a send-queue work request equivalent to
+    <code>IBV_WR_RDMA_READ</code>. The request carries P's virtual address and
+    rkey; the local scatter/gather entry names D's registered destination.
+    UCX deliberately hides those verbs. It may use multiple rails, DevX, a
+    different transport, or an inline completion, so there is no
+    <code>ibv_post_send</code> call in vLLM or in NIXL's UCX-facing code.
+  </p>
+
+  <h3>6.6 Primitive 5 &mdash; progress, completion, and endpoint flush</h3>
+
+  <p>
+    <code>transfer(handle)</code> is a post, not a wait. UCX returns either an
+    in-progress request pointer or immediate success. NIXL retains the pending
+    UCX requests and adds an endpoint flush after posting the descriptor batch:
+  </p>
+
+<pre><code>for each descriptor pair:
+    req = ucp_get_nbx(...)
+
+flush_req = ucp_ep_flush_nbx(endpoint)
+
+<span class="c"># reached through vLLM's check_xfer_state(handle)</span>
+ucp_worker_progress(worker)
+status = ucp_request_check_status(req)
+status = ucp_request_check_status(flush_req)</code></pre>
+
+  <p>
+    Conceptually, the NIC produces completion queue entries and UCX's progress
+    engine consumes them. vLLM does not poll a CQ itself; its
+    <code>check_xfer_state</code> call enters NIXL, which calls UCX progress and
+    checks the retained requests. NIXL reports <code>"DONE"</code> only after
+    the batch and flush are complete, so D can safely let the model consume the
+    destination KV blocks. The connector polls those handles in
+    <span class="fileref">nixl/base_worker.py:2092-2135</span>.
+  </p>
+
+  <div class="callout">
+    <strong>Why a flush if READ completions already exist?</strong>
+    <p>
+      NIXL batches requests and retains only the relevant UCX request state.
+      Its endpoint flush is the fence that keeps the aggregate handle alive
+      until all operations issued on each distinct connection are complete.
+      This is an implementation detail of the UCX backend, but an important one:
+      vLLM's single <code>"DONE"</code> covers the whole scatter-gather request,
+      not merely the last Python call returning.
+    </p>
+  </div>
+
+  <h3>6.7 Primitive 6 &mdash; completion notification is an Active Message</h3>
+
+  <p>
+    The piggy-backed <code>notif_msg</code> is ordered <em>after</em> the data
+    transfer and flush. In the UCX backend it is sent with
+    <code>ucp_am_send_nbx(..., UCP_AM_SEND_FLAG_EAGER)</code>. That is a small
+    two-sided control message, not an RDMA write-with-immediate and not part of
+    the KV payload:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Signal</th><th>Primitive</th><th>Consumer</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>D-side data completion</td>
+        <td>UCX request status + endpoint flush</td>
+        <td>D polls <code>check_xfer_state</code></td>
+        <td>The destination KV is safe to read.</td>
+      </tr>
+      <tr>
+        <td>P-side lifetime completion</td>
+        <td>UCX Active Message carrying
+          <code>"request_id:D_tp_size"</code></td>
+        <td>P polls <code>get_new_notifs</code></td>
+        <td>One D consumer finished; free after all expected consumers report.</td>
+      </tr>
+      <tr>
+        <td>Lease extension</td>
+        <td>Standalone NIXL notification / UCX Active Message</td>
+        <td>P handles <code>"HB:..."</code></td>
+        <td>Do not recycle these source blocks yet.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    That distinction answers a common puzzle: the KV movement is
+    <strong>one-sided</strong>, because P's CPU is absent from the payload data
+    path. The protocol as a whole is not &ldquo;no remote participation&rdquo;:
+    P registers memory, exports keys, keeps the allocation alive, progresses
+    its UCX worker, and consumes the small completion notification.
+  </p>
+
+  <h3>6.8 Full primitive timeline</h3>
+
+  <ol class="steps">
+    <li>
+      <strong>P and D register their KV arenas.</strong>
+      <code>ucp_mem_map</code> creates local memory handles; UCX packs public
+      remote keys. This happens once per allocation, not per request.
+    </li>
+    <li>
+      <strong>D imports P's capability metadata.</strong> ZMQ carries P's
+      worker address and packed keys; UCX creates an endpoint and unpacks each
+      rkey. This happens lazily on first contact with a P engine.
+    </li>
+    <li>
+      <strong>vLLM pairs block descriptors.</strong> Local D block IDs and
+      remote P block IDs select equal-length address ranges from prepared
+      descriptor lists.
+    </li>
+    <li>
+      <strong>D posts the READ.</strong> NIXL's UCX plugin calls
+      <code>ucp_get_nbx</code> for the descriptor pairs. On the RDMA path, UCX
+      rings D's NIC doorbell with READ WQEs carrying P's VA and rkey.
+    </li>
+    <li>
+      <strong>The NICs move KV P&rarr;D.</strong> P's NIC reads registered P
+      HBM; D's NIC DMAs the response into registered D HBM. P's CPU is not on
+      this payload path.
+    </li>
+    <li>
+      <strong>D observes aggregate completion.</strong> UCX progresses its
+      worker/CQs; NIXL waits for request state plus endpoint flush, then returns
+      <code>"DONE"</code> to vLLM.
+    </li>
+    <li>
+      <strong>P receives the ordered control notification.</strong> A UCX
+      Active Message tells P that this D consumer finished, allowing the lease
+      to be released when the expected notification count is reached.
+    </li>
+  </ol>
+
   <div class="callout warn">
     <strong>Hetero-TP means multiple READs per request</strong>
     <p>
@@ -1730,6 +2206,33 @@ for spec in read_specs:
       <code>(D_rank &rarr; P_rank)</code> pair. See
       <a href="PARALLELISM.html">PARALLELISM.html</a> for the
       head-dimension math.
+    </p>
+  </div>
+
+  <div class="callout good">
+    <strong>The shortest accurate mental model</strong>
+    <p>
+      NIXL turns vLLM's block table into reusable registered-memory
+      descriptors. The first request imports P's endpoint and rkeys; every
+      later request is mostly index selection plus asynchronous
+      <code>ucp_get_nbx</code>. RDMA is the UCX data-plane realization of that
+      GET, while ZMQ bootstrap, Active Message completion, and the lease keep
+      the one-sided copy safe.
+    </p>
+  </div>
+
+  <div class="callout code-ref">
+    <strong>Source trail (the version vLLM pins)</strong>
+    <p>
+      The Python-to-NIXL calls are in
+      <a href="https://github.com/ai-dynamo/nixl/blob/v1.3.1/src/api/python/_api.py">NIXL
+      1.3.1 <code>_api.py</code></a>. Registration, endpoint/rkey import,
+      posting, flush, and Active Message notification are in
+      <a href="https://github.com/ai-dynamo/nixl/blob/v1.3.1/src/plugins/ucx/ucx_backend.cpp"><code>ucx_backend.cpp</code></a>;
+      the exact <code>ucp_mem_map</code>, <code>ucp_rkey_pack</code>,
+      <code>ucp_get_nbx</code>, <code>ucp_ep_flush_nbx</code>, and progress
+      calls are in
+      <a href="https://github.com/ai-dynamo/nixl/blob/v1.3.1/src/plugins/ucx/ucx_utils.cpp"><code>ucx_utils.cpp</code></a>.
     </p>
   </div>
 
@@ -1957,6 +2460,30 @@ if self.consumer_notification_counts_by_req[req_id] == consumers_per_producer:
         <td>Per-layer or all-at-once?</td>
         <td>All-at-once. Per-layer hooks are no-ops</td>
         <td><span class="fileref">nixl/connector.py:255-267</span></td>
+      </tr>
+      <tr>
+        <td>Which RDMA operation moves pull-mode KV?</td>
+        <td>NIXL <code>READ</code> &rarr; UCX <code>ucp_get_nbx</code> &rarr;
+          an RDMA READ work request on an RDMA-capable UCX lane</td>
+        <td><span class="fileref">NIXL 1.3.1 ucx_utils.cpp</span></td>
+      </tr>
+      <tr>
+        <td>What does P export?</td>
+        <td>UCX worker connection data and packed rkeys for registered KV
+          regions, inside opaque NIXL agent metadata</td>
+        <td><span class="fileref">NIXL 1.3.1 ucx_backend.cpp</span></td>
+      </tr>
+      <tr>
+        <td>Is P's CPU on the KV payload path?</td>
+        <td>No. It participates in registration/bootstrap/lifetime control;
+          the NIC services the one-sided payload READ</td>
+        <td><a href="#xfer">section 6</a></td>
+      </tr>
+      <tr>
+        <td>Is the completion notif an RDMA immediate?</td>
+        <td>No. With UCX it is an eager Active Message sent after transfer
+          completion and endpoint flush</td>
+        <td><span class="fileref">NIXL 1.3.1 ucx_backend.cpp</span></td>
       </tr>
       <tr>
         <td>How does D know completion?</td>

@@ -34,7 +34,10 @@
       <code>align</code> cache mode; selectivity blocks fast-forward
       replay; the sequential recurrence blocks DCP/PCP. Each row of the
       summary table below is a place the cache infrastructure grew a
-      Mamba-specific affordance.
+      Mamba-specific affordance. In <code>align</code> mode the request
+      block table is also sparse and mutable, so asynchronous external
+      persistence must receive and pin the exact boundary-state block
+      rather than reconstructing it from an append-only positional mirror.
     </p>
   </section>
 
@@ -46,12 +49,14 @@
       <li><a href="#two-kernels">3. Two kernels: scan vs recurrence</a></li>
       <li><a href="#chunk-vs-block">4. <code>chunk_size</code> isn't <code>block_size</code></a></li>
       <li><a href="#align">5. Why <code>align</code> mode exists</a></li>
-      <li><a href="#spec">6. <code>num_speculative_blocks</code></a></li>
-      <li><a href="#dcp">7. DCP and PCP are not supported</a></li>
-      <li><a href="#hybrid">8. Hybrid layouts (Jamba, Granite)</a></li>
-      <li><a href="#blocksize-meaning">9. What "block size" even means for Mamba</a></li>
-      <li><a href="#table">10. Summary table</a></li>
-      <li><a href="#lesson">11. The general lesson</a></li>
+      <li><a href="#allocate-cases">6. <code>allocate_new_blocks()</code>, case by case</a></li>
+      <li><a href="#mooncake">7. Mooncake: exact boundary-state persistence</a></li>
+      <li><a href="#spec">8. <code>num_speculative_blocks</code></a></li>
+      <li><a href="#dcp">9. DCP and PCP are not supported</a></li>
+      <li><a href="#hybrid">10. Hybrid layouts (Jamba, Granite)</a></li>
+      <li><a href="#blocksize-meaning">11. What "block size" even means for Mamba</a></li>
+      <li><a href="#table">12. Summary table</a></li>
+      <li><a href="#lesson">13. The general lesson</a></li>
     </ol>
   </nav>
 
@@ -448,7 +453,515 @@ if (
     crosses a block boundary.
   </p>
 
-  <h2 id="spec">6. <code>num_speculative_blocks</code>: rollback budget for spec decode</h2>
+  <h2 id="allocate-cases">6. <code>allocate_new_blocks()</code>, case by case</h2>
+
+  <p>
+    <code>MambaManager.allocate_new_blocks()</code> is where the sparse,
+    mutable nature of an <code>align</code>-mode block table becomes
+    concrete. The function does not merely allocate memory. It maintains
+    a logical table aligned with token blocks, recycles speculative state
+    blocks, preserves partial-prefix states with copy-on-write, and returns
+    an <em>append delta</em> that can differ from the core's final table.
+  </p>
+
+  <div class="callout info">
+    <strong>Notation used below</strong>
+    <code>B = 4</code> tokens per logical Mamba block,
+    <code>&empty;</code> is the shared null block, uppercase letters are
+    physical GPU blocks, <code>S</code> is
+    <code>num_speculative_blocks</code>, and <code>T</code> is the total
+    number of main-model tokens requiring slots &mdash; not the increment
+    added in this scheduler step.
+  </div>
+
+  <h3>The two equations</h3>
+
+<pre><code>num_required_blocks = cdiv(T, B) + S
+num_skipped_blocks  = num_required_blocks - S - 1
+                    = cdiv(T, B) - 1</code></pre>
+
+  <p>
+    <code>num_skipped_blocks</code> is best read as
+    <strong>the number of historical logical positions before the current
+    running-state position</strong>. It is not the number of physical
+    blocks freed in this call. The table needs those positions so its
+    indices remain aligned with token boundaries, but Mamba's latest state
+    already summarizes their history, so most can be represented by
+    <code>&empty;</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title"><code>T = 10</code>, <code>B = 4</code>, <code>S = 2</code>: what "skipped" means</div>
+    <div class="diagram-row">
+      <span class="cell label">index</span>
+      <div class="cell-row tight">
+        <div class="cell xs">0</div><div class="cell xs">1</div><div class="cell xs">2</div><div class="cell xs">3</div><div class="cell xs">4</div>
+      </div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">role</span>
+      <div class="cell-row tight">
+        <div class="cell xs evicted">old</div><div class="cell xs evicted">old</div><div class="cell xs mamba-grp">current</div><div class="cell xs free">spec 1</div><div class="cell xs free">spec 2</div>
+      </div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">ideal</span>
+      <div class="cell-row tight">
+        <div class="cell xs null">&empty;</div><div class="cell xs null">&empty;</div><div class="cell xs mamba-grp">A</div><div class="cell xs free">P</div><div class="cell xs free">Q</div>
+      </div>
+    </div>
+    <div class="diagram-caption">
+      <code>cdiv(10, 4) = 3</code>, so there are two historical positions
+      before logical position 2. Speculation only adds scratch blocks after
+      the current state; it does not change the skipped-prefix boundary.
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>A skipped position is not necessarily null yet</strong>
+    A previous non-null state can remain inside the historical prefix for
+    one more forward because the current step still needs it as a copy/input
+    source. A later <code>remove_skipped_blocks()</code> call frees it and
+    replaces its table entry with <code>&empty;</code>.
+  </div>
+
+  <h3>Branch map</h3>
+
+  <table>
+    <thead>
+      <tr><th>Case</th><th>Condition</th><th>Result</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Non-align</td><td><code>mamba_cache_mode != "align"</code></td><td>Add capacity for <code>S</code> blocks and delegate to the ordinary append-only allocator.</td></tr>
+      <tr><td>No-op</td><td>Table is long enough and there is no partial hit</td><td>Return an empty delta; do not shrink over-allocation.</td></tr>
+      <tr><td>First prefill</td><td>Request is not in <code>_allocated_block_reqs</code></td><td>Pad history with nulls; allocate one running block plus <code>S</code> scratch blocks.</td></tr>
+      <tr><td>Aligned prefix hit</td><td>New request begins from a full Mamba boundary</td><td>Keep the hit as previous state and append a running block.</td></tr>
+      <tr><td>Continuation</td><td>Allocated request needs another logical position</td><td>Retain the old state for the hand-off and append a new running block.</td></tr>
+      <tr><td>Spec reuse</td><td>Scratch indices remain in the active suffix</td><td>Reuse them in place; usually allocate one new tail scratch block.</td></tr>
+      <tr><td>Spec relocation</td><td>Scratch index is below <code>num_skipped_blocks</code></td><td>Append it to the active suffix and null the old position.</td></tr>
+      <tr><td>New-request partial hit</td><td>Hash boundary falls inside a Mamba block</td><td>CoW the shared hit into a private in-table block.</td></tr>
+      <tr><td>Running-owner partial tail</td><td>Current request owns a sub-block cached boundary</td><td>Keep the live source in-table; move the durable snapshot to an off-table CoW block.</td></tr>
+      <tr><td>Partial hit plus growth</td><td>CoW and a new position are both needed</td><td>Allocate the CoW block first, then append the ordinary blocks.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Case A: non-align mode</h3>
+
+  <p>
+    Non-align Mamba uses the ordinary allocator. With <code>B = 4</code>,
+    <code>T = 9</code>, and <code>S = 2</code>, it asks the base manager for
+    <code>9 + 4 &times; 2 = 17</code> tokens of capacity:
+  </p>
+
+<pre><code>cdiv(17, 4) = 5 blocks
+= 3 main-sequence blocks + 2 speculative blocks</code></pre>
+
+  <h3>No-op: the table is already long enough</h3>
+
+  <p>
+    With <code>B = 4</code>, <code>T = 5</code>, and <code>S = 2</code>, the
+    required length is four. If the table already has four entries and no
+    partial hit needs CoW, the function returns <code>[]</code> without
+    shrinking it:
+  </p>
+
+<pre><code>required:  cdiv(5, 4) + 2 = 4
+before:    [&empty;, A, P, Q]
+after:     [&empty;, A, P, Q]
+returned:  []</code></pre>
+
+  <h3>Case B: first <code>align</code> prefill, no hit</h3>
+
+  <p>
+    With <code>T = 10</code> and <code>S = 0</code>, the table needs three
+    logical positions and the first two are historical. The function pads
+    them and allocates only one physical state block:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">First prefill: null padding is part of the returned append delta</div>
+    <div class="diagram-row">
+      <span class="cell label">start</span>
+      <div class="cell-row tight"><div class="cell sm free">empty table</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">pad history</span>
+      <div class="cell-row tight"><div class="cell xs null">&empty;</div><div class="cell xs null">&empty;</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">allocate</span>
+      <div class="cell-row tight"><div class="cell xs null">&empty;</div><div class="cell xs null">&empty;</div><div class="cell xs mamba-grp">A</div></div>
+    </div>
+    <div class="diagram-caption">
+      Core table and returned delta are both <code>[&empty;, &empty;, A]</code>.
+      The return value describes newly appended <em>table entries</em>, not
+      only newly allocated physical blocks. With <code>S = 2</code>, the
+      result is <code>[&empty;, &empty;, A, P, Q]</code>.
+    </div>
+  </div>
+
+  <h3>Case C: aligned prefix hit</h3>
+
+  <p>
+    A new request that hits a cached state at token 8 starts with
+    <code>[&empty;, H8]</code>. Scheduling through token 12 requires one
+    additional position:
+  </p>
+
+<pre><code>before:   [&empty;, H8]
+after:    [&empty;, H8, A]
+returned: [A]</code></pre>
+
+  <p>
+    The hit remains as the previous-state input, while <code>A</code>
+    receives the next recurrent state.
+  </p>
+
+  <h3>Case D: an existing request continues</h3>
+
+  <p>
+    Suppose token 6's state lives in <code>A</code> and the request continues
+    through token 10:
+  </p>
+
+<pre><code>before:   [&empty;, A]
+after:    [&empty;, A, B]
+returned: [B]
+
+before later cleanup: [&empty;, A, B]
+after later cleanup:  [&empty;, &empty;, B]</code></pre>
+
+  <p>
+    <code>A</code> remains alive for the current state hand-off. A later
+    <code>remove_skipped_blocks()</code> retires it once it is no longer a
+    forward input.
+  </p>
+
+  <div class="callout bad">
+    <strong>This is an in-place mutation</strong>
+    The core changes an existing position from <code>A</code> to
+    <code>&empty;</code>. An append-only consumer of the table does not learn
+    that mutation merely by receiving the next append delta.
+  </div>
+
+  <h3>Case E: speculative reuse and relocation</h3>
+
+  <p>
+    With <code>S = 2</code>, a request at token 4 may have
+    <code>[A, P, Q]</code>. A small advance to token 8 leaves the scratch
+    blocks inside the active suffix:
+  </p>
+
+<pre><code>before:   [A, P, Q]
+after:    [A, P, Q, R]
+returned: [R]
+
+roles after the step:
+            P = current; Q, R = speculative scratch</code></pre>
+
+  <p>
+    A larger jump to token 16 moves the active suffix past indices 1 and 2,
+    so the same physical scratch blocks are relocated:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Large jump: old speculative positions become historical</div>
+    <div class="diagram-row">
+      <span class="cell label">before</span>
+      <div class="cell-row tight"><div class="cell xs mamba-grp">A</div><div class="cell xs free">P</div><div class="cell xs free">Q</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">move P</span>
+      <div class="cell-row tight"><div class="cell xs mamba-grp">A</div><div class="cell xs null">&empty;</div><div class="cell xs free">Q</div><div class="cell xs free">P</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">move Q</span>
+      <div class="cell-row tight"><div class="cell xs mamba-grp">A</div><div class="cell xs null">&empty;</div><div class="cell xs null">&empty;</div><div class="cell xs free">P</div><div class="cell xs free">Q</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">allocate R</span>
+      <div class="cell-row tight"><div class="cell xs mamba-grp">A</div><div class="cell xs null">&empty;</div><div class="cell xs null">&empty;</div><div class="cell xs mamba-grp">P</div><div class="cell xs free">Q</div><div class="cell xs free">R</div></div>
+    </div>
+    <div class="diagram-caption">
+      Final core table: <code>[A, &empty;, &empty;, P, Q, R]</code>.
+      Returned delta: <code>[P, Q, R]</code>. <code>P</code> and
+      <code>Q</code> are returned even though they were reused rather than
+      physically allocated.
+    </div>
+  </div>
+
+  <p>
+    PR <a href="https://github.com/vllm-project/vllm/pull/51358">#51358</a>
+    routes this move through <code>_relocate_speculative_block()</code> and
+    requires the block to be non-null, exclusively owned
+    (<code>ref_cnt == 1</code>), and unhashed. A connector-pinned, shared,
+    or cached state must not be silently repurposed as scratch.
+  </p>
+
+  <h3>Case F: partial-prefix CoW</h3>
+
+  <p>
+    Let the hash unit be 2 tokens while the Mamba block size is 4. A hit at
+    token 6 is hash-aligned but falls inside a Mamba logical block. The
+    cached state must be copied before the request writes tokens 7&ndash;8.
+  </p>
+
+  <div class="compare">
+    <div class="side left">
+      <h4 style="margin-top:0">New request consuming <code>H6</code></h4>
+<pre><code>before: [&empty;, H6]
+copy:   H6 &rarr; C
+after:  [&empty;, C]
+return: [C]</code></pre>
+      <p style="font-size:0.85em">
+        <code>_apply_cow()</code> replaces the shared hit in this new
+        request's table with private block <code>C</code>. Computation then
+        extends <code>C</code> through token 8.
+      </p>
+    </div>
+    <div class="vs">vs</div>
+    <div class="side right">
+      <h4 style="margin-top:0">Running request that produced <code>H6</code></h4>
+<pre><code>table before: [&empty;, A]
+move hash:    A &rarr; Y
+copy bytes:   A &rarr; Y
+table after:  [&empty;, A]
+Mamba delta:  []</code></pre>
+      <p style="font-size:0.85em">
+        <code>A</code> stays live in the request table and is overwritten by
+        token 7. <code>Y</code> is an off-table durable snapshot of state
+        <code>H6</code>.
+      </p>
+    </div>
+  </div>
+
+  <p>
+    If table growth is also required, the allocator requests
+    <code>[cow_block, ordinary_block, ...]</code>. The first block is consumed
+    by CoW; only the remainder is appended normally.
+  </p>
+
+  <h3>Keep three structures separate</h3>
+
+  <table>
+    <thead>
+      <tr><th>Structure</th><th>Meaning</th><th>Can contain</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>req_blocks</code></td><td>Core's complete mutable table</td><td>Nulls, retained old state, current state, scratch</td></tr>
+      <tr><td><code>returned_blocks</code></td><td>Entries newly appended for worker bookkeeping</td><td>Null padding, relocated old blocks, fresh blocks</td></tr>
+      <tr><td>Pending CoW blocks</td><td>Copy destinations retained until the copy executes</td><td>Private in-table hit blocks or off-table boundary snapshots</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <strong>The decisive mental model</strong>
+    <code>allocate_new_blocks()</code> returns a block-table delta, not a list
+    of physical allocations. That is sufficient for execution's append-only
+    bookkeeping, but not for reconstructing the historical physical source
+    of every Mamba prefix state.
+  </div>
+
+  <h2 id="mooncake">7. Mooncake: exact boundary-state persistence</h2>
+
+  <p>
+    Mooncake Store asynchronously persists cache blocks under chained prefix
+    hashes. Before
+    <a href="https://github.com/vllm-project/vllm/pull/51358">PR #51358</a>,
+    its normal save path selected each group's source block by position from
+    connector-side request bookkeeping. That is valid for append-only
+    attention tables and unsafe for mutable Mamba <code>align</code> tables.
+  </p>
+
+  <h3>What the "Mooncake mirror" actually is</h3>
+
+  <p>
+    The informal "mirror" is
+    <code>RequestTracker.allocated_block_ids</code>. A new request seeds it
+    from a copy of the complete block table. Later scheduler ticks provide
+    only <code>new_block_ids</code>, and the tracker performs:
+  </p>
+
+<pre><code>for existing, new in zip(allocated_block_ids, new_block_ids):
+    existing.extend(new)</code></pre>
+
+  <p>
+    It has no ordinary update such as
+    <code>existing[position] = NULL_BLOCK_ID</code>. Consequently, an in-place
+    mutation in the core is invisible:
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">Core mutation versus append-only connector bookkeeping</div>
+    <div class="diagram-row">
+      <span class="cell label">initial core</span>
+      <div class="cell-row tight"><div class="cell xs mamba-grp">17</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">initial mirror</span>
+      <div class="cell-row tight"><div class="cell xs mamba-grp">17</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:12px;border-top:1px dashed var(--border);padding-top:10px">
+      <span class="cell label">later core</span>
+      <div class="cell-row tight"><div class="cell xs null">&empty;</div><div class="cell xs mamba-grp">42</div></div>
+    </div>
+    <div class="diagram-row" style="margin-top:6px">
+      <span class="cell label">later mirror</span>
+      <div class="cell-row tight"><div class="cell xs" style="background:#fdeaea;border-color:#e0b3ae">17 stale</div><div class="cell xs mamba-grp">42</div></div>
+    </div>
+    <div class="diagram-caption">
+      Setting the core entry to <code>&empty;</code> does not write null bytes
+      into physical block 17. It releases block 17 to the pool. The allocator
+      may reassign it while Mooncake still resolves the old logical position
+      to physical ID 17.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong><code>new_block_ids</code> is per-group append data</strong>
+    A hybrid update might look like
+    <code>([101, 102], [NULL_BLOCK_ID, 77])</code>: two new attention
+    entries, plus Mamba null padding and an active state entry. It can contain
+    nulls and relocated blocks, but it does not describe replacements made at
+    positions the connector already knows.
+  </div>
+
+  <h3>How a correct key acquired the wrong value</h3>
+
+<pre><code>step N:
+  block 17 contains request A's state at boundary H4
+  Mooncake queues an asynchronous save
+
+step N+1:
+  core changes A's logical position to NULL
+  block 17 is freed, reassigned, and overwritten by request B
+
+later in the send thread:
+  Mooncake resolves A's old position to block 17
+  Mooncake stores B's bytes under A's valid prefix hash H4</code></pre>
+
+  <p>
+    The hash is correct because it was computed from A's tokens; the value is
+    wrong because the physical source was selected from stale positional
+    bookkeeping. A later external hit restores poisoned recurrent state and
+    can produce garbled or runaway output. Existence-based deduplication can
+    preserve the bad value by preventing a later correct save from replacing
+    it.
+  </p>
+
+  <h3>The fix: exact source plus explicit lifetime</h3>
+
+  <div class="flow">
+    <div class="flow-step"><strong>Core</strong><br><code>(req, group, block, boundary)</code></div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step"><strong>Scheduler</strong><br>handoff ID + <code>touch()</code></div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step"><strong>Worker</strong><br>save exact block</div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step"><strong>All ranks</strong><br>completion watermark</div>
+    <div class="flow-arrow">&rarr;</div>
+    <div class="flow-step"><strong>Scheduler</strong><br>release pin</div>
+  </div>
+
+  <p>
+    For each committed, retained Mamba boundary, the core now offers the exact
+    <code>(group_id, block_id, boundary_tokens)</code>. The scheduler assigns a
+    monotonic handoff ID and pins that physical block with
+    <code>BlockPool.touch()</code>. Mooncake uses the supplied block ID directly;
+    it never reconstructs a Mamba source positionally.
+  </p>
+
+  <div class="callout warn">
+    <strong>The two bugs were independent</strong>
+    Exact source selection fixes stale identity. Pinning fixes asynchronous
+    lifetime. Either fix alone is insufficient: the right block ID can still
+    be recycled before the worker reads it, and a long-lived wrong block is
+    still the wrong value.
+  </div>
+
+  <div class="callout info">
+    <strong>Logical mutation may continue</strong>
+    The core may immediately replace the request-table position with
+    <code>&empty;</code>. The connector-owned pin prevents the handed-off
+    physical block from being recycled until every worker rank is terminal.
+  </div>
+
+  <h3>Cross-rank completion watermark</h3>
+
+  <p>
+    Each rank reports the largest handoff ID for which every earlier handoff
+    it received is terminal. Aggregation takes the minimum across ranks:
+  </p>
+
+<pre><code>handoffs:                  10, 11
+rank 0 completed through: 11
+rank 1 still pending:     10  -&gt; watermark 9
+aggregate: min(11, 9) = 9 -&gt; release neither block
+
+rank 1 completes 10       -&gt; watermark 10
+aggregate becomes 10      -&gt; release handoff 10's pin</code></pre>
+
+  <p>
+    Terminal means the worker will no longer read the block: successful put,
+    dedup/no-put, pressure drop, cancellation, or store failure all qualify.
+    It does not mean persistence succeeded. While the first handoff is pending,
+    a rank reports watermark <code>0</code> rather than omitting metadata, so a
+    lagging rank cannot disappear from the minimum.
+  </p>
+
+  <h3>Only exact handoffs write Mamba state</h3>
+
+  <ul>
+    <li>Mooncake's normal positional <code>store_mask</code> is false for Mamba groups.</li>
+    <li>The normal path skips null or missing source IDs for every group.</li>
+    <li>Only non-null, hashed states selected by the core's retention policy are offered.</li>
+    <li>Block-aligned snapshots and sub-block CoW tails both use exact Mamba block IDs.</li>
+    <li>Consumer-only roles reject offers before claiming or pinning blocks.</li>
+    <li>The default cap of eight in-flight boundary handoffs bounds pinned GPU memory; excess saves are dropped as best-effort persistence.</li>
+  </ul>
+
+  <h3>Sub-block example: boundary 6 with a Mamba block size of 4</h3>
+
+  <p>
+    With a two-token hash unit, boundary 6 has a valid hash but lies inside a
+    four-token Mamba block. When the producer continues, CoW preserves state
+    6 in target block <code>Y</code> while the live source continues to token 7:
+  </p>
+
+<pre><code>H6 Mamba value:      exact off-table CoW block Y
+H6 attention value: attention block covering tokens 5-6
+
+joint hybrid hit at H6 requires both</code></pre>
+
+  <p>
+    Resumed prefills use the tracked prefill end rather than the request's
+    original prompt length, so replayed generated tokens receive matching
+    save coverage in every cache group.
+  </p>
+
+  <h3>Retention still decides which boundaries exist</h3>
+
+  <p>
+    Boundary handoffs are emitted after the core applies
+    <code>VLLM_PREFIX_CACHE_RETENTION_INTERVAL</code>. Only materialized,
+    hashed states are offered. With <code>B = 4</code> and an eight-token
+    interval, a 16-token request can look like:
+  </p>
+
+<pre><code>boundary 4:  null / unretained -&gt; no handoff
+boundary 8:  retained block   -&gt; exact handoff
+boundary 12: null / unretained -&gt; no handoff
+boundary 16: retained block   -&gt; exact handoff</code></pre>
+
+  <div class="callout good">
+    <strong>The durable rule</strong>
+    A prefix hash and a cache value are a pair. Supplying the right hash is
+    insufficient: the producer must identify the exact physical snapshot that
+    held the corresponding state and keep it alive until every asynchronous
+    reader is finished.
+  </div>
+
+  <h2 id="spec">8. <code>num_speculative_blocks</code>: rollback budget for spec decode</h2>
 
   <p>
     Speculative decoding generates <code>K</code> draft tokens, runs them
@@ -535,7 +1048,7 @@ num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)<
     </div>
   </div>
 
-  <h2 id="dcp">7. DCP and PCP are not supported</h2>
+  <h2 id="dcp">9. DCP and PCP are not supported</h2>
 
   <div class="callout code-ref">
     <strong>Code: hard asserts</strong>
@@ -570,7 +1083,7 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
     Sequence-dimension sharding is off the table.
   </div>
 
-  <h2 id="hybrid">8. Hybrid layouts (Jamba, Granite-Hybrid)</h2>
+  <h2 id="hybrid">10. Hybrid layouts (Jamba, Granite-Hybrid)</h2>
 
   <p>Jamba, Granite-Hybrid, and similar architectures interleave Mamba layers with attention layers in a fixed ratio. The design rationale matters for the cache:</p>
 
@@ -611,7 +1124,7 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
     prefix the other doesn't.
   </p>
 
-  <h2 id="blocksize-meaning">9. What "block size" even means for Mamba</h2>
+  <h2 id="blocksize-meaning">11. What "block size" even means for Mamba</h2>
 
   <p>
     For attention, "block of size 16" means: K/V for 16 consecutive token
@@ -698,7 +1211,7 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
         <div class="cell sm mamba-grp" style="min-width:80px"><strong>S<sub>cur</sub></strong></div>
         <div class="cell sm free" style="min-width:80px">(+spec)</div>
       </div>
-      <span style="font-size:0.82em;color:var(--muted)">2 + num_spec: keeps conv lookback across block boundaries.</span>
+      <span style="font-size:0.82em;color:var(--muted)">2 + num_spec live-state budget; retained boundary snapshots can participate in prefix caching.</span>
     </div>
     <div class="diagram-row" style="margin-top:6px">
       <span class="cell label">all</span>
@@ -712,7 +1225,7 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
       <span style="font-size:0.82em;color:var(--muted)"><code>cdiv(max_len, block_size)</code>: every block boundary checkpointed for prefix caching.</span>
     </div>
     <div class="diagram-caption">
-      <code>none</code> is cheapest but throws away history. <code>align</code> is what hybrid models use &mdash; conv-state alignment, spec budget, no prefix sharing. <code>all</code> opens up Mamba prefix caching at the cost of one block per <code>block_size</code> tokens of context.
+      <code>none</code> is cheapest but throws away reusable history. <code>align</code> is what hybrid models use &mdash; a sparse mutable request table plus retained boundary snapshots for prefix reuse. <code>all</code> keeps every boundary directly in the request table at the cost of one block per <code>block_size</code> tokens of context.
     </div>
   </div>
 
@@ -724,7 +1237,7 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
     to a larger block, just a checkpoint-frequency / memory tradeoff.
   </p>
 
-  <h2 id="table">10. Summary table: where Mamba diverges from attention</h2>
+  <h2 id="table">12. Summary table: where Mamba diverges from attention</h2>
 
   <table>
     <thead>
@@ -745,13 +1258,16 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
       <tr><td>Spec-decode rollback</td><td>Free, just don't advance</td><td>Reserve <code>num_speculative_blocks</code></td></tr>
       <tr><td>DCP/PCP support</td><td>Yes</td><td>No (sequential recurrence)</td></tr>
       <tr><td>Slot-mapping semantics</td><td><code>block * size + offset</code></td><td>Block holds one state snapshot; offset meaningless</td></tr>
+      <tr><td>Request block-table updates</td><td>Normally append-only</td><td><code>align</code> nulls and relocates positions in place</td></tr>
+      <tr><td>External persistence source</td><td>Can resolve positionally</td><td>Must use the exact core-selected boundary block</td></tr>
+      <tr><td>Async save lifetime</td><td>Request/table retention is usually sufficient</td><td>Exact boundary block must be pinned through cross-rank completion</td></tr>
       <tr><td>Allocator-imposed page padding</td><td>None</td><td><code>page_size_padded</code> to match attention</td></tr>
     </tbody>
   </table>
 
   <p>Each row is a place where the cache infrastructure had to grow a Mamba-specific affordance.</p>
 
-  <h2 id="lesson">11. The general lesson</h2>
+  <h2 id="lesson">13. The general lesson</h2>
 
   <p>The cache subsystem was originally designed for one shape of compute (softmax attention). Adding Mamba required:</p>
 
@@ -761,6 +1277,7 @@ assert pcp_world_size == 1, "PCP not support mamba now."</code></pre>
     <li>New scheduler bookkeeping (<code>last_state_block_idx</code>, <code>num_speculative_blocks</code>).</li>
     <li>A new metadata path in attention backends (<code>Mamba2AttentionMetadata</code>).</li>
     <li>A new alignment discipline (<code>alignment_tokens</code> / <code>mamba_cache_mode="align"</code>).</li>
+    <li>An exact boundary-state handoff for asynchronous persistence, because the <code>align</code> request table is not an authoritative historical map.</li>
     <li>Explicit guards excluding it from features that don't compose (<code>assert dcp_world_size == 1</code>).</li>
   </ul>
 

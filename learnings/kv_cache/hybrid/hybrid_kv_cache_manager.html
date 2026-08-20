@@ -124,6 +124,12 @@
   }
   .node strong { display: block; color: var(--blue); margin-bottom: 4px; }
   .small { color: var(--muted); font-size: 0.86em; }
+  .pipe .node .small {
+    display: block;
+    margin-top: 5px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 0.76em;
+  }
 
   .source-list {
     background: var(--panel);
@@ -162,6 +168,11 @@
       so it is a clean block boundary in every group simultaneously. Hybrid
       caching is real prefix sharing — the suffix-digest shortcut for SWA is
       unsound past depth 2 and the manager intentionally does not attempt it.
+      Sharing one pool across types also has a memory-safety cost:
+      <strong><code>needs_kv_cache_zeroing</code></strong> exists because a page
+      recycled from an fp32 SSM group into a bf16 full-attention/MLA group
+      decodes as <code>Inf</code>/<code>NaN</code>, and attention's
+      <code>P·V</code> matmul assumes <code>V</code> is finite. See §5.
     </p>
   </section>
 
@@ -172,6 +183,7 @@
       <li><a href="#coordinators">Three coordinator flavors</a></li>
       <li><a href="#groups">KV cache groups</a></li>
       <li><a href="#alignment">Block-size alignment (LCM &amp; GCD)</a></li>
+      <li><a href="#zeroing">Cross-type block reuse &amp; <code>needs_kv_cache_zeroing</code></a></li>
       <li><a href="#flcm-overview">find_longest_cache_hit overview</a></li>
       <li><a href="#flcm-algo">The fixed-point algorithm</a></li>
       <li><a href="#scans">Per-type scan directions</a></li>
@@ -241,7 +253,10 @@
     its own <code>req_to_blocks</code> mapping. They all draw from the same
     <code>BlockPool</code>, but the per-group block lists for the same request
     are independent — group <em>A</em>'s block 3 has nothing to do with group
-    <em>B</em>'s block 3.
+    <em>B</em>'s block 3. The flip side: a physical block freed by one group can
+    be handed to a group of a <em>different attention type</em>, carrying the
+    previous owner's bytes with it. That is what §5's
+    <code>needs_kv_cache_zeroing</code> is for.
   </div>
 
   <h2 id="coordinators">2. Three coordinator flavors</h2>
@@ -426,7 +441,308 @@ for manager in self.single_type_managers:
     works through the divisibility chain in detail.
   </p>
 
-  <h2 id="flcm-overview">5. find_longest_cache_hit overview</h2>
+  <h2 id="zeroing">5. Cross-type block reuse &amp; <code>needs_kv_cache_zeroing</code></h2>
+  <p>
+    Section 3's "one physical pool, many logical tables" has a sharp edge. Because
+    every group's page size is forced to be identical, a physical block is
+    <strong>fungible across attention types</strong>: a page that held fp32 SSM
+    state for a Mamba group one step ago can be freed and handed to a
+    full-attention or MLA group on the next step, byte-for-byte unchanged. That
+    is only safe if the new owner either writes every byte it later reads, or
+    tolerates arbitrary bit patterns in the bytes it doesn't. <strong>Full
+    attention does neither.</strong>
+  </p>
+
+  <p>
+    <code>KVCacheConfig.needs_kv_cache_zeroing</code> exists to close that hole.
+    It is a one-line property — and it is <code>True</code> for exactly the
+    hybrid models this page is about:
+  </p>
+
+  <pre><code># vllm/v1/kv_cache_interface.py:979-985
+@property
+def has_mamba_layers(self) -&gt; bool:
+    return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
+
+@property
+def needs_kv_cache_zeroing(self) -&gt; bool:
+    return self.has_mamba_layers</code></pre>
+
+  <div class="callout warn">
+    <strong>The name is misleading in two ways</strong>
+    It reads like "Mamba needs its cache zeroed", but the flag is set
+    <em>because</em> Mamba is present and the thing that actually gets zeroed is
+    the <strong>full-attention / MLA</strong> side. It is also not a per-group
+    property: one Mamba group anywhere in the model turns zeroing on for every
+    attention group in the config.
+  </div>
+
+  <h3>5.1 Why full attention (and MLA) cannot tolerate garbage</h3>
+  <p>
+    An attention kernel does not read exactly the slots the model wrote. It reads
+    <em>tiles</em>. For a K/V tile that extends past the end of the valid
+    sequence, the mask drives the softmax probability to <code>P = 0</code> for
+    those lanes, so their contribution to the output <em>should</em> be zero. But
+    the kernel still evaluates the matmul:
+  </p>
+
+  <pre><code>out = P @ V           # P[j] == 0 for masked/out-of-range j
+
+0 * 1.7        =  0        ✓
+0 * inf        =  NaN      ✗
+0 * NaN        =  NaN      ✗</code></pre>
+
+  <p>
+    Masking zeroes the <em>weight</em>, not the <em>value</em>. The kernel carries
+    an unwritten contract that every byte inside a tile it touches decodes to a
+    <strong>finite</strong> number — <code>0 · V</code> is only harmless when
+    <code>V</code> is finite. One <code>Inf</code> in a V tile produces a
+    <code>NaN</code> in the accumulator, which propagates to that row's output,
+    into the residual stream, and from there to every later layer and token. No
+    kernel raises, nothing asserts; the request just returns garbage or the loss
+    goes to <code>NaN</code>.
+  </p>
+
+  <div class="callout info">
+    <strong>Why the <em>whole</em> page, not just the tail</strong>
+    The obvious dirty region is the unwritten tail of a partially-filled last
+    block during prefill. But it is not the only one: <code>page_size_padded</code>
+    (§4 / <code>unify_kv_cache_spec_page_size</code>,
+    <code>kv_cache_utils.py:1068</code>) inflates Mamba and smaller
+    attention pages up to a common size, and those padding bytes are never
+    written by anyone. Rather than track which sub-ranges of a page are live, the
+    zeroer wipes the entire page for every layer sharing it, once, at allocation
+    time — <code>_zero_kv_blocks_kernel</code> stores zeros across all
+    <code>PAGE_SIZE_EL</code> elements of each block, for every precomputed
+    segment.
+  </div>
+
+  <h3>5.2 Why SSM state is the poison</h3>
+  <p>
+    Attention KV is bf16/fp16 (or fp8). SSM state is <strong>fp32</strong> — for
+    Kimi Linear's KDA layers, literally:
+  </p>
+
+  <pre><code># vllm/model_executor/layers/mamba/mamba_utils.py:119-125
+@classmethod
+def kda_state_dtype(cls, model_dtype, mamba_cache_dtype):
+    state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+    return (state_dtype, torch.float32)        # &lt;- the recurrent state is fp32</code></pre>
+
+  <p>
+    bf16 is the <em>high half</em> of an fp32 word. So re-reading an fp32 buffer
+    as bf16 splits each 32-bit word into two bf16 values: the high half is a
+    benign truncation of the original number, but the low half becomes a bf16
+    whose <em>exponent field</em> is mantissa bits 7–14 of the original fp32.
+    All-ones there decodes as <code>Inf</code> or <code>NaN</code>.
+  </p>
+
+  <div class="arch">
+<pre><code>one fp32 SSM state value, reinterpreted as two bf16 KV values
+(little-endian, so the low half comes first in memory)
+
+fp32:   S EEEEEEEE MMMMMMM MMMMMMMMMMMMMMMM
+        └────── high 16 bits ──────┘└─ low 16 bits ─┘
+                     │                      │
+        bf16 #1 ─────┘                      └───── bf16 #2
+        = truncation of the value             sign = M[15]
+          (finite, benign)                    exp  = M[14:7]   &lt;-- garbage
+                                              mant = M[6:0]
+
+        exp == 0xFF  ->  Inf / NaN
+        ~1 in 256 for unstructured mantissa bits
+        a page holds thousands of fp32 values -> effectively guaranteed</code></pre>
+  </div>
+
+  <p>
+    So this is not a rare-bit-pattern hazard that shows up once a week under
+    load. Any page of real fp32 SSM state, reinterpreted as bf16, contains
+    <code>Inf</code>/<code>NaN</code> with near-certainty. Reuse such a page for
+    an MLA group without wiping it and the very first forward pass that reads
+    past the written region poisons the output.
+  </p>
+
+  <div class="blocks">
+    <span class="label">page freed by Mamba group:</span>
+    <span class="cell miss">fp32</span>
+    <span class="cell miss">fp32</span>
+    <span class="cell miss">fp32</span>
+    <span class="cell miss">fp32</span>
+    <span class="cell miss">fp32</span>
+    <span class="cell miss">fp32</span>
+  </div>
+  <div class="blocks">
+    <span class="label">reallocated to MLA group, no zeroing:</span>
+    <span class="cell hit">K/V</span>
+    <span class="cell hit">K/V</span>
+    <span class="cell miss">Inf ✗</span>
+    <span class="cell miss">NaN ✗</span>
+    <span class="cell miss">Inf ✗</span>
+    <span class="cell miss">NaN ✗</span>
+    <span class="small">← tile reads here; 0·Inf = NaN</span>
+  </div>
+  <div class="blocks">
+    <span class="label">reallocated <em>with</em> zeroing:</span>
+    <span class="cell hit">K/V</span>
+    <span class="cell hit">K/V</span>
+    <span class="cell null">0</span>
+    <span class="cell null">0</span>
+    <span class="cell null">0</span>
+    <span class="cell null">0</span>
+    <span class="small">← 0·0 = 0, output unchanged</span>
+  </div>
+
+  <h3>5.3 The plumbing, scheduler → worker</h3>
+  <p>
+    Zeroing is decided in the KV cache manager, shipped over
+    <code>SchedulerOutput</code>, and executed by a Triton kernel on the worker
+    before the forward pass.
+  </p>
+
+  <div class="pipe">
+    <div class="node">
+      <strong>Config</strong>
+      <code>needs_kv_cache_zeroing</code> = has any <code>MambaSpec</code> group
+      <span class="small">kv_cache_interface.py:984</span>
+    </div>
+    <div class="node">
+      <strong>Per-group manager</strong>
+      records new block ids only for full-attention-family specs
+      <span class="small">single_type_kv_cache_manager.py:86</span>
+    </div>
+    <div class="node">
+      <strong>Scheduler</strong>
+      drains them into <code>new_block_ids_to_zero</code>
+      <span class="small">scheduler.py:1191</span>
+    </div>
+    <div class="node">
+      <strong>Worker</strong>
+      <code>KVBlockZeroer.zero_block_ids()</code> Triton kernel
+      <span class="small">worker/utils.py:83,209</span>
+    </div>
+  </div>
+
+  <pre><code># single_type_kv_cache_manager.py:84-92 — which groups opt in
+self._record_new_block_ids = needs_kv_cache_zeroing and type(kv_cache_spec) in (
+    FullAttentionSpec,
+    TQFullAttentionSpec,
+    MLAAttentionSpec,        # &lt;- Kimi Linear's non-KDA layers land here
+    HiddenStateCacheSpec,
+)
+
+# ...and allocate_new_blocks appends every fresh block id (incl. CoW blocks):
+new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+req_blocks.extend(new_blocks)
+if self._record_new_block_ids:
+    self.new_block_ids.extend(b.block_id for b in new_blocks)</code></pre>
+
+  <p>
+    On the worker side, <code>KVBlockZeroer.__init__</code> walks the attention
+    groups once — skipping Mamba layers, and de-duplicating by
+    <code>kv.data_ptr()</code> so layers that share a tensor are zeroed once —
+    and precomputes a table of absolute segment addresses. Each step,
+    <code>zero_block_ids</code> copies the id list H2D through a rotating set of
+    pinned buffers and launches <code>_zero_kv_blocks_kernel</code> over
+    <code>(n_blocks × n_segs × chunks)</code> programs. The metadata is built
+    <em>outside</em> the CuMem pool (<code>gpu_worker.py:736-743</code>) so
+    sleep/wake cycles do not discard it.
+  </p>
+
+  <h3>5.4 Zeroing is one-directional</h3>
+  <p>
+    Only the full-attention family records blocks; Mamba groups never do. The
+    asymmetry follows from how each side reads a page: an SSM state page is
+    written as a <em>complete checkpoint</em> before anything reads it, so no
+    reader ever sees an unwritten byte. Attention, as §5.1 shows, reads tiles
+    that overhang what it wrote. Same shared pool, same stale bytes — but only
+    one end of the exchange is exposed.
+  </p>
+
+  <div class="callout warn">
+    <strong>Three subtleties the code pays for</strong>
+    <ul>
+      <li>
+        <strong>Drain unconditionally.</strong>
+        <code>_get_new_block_ids_to_zero</code> calls
+        <code>take_new_block_ids()</code> <em>before</em> checking the flag, so
+        the manager-side list cannot grow without bound when nothing consumes it
+        — that was a host memory leak
+        (<a href="https://github.com/vllm-project/vllm/pull/44490">#44490</a>).
+      </li>
+      <li>
+        <strong>Async KV loads must not be zeroed.</strong> For a request going
+        to <code>WAITING_FOR_REMOTE_KVS</code>, the connector DMAs directly into
+        the freshly allocated blocks; zeroing them races that write. The
+        scheduler stashes those ids in <code>_skip_zero_block_ids</code>
+        (<code>scheduler.py:991-1001</code>) and filters them out
+        (<a href="https://github.com/vllm-project/vllm/pull/48481">#48481</a>).
+      </li>
+      <li>
+        <strong>…but a <em>failed</em> load must be.</strong> A skipped-then-failed
+        load leaves the tail unwritten <em>and</em> unzeroed. So
+        <code>record_blocks_for_zeroing(req, num_computed_tokens)</code>
+        (<code>kv_cache_manager.py:698</code>) re-records everything past the
+        valid prefix. Its <code>start_token</code> must be block-aligned —
+        zeroing a partially-valid block would wipe real KV.
+      </li>
+    </ul>
+  </div>
+
+  <h3>5.5 Which models this hits</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Layer mix</th>
+        <th>SSM state dtype</th>
+        <th>Zeroed side</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Kimi Linear</td>
+        <td>KDA linear attention + MLA (<code>config.is_kda_layer(i)</code>)</td>
+        <td><code>(state_dtype, float32)</code> — <code>kda_state_dtype</code></td>
+        <td><code>MLAAttentionSpec</code> groups</td>
+      </tr>
+      <tr>
+        <td>Kimi K-series hybrids (K2.5 / K3-class)</td>
+        <td>Same KDA + MLA layout</td>
+        <td>fp32 recurrent state</td>
+        <td><code>MLAAttentionSpec</code> groups</td>
+      </tr>
+      <tr>
+        <td>Qwen3.5 (GDN)</td>
+        <td>Gated DeltaNet + full attention</td>
+        <td><code>gated_delta_net_state_dtype</code>, fp32 by default</td>
+        <td><code>FullAttentionSpec</code> groups</td>
+      </tr>
+      <tr>
+        <td>Jamba / Mamba2-Hybrid</td>
+        <td>Mamba2 + sparse full attention</td>
+        <td>fp32 SSM state</td>
+        <td><code>FullAttentionSpec</code> groups</td>
+      </tr>
+      <tr>
+        <td>Gemma-3, Llama-4</td>
+        <td>Full + SWA / chunked-local, no SSM</td>
+        <td>—</td>
+        <td>Nothing — flag is <code>False</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout bad">
+    <strong>What the bug looks like in the wild</strong>
+    Nothing crashes. On a Kimi-Linear-class model you get intermittently wrong
+    outputs or <code>NaN</code> logits that correlate with <em>load</em>, not with
+    input — because the trigger is a Mamba group freeing a page that an MLA group
+    then picks up, which only happens once the pool starts recycling. Low-QPS
+    testing and single-request repros will miss it entirely. Original fix:
+    <a href="https://github.com/vllm-project/vllm/pull/35219">#35219</a>.
+  </div>
+
+  <h2 id="flcm-overview">6. find_longest_cache_hit overview</h2>
   <p>
     Lookup is a single call from the scheduler:
   </p>
@@ -459,7 +775,7 @@ for manager in self.single_type_managers:
     everything before the last chunk; etc.).
   </p>
 
-  <h2 id="flcm-algo">6. The fixed-point algorithm</h2>
+  <h2 id="flcm-algo">7. The fixed-point algorithm</h2>
   <p>
     Different attention types accept different prefix lengths. Full attention is
     <em>downward-closed</em>: if length L is a hit, every length below L is
@@ -523,7 +839,7 @@ while True:
     where the drop was applied twice.
   </p>
 
-  <h2 id="scans">7. Per-type scan directions</h2>
+  <h2 id="scans">8. Per-type scan directions</h2>
   <p>
     Each <code>SingleTypeKVCacheManager.find_longest_cache_hit</code>
     walks the request's hash list in the direction that matches its attention
@@ -593,7 +909,7 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
     as <code>null_block</code> is semantically correct, not a hack.
   </div>
 
-  <h2 id="walkthrough">8. Walkthrough — Gemma-3 hybrid hit</h2>
+  <h2 id="walkthrough">9. Walkthrough — Gemma-3 hybrid hit</h2>
   <p>
     Setup: Gemma-3 with <code>block_size=16</code>, <code>sliding_window=64</code>
     (so <code>W_blocks = ceil(63/16) = 4</code>). One full-attention group plus
@@ -699,7 +1015,7 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
     all groups.
   </p>
 
-  <h2 id="models">9. Real models &amp; group patterns</h2>
+  <h2 id="models">10. Real models &amp; group patterns</h2>
   <table>
     <thead>
       <tr>
@@ -744,7 +1060,14 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
         <td>Full + Mamba</td>
         <td>Sparse full layers + many Mamba</td>
         <td><strong>Hybrid</strong></td>
-        <td>Requires <code>mamba_cache_mode="align"</code> for prefix caching to engage.</td>
+        <td>Requires <code>mamba_cache_mode="align"</code> for prefix caching to engage. Turns on <code>needs_kv_cache_zeroing</code> (§5).</td>
+      </tr>
+      <tr>
+        <td>Kimi Linear / Kimi K-series</td>
+        <td>MLA + KDA linear attention</td>
+        <td><code>config.is_kda_layer(i)</code> decides per layer</td>
+        <td><strong>Hybrid</strong></td>
+        <td>fp32 KDA state shares the pool with bf16 MLA pages → <code>needs_kv_cache_zeroing</code> is load-bearing for correctness (§5).</td>
       </tr>
       <tr>
         <td>GPT-OSS-20B + EAGLE</td>
@@ -756,7 +1079,7 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
     </tbody>
   </table>
 
-  <h2 id="limits">10. Limitations &amp; correctness walls</h2>
+  <h2 id="limits">11. Limitations &amp; correctness walls</h2>
 
   <div class="grid">
     <div class="box">
@@ -810,7 +1133,7 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
     <a href="../KV_CACHE.md">KV_CACHE.md Part 2</a> for the full proof.
   </div>
 
-  <h2 id="wins">11. Where the engineering wins are</h2>
+  <h2 id="wins">12. Where the engineering wins are</h2>
   <p>
     Three improvements are sound and have measurable upside for hybrid models;
     a fourth (suffix-digest hashing) does not exist.
@@ -844,7 +1167,7 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
     </li>
   </ol>
 
-  <h2 id="source-map">12. Source map</h2>
+  <h2 id="source-map">13. Source map</h2>
   <ol class="source-list">
     <li>
       <a href="../../../vllm/v1/core/kv_cache_coordinator.py"><code>vllm/v1/core/kv_cache_coordinator.py</code></a>
@@ -873,7 +1196,24 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
       <a href="../../../vllm/v1/kv_cache_interface.py"><code>vllm/v1/kv_cache_interface.py</code></a>
       — the spec types (<code>FullAttentionSpec</code>,
       <code>SlidingWindowSpec</code>, <code>ChunkedLocalAttentionSpec</code>,
-      <code>MambaSpec</code>, etc.) that drive grouping and dispatch.
+      <code>MambaSpec</code>, etc.) that drive grouping and dispatch, plus
+      <code>KVCacheConfig.has_mamba_layers</code> /
+      <code>needs_kv_cache_zeroing</code> (980, 984).
+    </li>
+    <li>
+      <a href="../../../vllm/v1/worker/utils.py"><code>vllm/v1/worker/utils.py</code></a>
+      — <code>_zero_kv_blocks_kernel</code> (44) and <code>KVBlockZeroer</code>
+      (83) with <code>zero_block_ids</code> (209): the worker-side half of §5.
+      Wired up in <code>gpu_worker.py:736-743</code>
+      (<code>_init_kv_zero_meta</code>) and invoked from the model runners
+      (<code>gpu_model_runner.py:1197</code>,
+      <code>gpu/model_runner.py:851</code>).
+    </li>
+    <li>
+      <a href="../../../vllm/model_executor/layers/mamba/mamba_utils.py"><code>vllm/model_executor/layers/mamba/mamba_utils.py</code></a>
+      — <code>MambaStateDtypeCalculator</code>: <code>kda_state_dtype</code> (119)
+      and <code>gated_delta_net_state_dtype</code> (108) are where the fp32
+      recurrent state that motivates zeroing comes from.
     </li>
     <li>
       <a href="../KV_CACHE.md"><code>learnings/kv_cache/KV_CACHE.md</code></a>
@@ -889,9 +1229,11 @@ result = [NULL, NULL, NULL, B3]  (replay from B3 forward)</code></pre>
 
   <div class="callout good">
     <strong>Reading order</strong>
-    Skim §1–§3 to anchor the vocabulary; jump to §6 (fixed-point algorithm)
-    and §8 (walkthrough) for the load-bearing mental model; then read §4
-    (alignment) when the LCM/GCD chain starts to matter. §7's per-type scans
+    Skim §1–§3 to anchor the vocabulary; jump to §7 (fixed-point algorithm)
+    and §9 (walkthrough) for the load-bearing mental model; then read §4
+    (alignment) when the LCM/GCD chain starts to matter. §5 (zeroing) is
+    self-contained — read it if you touch Mamba/linear-attention hybrids or the
+    block pool, and skip it otherwise. §8's per-type scans
     are best understood by reading
     <code>SlidingWindowManager.find_longest_cache_hit</code> alongside.
   </div>

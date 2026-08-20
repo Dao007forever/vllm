@@ -56,9 +56,11 @@
     </div>
     <p>
       Compute one tiny meet per axis, take the product &mdash; that <em>is</em> the
-      transfer plan. The within-cell address math is an <strong>affine map on an
-      integer lattice</strong> (a CuTe-style <em>layout</em>). These are exactly
-      the objects behind PyTorch <code>DTensor</code> (<code>DeviceMesh</code> +
+      transfer plan. Within a physical page the address math is an
+      <strong>affine map on an integer lattice</strong> (a CuTe-style
+      <em>layout</em>); a block table makes the full paged layout an
+      <strong>indexed, piecewise-affine map</strong>. These are the objects
+      behind PyTorch <code>DTensor</code> (<code>DeviceMesh</code> +
       <code>Placement</code>), JAX/GSPMD (<code>Mesh</code> +
       <code>PartitionSpec</code>), and CUTLASS/CuTe <code>Layout</code>s.
     </p>
@@ -76,7 +78,8 @@
       <li><a href="#mesh">The rank side is also a product: the mesh</a></li>
       <li><a href="#prior-art">Prior art: DTensor, GSPMD, CuTe</a></li>
       <li><a href="#code-map">Mapping to the current NIXL code</a></li>
-      <li><a href="#proposal">Proposed abstraction: ordered-sequence <code>Placement</code> + <code>plan_transfer</code></a></li>
+      <li><a href="#proposal">Proposed abstraction: <code>Placement</code> + physical <code>Layout</code> + <code>plan_transfer</code></a></li>
+      <li><a href="#case-49612">Case study: hybrid models with heterogeneous block sizes (PR #49612)</a></li>
     </ol>
   </nav>
 
@@ -392,6 +395,17 @@
     that one axis was &ldquo;PP&rdquo; and another was &ldquo;TP.&rdquo;
   </div>
 
+  <div class="callout warn">
+    <strong>Paging makes the global map only piecewise affine.</strong> A request's
+    logical blocks may live in arbitrary physical cache pages. Inside one page,
+    <code>base + stride&middot;coordinate</code> still applies; crossing a page
+    boundary requires an indexed lookup through the block table. Thus the honest
+    map is <code>logical coordinate &rarr; physical page &rarr; affine
+    offset</code>. The meet should stay in the logical coordinate space, while a
+    separate lowering step resolves physical page ids and splits a logical run
+    wherever physical contiguity breaks.
+  </div>
+
   <h2 id="replication">6. Where partitions break: replication (MLA / GQA)</h2>
 
   <p>
@@ -621,38 +635,54 @@ kv.redistribute(mesh_D, D_placements)                     # what D needs   ← t
     </tbody>
   </table>
 
-  <h2 id="proposal">10. Proposed abstraction: ordered-sequence <code>Placement</code> + <code>plan_transfer</code></h2>
+  <h2 id="proposal">10. Proposed abstraction: ordered-sequence <code>Placement</code> + physical <code>Layout</code> + <code>plan_transfer</code></h2>
 
   <p>
-    The objects above suggest one interface, and &sect;5 pins the representation:
-    describe each side's placement on an axis as <strong>each rank's
-    owner-sequence, in local-buffer order</strong>. A global index's
-    <em>membership</em> in a sequence is the partition (who holds it); its
-    <em>position</em> is the local slot (the layout). One object answers both &mdash;
-    so there is no separate <code>owner</code>/<code>local_layout</code> method,
-    no interval arithmetic, and no per-axis <code>LayerAxis</code>/<code>HeadAxis</code>
-    class. An <code>Axis</code> is just metadata; the planner is dimension-agnostic.
+    The objects above suggest a two-level interface. Describe each side's
+    <em>logical placement</em> on an axis as <strong>each rank's owner-sequence</strong>.
+    Membership says who holds a global coordinate; position gives its logical
+    slot on that rank. For dense Layer and Head shards that slot also determines
+    the physical address, so a compact affine layout is enough. For paged Block
+    storage it does not: request order and physical cache-page id are different
+    things, and the block table supplies a separate indexed
+    <code>PhysicalLayout</code>.
+  </p>
+
+  <p>
+    This keeps the planner dimension-agnostic without asking it to understand
+    page ids. <code>plan_transfer</code> intersects logical coordinates and
+    produces descriptor boxes; <code>lower</code> maps those boxes through each
+    side's physical layout, splitting and coalescing NIXL spans as physical
+    continuity permits. An <code>Axis</code> remains metadata &mdash; there is
+    still no per-axis <code>LayerAxis</code>/<code>HeadAxis</code> mapping class.
   </p>
 
   <div class="callout code-ref">
     <strong>The whole interface.</strong>
-<pre><code># Placement = each rank's owner-sequence, in LOCAL BUFFER ORDER.
-#   membership = the partition        |        position = the local slot
+<pre><code># Placement lives in LOGICAL coordinates.
+#   membership = the partition        |        position = the logical slot
 Placement = tuple[Sequence[int], ...]            # owners[r] = global indices rank r holds
 
 def Shard(size, n):     return tuple(range(i*size//n, (i+1)*size//n) for i in range(n))  # range = compact
 def Replicate(size, n): return (range(size),) * n                                         # n identical seqs
-#   blocks / permuted / strided: pass explicit lists instead of ranges — same interface.
 
 @dataclass
-class Axis:                  # just metadata now — no per-axis cells/owner/layout
+class Axis:                  # metadata only — no per-axis mapping implementation
     name: str                # "layer" | "head" | "block" | ...
     size: int
 
 @dataclass
-class Side:                  # one engine: mesh extents + an owner-sequence Placement per axis
+class PhysicalLayout:
+    # Resolve a worker-local logical coordinate tuple to byte span(s).
+    # Dense storage: affine base + strides. Paged storage: block-table lookup,
+    # then an affine map within the selected page.
+    resolve: Callable[[tuple[int, ...]], Sequence[Span]]
+
+@dataclass
+class Side:
     mesh:  tuple[int, ...]   # extents per axis, in AXES order   (pp, tp)
     place: dict[str, Placement]
+    layout: tuple[PhysicalLayout, ...]             # one per flattened worker
 
 def meet_edge(src_seq, dst_seq):        # the ONLY core op: membership + slot in one pass
     dst_slot = {e: j for j, e in enumerate(dst_seq)}
@@ -675,7 +705,12 @@ def plan_transfer(axes, P: Side, D: Side):
     for combo in itertools.product(*per_axis):           # one edge per axis == the nested loop
         src = mesh_rank(P, [e[0] for e in combo])         # e = (src_rank, dst_rank, runs)
         dst = mesh_rank(D, [e[1] for e in combo])
-        yield Read(src, dst, region=[e[2] for e in combo])  # product of per-axis runs = a descriptor box</code></pre>
+        yield Read(src, dst, region=[e[2] for e in combo])  # a LOGICAL descriptor box
+
+def lower(read, P, D):
+    # Resolve both indexed/affine layouts, split at page or stride boundaries,
+    # then coalesce adjacent physical spans into NIXL descriptors.
+    return physical_ops(read, P.layout[read.src], D.layout[read.dst])</code></pre>
   </div>
 
   <p>
@@ -691,8 +726,8 @@ def plan_transfer(axes, P: Side, D: Side):
   <ul>
     <li>layer owner-sequences (a <code>range</code> per PP rank) &rarr; replace <code>PPLayerMap</code> + the layer-name matching (which <em>is</em> <code>list.index(name)</code>).</li>
     <li>head owner-sequences (<code>Shard</code> or <code>Replicate</code>) &rarr; replace all three branches of <code>compute_tp_mapping</code> plus the GQA/MLA dedup.</li>
-    <li>block-id sequences (explicit <code>list</code>s) &rarr; absorb <code>block_size_ratio</code> and <code>physical_blocks_per_logical</code> as the list contents.</li>
-    <li><code>plan_transfer</code>'s <code>itertools.product</code> &rarr; <em>is</em> the nested loop in <code>_read_blocks_for_req</code>; each <code>meet_edge</code> run &rarr; one NIXL descriptor.</li>
+    <li>logical token-quantum sequences + indexed Block layouts &rarr; absorb <code>block_size_ratio</code>, <code>physical_blocks_per_logical</code>, and arbitrary physical block ids without confusing identity with address.</li>
+    <li><code>plan_transfer</code>'s <code>itertools.product</code> &rarr; <em>is</em> the nested loop in <code>_read_blocks_for_req</code>; each <code>meet_edge</code> run &rarr; one logical region, lowered to one or more NIXL descriptors.</li>
   </ul>
 
   <h3 id="concrete-pp-tp">Concrete instantiation &mdash; PP and TP on the running example</h3>
@@ -720,8 +755,9 @@ D.place["layer"] = Shard(4, 1)             D.place["head"] = Shard(4, 4)
   </div>
 
   <p>
-    Reading a slot off a sequence is the whole layout story &mdash; no
-    <code>base</code>/<code>stride</code> object. On the head axis, P's tp0 holds
+    For these dense Layer and Head axes, reading a slot off a sequence supplies
+    the only variable part of the layout; the fixed physical strides live in
+    each worker's <code>PhysicalLayout</code>. On the head axis, P's tp0 holds
     <code>range(0,2)=[0,1]</code>; the slot of head 1 is <code>[0,1].index(1)=1</code>,
     and that &ldquo;1&rdquo; is exactly NIXL's <code>rank_offset_factor</code>. On
     the layer axis, D's pp0 holds <code>range(0,4)=[0,1,2,3]</code>; the slot of
@@ -954,52 +990,192 @@ reads = list(plan_transfer(AXES, P, D))        # -> 8 Reads
     contiguous whole-latent copy instead of a head-slice.
   </div>
 
-  <h3 id="sequences">Representation note: <code>range</code> for the regular case, <code>list</code> for the rest</h3>
+  <h3 id="sequences">Representation note: logical order is not physical page order</h3>
 
   <p>
-    Owner-sequences carried the whole section; the one per-axis decision left is
-    whether a rank's sequence is a <code>range</code> or an explicit
-    <code>list</code>. They share the sequence interface (<code>in</code>,
-    <code>index</code>, <code>len</code>, slicing), so <code>meet_edge</code> /
-    <code>axis_edges</code> are written once. <code>range</code> just makes the
-    slot lookup O(1) &mdash; <code>range(start,&hellip;).index(e) == e &minus; start</code>,
-    which <em>is</em> the <code>rank_offset_factor</code> the interval code
-    computes by hand:
+    Owner-sequences carry the logical partition. A <code>range</code> compactly
+    represents a regular shard; an explicit <code>list</code> represents a
+    logical permutation or strided ownership pattern. They share the sequence
+    interface (<code>in</code>, <code>index</code>, <code>len</code>, slicing),
+    so <code>meet_edge</code> / <code>axis_edges</code> remain unchanged.
+    <code>range</code> makes slot lookup O(1):
+    <code>range(start,&hellip;).index(e) == e &minus; start</code>.
   </p>
 
   <table>
-    <thead><tr><th>Axis</th><th>owner-sequence representation</th><th><code>.index(e)</code></th><th>covers</th></tr></thead>
+    <thead><tr><th>Case</th><th>Logical placement</th><th>Physical layout</th></tr></thead>
     <tbody>
-      <tr><td>Head, contiguous Layer shards</td><td><code>range(start, stop)</code> &mdash; O(1)</td><td><code>e &minus; start</code> (= <code>rank_offset_factor</code>)</td><td>the regular PP/TP case</td></tr>
-      <tr><td>Block ids, permuted / strided, GQA-replicated</td><td>explicit <code>list</code></td><td>inverse-dict lookup</td><td>blocks, HND&harr;NHD permute, replication</td></tr>
+      <tr><td>Contiguous Layer / Head shard</td><td><code>range(start, stop)</code></td><td>Affine base + strides; logical slot determines offset</td></tr>
+      <tr><td>Permuted / strided ownership</td><td>Explicit logical-coordinate <code>list</code></td><td>Affine or indexed, depending on storage</td></tr>
+      <tr><td>Paged Block axis</td><td>Request-relative token quanta</td><td>Block-table lookup + affine offset within the selected physical page</td></tr>
+      <tr><td>GQA / MLA replication</td><td>Repeated logical owner-sequences</td><td>One physical layout per replica</td></tr>
     </tbody>
   </table>
 
-  <div class="callout good">
-    <strong>Why a sequence &mdash; not a set, not an interval.</strong> An
+  <div class="callout info">
+    <strong>Why a sequence &mdash; but not only a sequence.</strong> An
     <em>interval</em> expresses only contiguous shards. A <em>set</em> gives
-    membership but drops order, forcing a separate layout to recover offsets. A
-    <em>sequence</em> keeps order, so one object is both the partition
-    (membership) and the layout (position) &mdash; and degrades gracefully to an
-    explicit <code>list</code> for blocks, permutations, and striding that
-    intervals can't express. It's also what the connector already stores:
+    membership but drops order. A <em>sequence</em> keeps both membership and
+    logical order, which is sufficient to recover offsets for dense Layer and
+    Head layouts. It is not a page table. The connector's
     <code>local_block_ids</code>/<code>remote_block_ids</code> are
-    <strong>lists</strong> zipped positionally, and
+    <strong>physical ids zipped by request position</strong>; ids on opposite
+    sides need not be equal, contiguous, or related numerically. Meanwhile,
     <code>_local_region_indices_for_layer_names</code> is literally
-    <code>list.index(name)</code> &mdash; the interval <code>base</code>/<code>stride</code>
-    is just the O(1) <code>range</code> encoding of those lists.
+    <code>list.index(name)</code>. The former requires an indexed physical
+    layout; the latter is the O(1) dense-sequence case.
   </div>
 
   <div class="callout good">
     <strong>Litmus test for the abstraction.</strong> Adding context/sequence
     parallel should be: supply that axis's <strong>owner-sequences</strong> (a
     <code>range</code> for a contiguous shard, an explicit <code>list</code>
-    otherwise) and register the axis. <em>Zero</em> changes to
-    <code>plan_transfer</code>, <code>meet_edge</code>, or the transport &mdash; no
-    new <code>owner</code>/<code>layout</code> method, no <code>Shard | Replicate</code>
-    branch. If a new parallel dimension forces an edit to the planner, the axis
-    abstraction has leaked &mdash; the per-axis meet + product structure is the
-    invariant to protect.
+    otherwise), provide its physical layout, and register the axis.
+    <em>Zero</em> changes to <code>plan_transfer</code> or
+    <code>meet_edge</code>; only the generic lowerer may split logical boxes at
+    new physical discontinuities. If a new parallel dimension forces an edit to
+    the logical planner, the axis abstraction has leaked &mdash; the per-axis
+    meet + product structure is the invariant to protect.
+  </div>
+
+  <h2 id="case-49612">11. Case study: hybrid models with heterogeneous block sizes (PR #49612)</h2>
+
+  <p>
+    <a href="https://github.com/vllm-project/vllm/pull/49612">vLLM PR #49612</a>
+    supports different P/D attention block sizes for hybrid attention + Mamba
+    models. It is a useful stress test because it combines three independent
+    concerns: Block-axis refinement, Head-axis TP redistribution, and two cache
+    groups whose &ldquo;block&rdquo; coordinates have different meanings.
+  </p>
+
+  <div class="callout warn">
+    <strong>The old failure.</strong> The heterogeneous-block path ratio-expanded
+    attention descriptors, but the hybrid path treated Mamba state descriptors
+    as though the same ratio applied. Mamba state is not a token extent that can
+    be subdivided: each state page is one indivisible object. The connector
+    therefore asserted out the entire combination.
+  </div>
+
+  <h3>The correct logical domain is a coproduct</h3>
+
+  <div class="eq" style="text-align:center">
+    G =
+    (Layer<sub>FA</sub> &times; Head &times; TokenQuantum &times; {K,V})
+    &nbsp;+&nbsp;
+    (Layer<sub>SSM</sub> &times; StateSlot &times; StateComponent)
+  </div>
+
+  <p>
+    The <code>+</code> is essential. On the attention side, choose a common token
+    quantum &mdash; under the connector's current divisibility constraint, the
+    smaller block size &mdash; and refine both physical layouts to that unit. On
+    the Mamba side, <code>StateSlot</code> transfers 1:1 and never participates
+    in the attention block-size ratio. The PR's
+    <code>_group_spec_types</code> and <code>source_ranks_per_group</code> are the
+    runtime tags and placements for these two summands.
+  </p>
+
+  <table>
+    <thead><tr><th>PR #49612 behavior</th><th>Mathematical object</th></tr></thead>
+    <tbody>
+      <tr><td>Attention descriptor ids are ratio-expanded</td><td>Refinement of <code>TokenQuantum</code></td></tr>
+      <tr><td>Mamba descriptor ids and pages remain 1:1</td><td>Independent <code>StateSlot</code> axis in the SSM summand</td></tr>
+      <tr><td>Source ranks differ per cache group</td><td>Group-specific Head/channel placements</td></tr>
+      <tr><td>Handles keyed by <code>(tp_ratio, remote_block_size)</code></td><td>Cached lowering for one Head placement + Block layout signature</td></tr>
+      <tr><td>Only attention caches are permuted</td><td>Group-specific destination layout transform</td></tr>
+      <tr><td>Host-buffer mode with a ratio remains rejected</td><td>The staging <code>PhysicalLayout</code>/<code>Transform</code> lowerer lacks this capability; the logical meet is still valid</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Worked Block-axis refinement</h3>
+
+  <p>
+    Suppose P uses block size 4 and reports ten physical attention pages, while D
+    uses block size 16 and allocates three pages:
+  </p>
+
+  <div class="callout code-ref">
+<pre><code>P physical ids (size 4):   [30,31,32,33,34,35,36,37,38,39]
+D physical ids (size 16):  [1,2,3]
+ratio = 16 / 4 = 4
+
+logical TokenQuantum:       0  1  2  3 | 4  5  6  7 | 8  9
+P physical layout:         30 31 32 33 |34 35 36 37 |38 39
+D physical layout:        1.0 1.1 1.2 1.3|2.0 2.1 2.2 2.3|3.0 3.1
+
+meet(TokenQuantum_P, TokenQuantum_D) = range(0, 10)</code></pre>
+  </div>
+
+  <p>
+    The meet compares the logical coordinates <code>0..9</code>, not physical ids
+    <code>30..39</code> with <code>1..3</code>. Lowering then maps each logical
+    quantum through the two block tables. This reproduces the PR's expansion of
+    each D page into four remote-sized descriptors and its positional pairing
+    with P's pages.
+  </p>
+
+  <div class="callout warn">
+    <strong>This is the counterexample to &ldquo;the sequence is the
+    layout.&rdquo;</strong> The two physical-id lists have no common elements, so
+    feeding them directly to <code>meet_edge</code> would produce an empty
+    transfer. Their list positions describe request order, not physical cache
+    slots. Logical placement and physical page layout must remain distinct.
+  </div>
+
+  <h3>The clipped tail is a plan operation, not another transfer</h3>
+
+  <p>
+    D's third page has room for quanta <code>8,9,10,11</code>, but P supplied
+    only <code>8,9</code>. The meet correctly emits no copy for
+    <code>10,11</code>; however, a freshly allocated physical page may contain
+    stale bytes. PR #49612 zeroes that untransferred token tail after receive.
+    A complete plan therefore has more than reads:
+  </p>
+
+  <div class="eq" style="text-align:center">
+    PlanOp = Copy(srcSpan, dstSpan) &nbsp;|&nbsp; Fill(dstSpan, 0)
+    &nbsp;|&nbsp; Transform(dstRegion, layoutPermutation)
+  </div>
+
+  <p>
+    For this request the lowerer emits ten quantum copies, coalesced wherever
+    their physical spans are adjacent, plus <code>Fill(D page 3, quanta
+    10..11, 0)</code>. HND&harr;NHD or block-size receive permutations are
+    destination <code>Transform</code>s. The logical meet itself stays unchanged.
+  </p>
+
+  <h3>Why Head-sharded attention + block mismatch is not fundamentally incompatible</h3>
+
+  <p>
+    The PR deliberately rejects head-sharded attention reads combined with a
+    block-size mismatch. That is a limitation of the current pre-registered,
+    flat descriptor lowering, not of the decomposition:
+  </p>
+
+  <div class="eq" style="text-align:center">
+    meet<sub>FA</sub> =
+    meet<sub>Layer</sub> &times;
+    meet<sub>Head</sub> &times;
+    meet<sub>TokenQuantum</sub>
+  </div>
+
+  <p>
+    A generic lowerer would take each Head run &times; TokenQuantum run, compose
+    both sides' indexed/affine layouts, and emit one descriptor for every
+    physically contiguous rectangle (or several spans when the page table or
+    stride breaks contiguity). The existing code has separate paths for
+    head-slicing and remote-granularity sub-pages; it does not yet compose both
+    transformations generically.
+  </p>
+
+  <div class="callout good">
+    <strong>Conclusion from the case.</strong> PR #49612 validates the
+    sum-of-products and per-axis-refinement model. It also sharpens the
+    implementation boundary: <code>plan_transfer</code> works solely with
+    logical coordinates; <code>PhysicalLayout</code> owns page ids, byte
+    strides, and group-specific transforms; <code>lower</code> produces NIXL
+    copies and destination initialization operations. With that boundary, adding
+    the Block refinement changes layouts and plan inputs, not the planner.
   </div>
 
   <div class="divider"></div>
