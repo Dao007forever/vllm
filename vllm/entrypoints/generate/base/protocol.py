@@ -11,7 +11,9 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     model_serializer,
+    model_validator,
 )
 
 import vllm.envs as envs
@@ -228,10 +230,28 @@ class FunctionDefinition(OpenAIBaseModel):
     strict: bool | None = None
     defer_loading: bool | None = None
 
+    # Chat templates iterate the dumped tool dict (e.g. GLM's
+    # `for k, v in tool.items()`), so the serialized key order becomes
+    # model-visible prompt text. Keep the client's order instead of
+    # pydantic's declaration order.
+    _client_key_order: list[str] | None = PrivateAttr(default=None)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _capture_client_key_order(cls, data, handler):
+        result = handler(data)
+        if isinstance(data, dict):
+            result._client_key_order = list(data)
+        return result
+
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         data = {k: v for k, v in data.items() if k in type(self).model_fields}
+        if self._client_key_order:
+            ordered = {k: data[k] for k in self._client_key_order if k in data}
+            ordered.update((k, v) for k, v in data.items() if k not in ordered)
+            data = ordered
         if self.strict is None:
             data.pop("strict", None)
         if self.defer_loading is None:
