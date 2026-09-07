@@ -526,30 +526,101 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # layer output buffer; the chunked prefill kernel cannot, so this
         # stays None there and the merge copy below runs as before.
         ns_out = None
+        # In a mixed non-spec step (prefill + decode in the same batch) the
+        # decode rows are peeled off the front and run through the recurrent
+        # kernel instead of being folded into the chunked kernel as length-1
+        # varlen sequences. The two paths are not numerically equivalent: the
+        # chunked path forms its output from the inter-chunk state `h`, which
+        # is materialized in the input dtype (bf16) by chunk_gated_delta_rule_fwd_h
+        # and read back as bf16 in chunk_gla_fwd_kernel_o, while the recurrent
+        # kernel keeps the state in fp32 registers. Folding decodes into the
+        # chunked path would make a decoding sequence's output depend on
+        # whether a prefill happened to be co-scheduled in the same step.
+        # Decodes are ordered first in the batch (see split_decodes_and_prefills),
+        # and the metadata builder precomputes the rebased prefill-only
+        # cu_seqlens / state indices / initial-state mask under exactly this
+        # condition (gdn_attn.py). Mirrors qwen_gdn_linear_attn.py.
+        split_non_spec = (
+            spec_sequence_masks is None
+            and attn_metadata_narrowed.num_prefills > 0
+            and attn_metadata_narrowed.num_decodes > 0
+        )
+        num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+        core_attn_out_decode = None
+        if split_non_spec:
+            assert q_ns is not None
+            assert non_spec_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
+            # Same call as the plain-decode branch below, restricted to the
+            # decode prefix: gate computed in-kernel (COMPUTE_GATE), beta
+            # sigmoided in-kernel, final state written in place through
+            # ssm_state_indices. The chunked prefill call below touches a
+            # disjoint set of state slots, so the two are order-independent.
+            core_attn_out_decode, _ = fused_recurrent_kda(
+                q=_rearr(q_ns[:num_decode_tokens]),
+                k=_rearr(k_ns[:num_decode_tokens]),
+                v=_rearr(v_ns[:num_decode_tokens]),
+                g=g1_ns[:, :num_decode_tokens],
+                beta=beta_ns[:, :num_decode_tokens],
+                initial_state=recurrent_state,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=non_spec_query_start_loc[
+                    : attn_metadata_narrowed.num_decodes + 1
+                ],
+                ssm_state_indices=non_spec_state_indices_tensor,
+                sigmoid_beta=True,
+                a_log=self.A_log,
+                g_bias=self.dt_bias,
+                compute_gate=True,
+                lower_bound=lower_bound,
+            )
         if attn_metadata_narrowed.num_prefills > 0:
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
+            if split_non_spec:
+                # cu_seqlens (rebased by num_decode_tokens), state indices and
+                # initial-state mask for the prefill tail are precomputed by the
+                # metadata builder under the same split condition.
+                prefill_query_start_loc = attn_metadata_narrowed.prefill_query_start_loc
+                prefill_state_indices = attn_metadata_narrowed.prefill_state_indices
+                prefill_has_initial_state = (
+                    attn_metadata_narrowed.prefill_has_initial_state
+                )
+                assert prefill_query_start_loc is not None
+                assert prefill_state_indices is not None
+                assert prefill_has_initial_state is not None
+                q_pre = q_ns[num_decode_tokens:]
+                k_pre = k_ns[num_decode_tokens:]
+                v_pre = v_ns[num_decode_tokens:]
+                g1_pre = g1_ns[:, num_decode_tokens:]
+                beta_pre = beta_ns[:, num_decode_tokens:]
+            else:
+                prefill_query_start_loc = non_spec_query_start_loc
+                prefill_state_indices = non_spec_state_indices_tensor
+                prefill_has_initial_state = has_initial_state
+                q_pre, k_pre, v_pre = q_ns, k_ns, v_ns
+                g1_pre, beta_pre = g1_ns, beta_ns
             initial_state = gather_initial_states(
-                recurrent_state, non_spec_state_indices_tensor, has_initial_state
+                recurrent_state, prefill_state_indices, prefill_has_initial_state
             )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
             ) = chunk_kda_with_fused_gate(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
-                raw_g=g1_ns,
+                q=_rearr(q_pre),
+                k=_rearr(k_pre),
+                v=_rearr(v_pre),
+                raw_g=g1_pre,
                 # Chunk path wants the pre-sigmoided fp32 beta (its kernels
                 # don't sigmoid); beta_ns is raw bf16 from forward.
-                beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+                beta=_cast_sigmoid(beta_pre.squeeze(0)).unsqueeze(0),
                 A_log=self.A_log,
                 g_bias=self.dt_bias,
                 initial_state=initial_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=prefill_query_start_loc,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
             )
@@ -557,8 +628,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             scatter_states(
                 recurrent_state,
                 last_recurrent_state,
-                non_spec_state_indices_tensor,
+                prefill_state_indices,
             )
+            if split_non_spec:
+                # Stitch the peeled decode outputs back in front of the prefill
+                # outputs (decode-first token order).
+                assert core_attn_out_decode is not None
+                core_attn_out_non_spec = torch.cat(
+                    [core_attn_out_decode, core_attn_out_non_spec], dim=1
+                )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
