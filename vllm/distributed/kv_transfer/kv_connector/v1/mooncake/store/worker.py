@@ -936,8 +936,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         event_token_ids = req_meta.token_ids
         token_ids_start = req_meta.token_ids_start
         try:
-            # Cache hits are always a multiple of ``lcm_block_size`` tokens,
-            # which is also ``store_mask``'s precondition.
+            # Keep common save progress block-aligned so later jobs revisit
+            # partial FA pages and unfinished blocks in other cache groups.
             lcm_block_size = self.coord.lcm_block_size
             token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
             block_ids_per_group = req_meta.block_ids
@@ -969,7 +969,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ):
                 return
 
-            if token_len == 0:
+            if req_meta.token_len_chunk == 0:
                 return
 
             # Resume from where this rank left off; only the new suffix is saved.
@@ -977,8 +977,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
+            save_token_len = (
+                req_meta.token_len_chunk
+                if self.coord.enable_partial_hash_hits
+                else token_len
+            )
             store_masks = self.coord.store_mask(
-                token_len,
+                save_token_len,
                 save_start,
                 num_prompt_tokens=req_meta.num_prompt_tokens,
             )
@@ -998,8 +1003,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 put_step = self.group_put_steps[g_idx]
                 put_step_rank = (self.tp_rank + g_idx) % put_step
                 group_blocks = block_ids_per_group[g_idx]
+                group_token_len = save_token_len // db.block_size * db.block_size
+                if (
+                    self.coord.enable_partial_hash_hits
+                    and g_idx in self.coord.full_attention_group_ids
+                ):
+                    # FA is append-only: publish the computed hash-aligned
+                    # prefix independently of the exact Mamba checkpoints.
+                    group_token_len = req_meta.token_len_chunk
                 for start, end, block_hash in db.process_tokens(
-                    token_len,
+                    group_token_len,
                     req_meta.block_hashes,
                     mask_num=save_start,
                     chunk_mask=store_masks[g_idx],
@@ -1208,6 +1221,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     if any(index in failed_indices for index in event_indices):
                         continue
                     db = self.token_databases[g_idx]
+                    if end - s != db.block_size:
+                        # A partial-page key does not represent a full block event.
+                        continue
                     token_ids = (
                         event_token_ids[s - token_ids_start : end - token_ids_start]
                         if event_token_ids is not None
