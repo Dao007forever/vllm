@@ -215,6 +215,9 @@ class MooncakeStoreScheduler:
         """Build connector metadata for this scheduler step."""
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
+        prefill_save_unit = (
+            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
+        )
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
@@ -267,7 +270,7 @@ class MooncakeStoreScheduler:
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                self._block_size,
+                prefill_save_unit,
                 load_spec=load_spec,
                 # A consumer may write decode KV without becoming a prefill
                 # producer. Loads are still carried by the same metadata.
@@ -319,7 +322,7 @@ class MooncakeStoreScheduler:
 
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        prefill_save_unit,
                         load_spec=load_spec,
                         skip_save=is_consumer,
                         block_hashes=request_real.block_hashes,
@@ -360,7 +363,7 @@ class MooncakeStoreScheduler:
 
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
-                        self._block_size,
+                        self._block_size if is_decode else prefill_save_unit,
                         load_spec=None,
                         skip_save=False,
                         block_hashes=unfinished_req.block_hashes,

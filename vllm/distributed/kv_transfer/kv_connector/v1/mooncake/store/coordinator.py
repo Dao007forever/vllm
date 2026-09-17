@@ -160,6 +160,12 @@ class MooncakeStoreCoordinator:
         if self.use_eagle and not any(g.use_eagle for g in attention_groups):
             attention_groups = [g._replace(use_eagle=True) for g in attention_groups]
         self.attention_groups = attention_groups
+        self.full_attention_group_ids = {
+            gid
+            for g in attention_groups
+            if isinstance(g.spec, FullAttentionSpec)
+            for gid in g.group_ids
+        }
         # Per-group eagle bits. SpecGroup carries use_eagle for the whole
         # merged spec group, so the per-group store/lookup masks agree with
         # the merged-group hit check, which applies the eagle drop to every

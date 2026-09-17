@@ -391,6 +391,36 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     assert tracker.num_saved_tokens == 48
 
 
+@pytest.mark.parametrize("completed_tokens", [35, 36, 37])
+def test_prefill_saves_new_hash_boundary_without_new_physical_block(completed_tokens):
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    hashes = [b"h" + bytes([i]) for i in range(9)]
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(37)),
+        block_hashes=hashes,
+        prefill_end_tokens=37,
+    )
+    tracker = scheduler._request_trackers["req-0"]
+    tracker.token_len = tracker.num_saved_tokens = 32
+    tracker.allocated_block_ids = ([1, 2, 3],)
+    output = _make_scheduler_output(scheduled_spec_tokens=None)
+    output.scheduled_cached_reqs.num_computed_tokens = [32]
+    output.scheduled_cached_reqs.new_block_ids = [None]
+    output.num_scheduled_tokens = {"req-0": completed_tokens - 32}
+    output.kv_connector_block_state = _make_connector_block_state(([1, 2, 3],))
+
+    meta = scheduler.build_connector_meta(output)
+
+    if completed_tokens < 36:
+        assert meta.requests == []
+    else:
+        (req_meta,) = meta.requests
+        assert req_meta.token_len_chunk == 36
+        assert req_meta.boundary_state_offloads is None
+        assert scheduler._pinned_saves[req_meta.store_job_id][0] == [1, 2, 3]
+
+
 @pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both"])
 def test_decode_tracking_is_skipped_by_default(kv_role):
     scheduler, tracker = _setup_decode_request(kv_role=kv_role)
