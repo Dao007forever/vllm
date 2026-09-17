@@ -977,8 +977,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
+            save_token_len = (
+                req_meta.token_len_chunk
+                if self.coord.enable_partial_hash_hits
+                else token_len
+            )
             store_masks = self.coord.store_mask(
-                token_len,
+                save_token_len,
                 save_start,
                 num_prompt_tokens=req_meta.num_prompt_tokens,
             )
@@ -998,7 +1003,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 put_step = self.group_put_steps[g_idx]
                 put_step_rank = (self.tp_rank + g_idx) % put_step
                 group_blocks = block_ids_per_group[g_idx]
-                group_token_len = token_len
+                group_token_len = save_token_len // db.block_size * db.block_size
                 if (
                     self.coord.enable_partial_hash_hits
                     and g_idx in self.coord.full_attention_group_ids

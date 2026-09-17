@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     RSWASpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -3674,7 +3675,14 @@ def test_lookup_partial_prefix_returns_first_hit_length():
     assert worker.lookup(48, [b"a0", b"a1", b"a2"]).hit_length == 32
 
 
-def _make_partial_hit_worker(*, use_eagle=False, block_size=16, hash_block_size=4):
+def _make_partial_hit_worker(
+    *,
+    use_eagle=False,
+    block_size=16,
+    hash_block_size=4,
+    swa_block_size=None,
+    retention_interval=None,
+):
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -3682,8 +3690,18 @@ def _make_partial_hit_worker(*, use_eagle=False, block_size=16, hash_block_size=
     )
 
     worker = _make_bare_worker(block_size=block_size)
-    full = FullAttentionSpec(
-        block_size=block_size, num_kv_heads=8, head_size=64, dtype=None
+    attention = (
+        FullAttentionSpec(
+            block_size=block_size, num_kv_heads=8, head_size=64, dtype=None
+        )
+        if swa_block_size is None
+        else SlidingWindowSpec(
+            block_size=swa_block_size,
+            num_kv_heads=8,
+            head_size=64,
+            dtype=None,
+            sliding_window=32,
+        )
     )
     mamba = MambaSpec(
         block_size=block_size,
@@ -3692,23 +3710,24 @@ def _make_partial_hit_worker(*, use_eagle=False, block_size=16, hash_block_size=
         mamba_cache_mode="align",
     )
     worker._kv_cache_groups = [
-        KVCacheGroupSpec(["full"], full),
+        KVCacheGroupSpec(["attention"], attention),
         KVCacheGroupSpec(["mamba"], mamba),
     ]
     worker.hash_block_size = hash_block_size
     worker.token_dbs = [
         ChunkedTokenDatabase(
             KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
-            block_size=block_size,
+            block_size=group.kv_cache_spec.block_size,
             hash_block_size=hash_block_size,
         )
-        for group_id in range(2)
+        for group_id, group in enumerate(worker._kv_cache_groups)
     ]
     worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
         worker._kv_cache_groups,
         scheduler_block_size=block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        retention_interval=retention_interval,
     )
     _refresh_group_tp_replication_factors(worker)
     return worker
@@ -3723,25 +3742,49 @@ def test_lookup_partial_tail_uses_hash_alignment():
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "block_size", "hash_size", "delayed_attention"),
+    (
+        "prompt_len",
+        "block_size",
+        "hash_size",
+        "delayed_attention",
+        "swa_block_size",
+        "retention_interval",
+    ),
     [
-        (13, 16, 4, False),
-        (31, 16, 4, True),
-        (37, 16, 4, True),
-        (40, 16, 4, False),
-        (7449, 1536, 128, False),
+        (13, 16, 4, False, None, None),
+        (31, 16, 4, True, None, None),
+        (37, 16, 4, True, None, None),
+        (40, 16, 4, False, None, None),
+        (7449, 1536, 128, False, None, None),
+        (49, 32, 16, True, 16, None),
+        (49, 32, 16, True, 16, 32),
+        (48, 32, 16, True, 16, None),
+        (49, 16, 16, True, 16, None),
+        (97, 64, 16, False, 16, None),
+        (97, 64, 16, False, 16, 0),
+        (97, 64, 16, False, 16, 64),
     ],
 )
-def test_saved_fa_tail_makes_eagle_mamba_checkpoint_reusable(
-    prompt_len, block_size, hash_size, delayed_attention
+def test_saved_attention_tail_makes_eagle_mamba_checkpoint_reusable(
+    prompt_len,
+    block_size,
+    hash_size,
+    delayed_attention,
+    swa_block_size,
+    retention_interval,
 ):
-    """FA publication follows computed tokens, including after a Mamba handoff."""
+    """Attention can advance beyond Mamba's boundary without another handoff."""
     worker = _make_partial_hit_worker(
-        use_eagle=True, block_size=block_size, hash_block_size=hash_size
+        use_eagle=True,
+        block_size=block_size,
+        hash_block_size=hash_size,
+        swa_block_size=swa_block_size,
+        retention_interval=retention_interval,
     )
+    attention_block_size = swa_block_size or block_size
     hashes = [BlockHash(f"h{i}".encode()) for i in range(prompt_len // hash_size)]
     checkpoint = (prompt_len - 1) // hash_size * hash_size - hash_size
-    fa_end = prompt_len // hash_size * hash_size
+    attention_end = prompt_len // hash_size * hash_size
     stored: dict[str, list[int]] = {}
     event = MagicMock()
 
@@ -3762,11 +3805,11 @@ def test_saved_fa_tail_makes_eagle_mamba_checkpoint_reusable(
     )
     thread.enable_kv_event = True
     thread.update_kv_event = MagicMock()
-    fa_blocks = list(range(1, math.ceil(prompt_len / block_size) + 1))
+    attention_blocks = list(range(1, math.ceil(prompt_len / attention_block_size) + 1))
     req = ReqMeta(
         req_id="req-a",
-        token_len_chunk=checkpoint if delayed_attention else fa_end,
-        block_ids=(fa_blocks, [5]),
+        token_len_chunk=checkpoint if delayed_attention else attention_end,
+        block_ids=(attention_blocks, [5]),
         block_hashes=hashes,
         can_save=True,
         current_event=event,
@@ -3777,14 +3820,14 @@ def test_saved_fa_tail_makes_eagle_mamba_checkpoint_reusable(
     if delayed_attention:
         assert worker.lookup(prompt_len, hashes).hit_length == 0
         # No new Mamba handoff or physical block allocation accompanies this save.
-        req.token_len_chunk = fa_end
+        req.token_len_chunk = attention_end
         req.boundary_state_offloads = None
         req.store_job_id = None
         _run_store_req(thread, req)
 
-    fa_db, mamba_db = worker.token_dbs
-    assert stored[fa_db.key_for(hashes[fa_end // hash_size - 1])] == [
-        0x1000 + fa_blocks[(fa_end - 1) // block_size] * 256
+    attention_db, mamba_db = worker.token_dbs
+    assert stored[attention_db.key_for(hashes[attention_end // hash_size - 1])] == [
+        0x1000 + attention_blocks[(attention_end - 1) // attention_block_size] * 256
     ]
     assert stored[mamba_db.key_for(hashes[checkpoint // hash_size - 1])] == [
         0x2000 + 7 * 256
@@ -3792,7 +3835,7 @@ def test_saved_fa_tail_makes_eagle_mamba_checkpoint_reusable(
     assert worker.lookup(prompt_len, hashes).hit_length == checkpoint
     full_hashes = {
         maybe_convert_block_hash(hashes[end // hash_size - 1])
-        for end in range(block_size, fa_end + 1, block_size)
+        for end in range(attention_block_size, attention_end + 1, attention_block_size)
     }
     for call in thread.update_kv_event.call_args_list:
         assert all(set(event.block_hashes) <= full_hashes for event in call.args[0])

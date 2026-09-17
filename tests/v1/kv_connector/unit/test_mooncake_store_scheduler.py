@@ -391,15 +391,30 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     assert tracker.num_saved_tokens == 48
 
 
-@pytest.mark.parametrize("completed_tokens", [35, 36, 37])
-def test_prefill_saves_new_hash_boundary_without_new_physical_block(completed_tokens):
-    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    hashes = [b"h" + bytes([i]) for i in range(9)]
+@pytest.mark.parametrize(
+    ("block_size", "hash_size", "prompt_len", "completed_tokens", "save_end"),
+    [
+        (16, 4, 37, 35, None),
+        (16, 4, 37, 36, 36),
+        (16, 4, 37, 37, 36),
+        (32, 16, 49, 47, None),
+        (32, 16, 49, 48, 48),
+        (32, 16, 49, 49, 48),
+    ],
+)
+def test_prefill_saves_new_hash_boundary_without_new_physical_block(
+    block_size, hash_size, prompt_len, completed_tokens, save_end
+):
+    scheduler = _make_bare_scheduler(
+        hash_block_size=hash_size, enable_partial_hash_hits=True
+    )
+    scheduler._block_size = block_size
+    hashes = [b"h" + bytes([i]) for i in range(prompt_len // hash_size)]
     _add_unfinished_request(
         scheduler,
-        token_ids=list(range(37)),
+        token_ids=list(range(prompt_len)),
         block_hashes=hashes,
-        prefill_end_tokens=37,
+        prefill_end_tokens=prompt_len,
     )
     tracker = scheduler._request_trackers["req-0"]
     tracker.token_len = tracker.num_saved_tokens = 32
@@ -412,11 +427,11 @@ def test_prefill_saves_new_hash_boundary_without_new_physical_block(completed_to
 
     meta = scheduler.build_connector_meta(output)
 
-    if completed_tokens < 36:
+    if save_end is None:
         assert meta.requests == []
     else:
         (req_meta,) = meta.requests
-        assert req_meta.token_len_chunk == 36
+        assert req_meta.token_len_chunk == save_end
         assert req_meta.boundary_state_offloads is None
         assert scheduler._pinned_saves[req_meta.store_job_id][0] == [1, 2, 3]
 
