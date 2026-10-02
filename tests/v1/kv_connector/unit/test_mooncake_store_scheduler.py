@@ -43,6 +43,7 @@ def _make_bare_scheduler(
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
+    scheduler.client = _StubLookupClient(hit_tokens=0)
     scheduler.enable_lookup = True
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
@@ -822,6 +823,11 @@ class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
         self.num_tokens: list[int] = []
+        self.prefetch_probes: list[str] = []
+        self.discarded: list[str] = []
+
+    def discard(self, req_id):
+        self.discarded.append(req_id)
 
     def lookup(
         self,
@@ -829,9 +835,76 @@ class _StubLookupClient:
         num_tokens: int,
         block_hashes: list[bytes],
         non_block: bool = False,
+        *,
+        prefetch: bool = False,
     ) -> MooncakeLookupResult:
-        self.num_tokens.append(num_tokens)
+        if prefetch:
+            assert non_block
+            self.prefetch_probes.append(req_id)
+        else:
+            self.num_tokens.append(num_tokens)
         return MooncakeLookupResult(self._hit_tokens)
+
+
+def _make_admission_request(request_id="req-0"):
+    return SimpleNamespace(
+        request_id=request_id,
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+
+def test_admission_lookup_waits_to_create_load_until_local_hit_is_known():
+    scheduler = _make_bare_scheduler()
+    scheduler.lookup_async = scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    request = _make_admission_request()
+
+    scheduler.on_new_request(request)
+
+    assert scheduler.client.prefetch_probes == [request.request_id]
+    assert scheduler.load_specs == {}
+    assert scheduler._unfinished_requests == {}
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+    assert scheduler.load_specs[request.request_id].vllm_cached_tokens == 16
+    assert scheduler.load_specs[request.request_id].can_load is False
+
+
+@pytest.mark.parametrize("option", ["sync", "disabled", "short", "no_hash"])
+def test_admission_lookup_skips_ineligible_requests(option):
+    scheduler = _make_bare_scheduler()
+    scheduler.lookup_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    request = _make_admission_request()
+    if option == "sync":
+        scheduler.lookup_async = False
+    elif option == "disabled":
+        scheduler.enable_lookup = False
+    elif option == "short":
+        request.num_tokens = 12
+    else:
+        request.block_hashes = []
+
+    scheduler.on_new_request(request)
+
+    assert scheduler.client.prefetch_probes == []
+
+
+@pytest.mark.parametrize("preempted", [False, True])
+def test_admission_lookup_is_discarded_on_finish_or_preemption(preempted):
+    scheduler = _make_bare_scheduler()
+    scheduler.lookup_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    request = _make_admission_request()
+    scheduler.on_new_request(request)
+    output = _make_preemption_scheduler_output()
+    if not preempted:
+        output.preempted_req_ids = set()
+        output.finished_req_ids = {request.request_id}
+
+    scheduler.build_connector_meta(output)
+
+    assert scheduler.client.discarded == [request.request_id]
 
 
 def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
