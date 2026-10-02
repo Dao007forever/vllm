@@ -707,7 +707,7 @@ def test_admission_lookup_retains_completed_result_until_scheduled():
     vllm_config = create_vllm_config(
         kv_connector="MooncakeStoreConnector",
         kv_role="kv_both",
-        kv_connector_extra_config={"lookup_async": True},
+        kv_connector_extra_config={"lookup_async": True, "lookup_prefetch_limit": 1},
     )
     with (
         set_current_vllm_config(vllm_config),
@@ -753,9 +753,11 @@ def _make_lookup_client(extra_config=None):
     return client, make_socket.return_value
 
 
-@pytest.mark.parametrize("limit", [0, 1])
+@pytest.mark.parametrize("limit", [None, 0, 1])
 def test_lookup_prefetch_cap_keeps_normal_scheduler_probes_available(limit):
-    client, sock = _make_lookup_client({"lookup_prefetch_limit": limit})
+    client, sock = _make_lookup_client(
+        {} if limit is None else {"lookup_prefetch_limit": limit}
+    )
     gate = threading.Event()
     sock.recv.side_effect = _gated_recv(gate, 32)
     try:
@@ -778,7 +780,7 @@ def test_lookup_prefetch_cap_keeps_normal_scheduler_probes_available(limit):
 
 @pytest.mark.parametrize("change", ["tokens", "hash", "expired", "cached_expired"])
 def test_lookup_client_refreshes_changed_or_expired_query(monkeypatch, change):
-    client, sock = _make_lookup_client()
+    client, sock = _make_lookup_client({"lookup_prefetch_limit": 1})
     sock.recv.return_value = (32).to_bytes(4, "big")
     clock = [0.0]
     monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
@@ -835,7 +837,7 @@ def test_normal_pending_lookup_is_not_restarted_by_result_cache_ttl(monkeypatch)
 
 
 def test_reset_clears_cached_async_results():
-    client, sock = _make_lookup_client()
+    client, sock = _make_lookup_client({"lookup_prefetch_limit": 1})
     sock.recv.return_value = (32).to_bytes(4, "big")
     try:
         client.lookup("req", 48, [], non_block=True, prefetch=True)

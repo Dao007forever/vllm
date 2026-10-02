@@ -2528,7 +2528,7 @@ class LookupKeyClient:
         self._num_prefetches = 0
         assert vllm_config.kv_transfer_config is not None
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self._prefetch_limit = extra_config.get("lookup_prefetch_limit", 64)
+        self._prefetch_limit = extra_config.get("lookup_prefetch_limit", 0)
         self._lookup_ttl_s = extra_config.get("lookup_prefetch_ttl_s", 2.0)
 
     def _lookup(
