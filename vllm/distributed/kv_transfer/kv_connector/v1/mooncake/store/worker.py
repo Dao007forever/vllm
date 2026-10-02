@@ -2531,6 +2531,16 @@ class LookupKeyClient:
         resp = self.socket.recv()
         return decode_lookup_response(resp)
 
+    def submit_lookup(
+        self, req_id: str, num_tokens: int, block_hashes: list[BlockHash]
+    ) -> Future[MooncakeLookupResult]:
+        """Submit once and retain the result until lookup() consumes it."""
+        future = self.futures.get(req_id)
+        if future is None:
+            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+            self.futures[req_id] = future
+        return future
+
     def lookup(
         self,
         req_id: str,
@@ -2540,10 +2550,7 @@ class LookupKeyClient:
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
-        future = self.futures.get(req_id)
-        if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
-            self.futures[req_id] = future
+        future = self.submit_lookup(req_id, num_tokens, block_hashes)
         if non_block and not future.done():
             return None
         try:

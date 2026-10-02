@@ -3,6 +3,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -699,6 +700,42 @@ def _gated_recv(gate: threading.Event, value: int):
         return value.to_bytes(4, "big")
 
     return recv
+
+
+def test_admission_lookup_retains_completed_result_until_scheduled():
+    """A fast admission lookup must not be consumed or submitted twice."""
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"lookup_async": True},
+    )
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, _make_kv_cache_config()
+        )
+    request = SimpleNamespace(
+        request_id="req1", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+    )
+    mock_make_socket.return_value.recv.return_value = (32).to_bytes(4, "big")
+    try:
+        connector.on_new_request(request)
+        sched = connector.connector_scheduler
+        assert sched is not None
+        future = sched.client.futures[request.request_id]
+        assert future.result(timeout=5).hit_length == 32
+        connector.on_new_request(request)
+        assert sched.load_specs == {}
+        assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
+        assert mock_make_socket.return_value.send_multipart.call_count == 1
+        assert request.request_id not in sched.client.futures
+    finally:
+        connector.shutdown()
 
 
 def test_lookup_key_client_non_block_lookup_async():
