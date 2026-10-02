@@ -43,9 +43,7 @@ def _make_bare_scheduler(
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
-    scheduler.lookup_prefetch_limit = 64
-    scheduler.lookup_prefetch_ttl_s = 2.0
-    scheduler._admission_lookups = {}
+    scheduler.client = _StubLookupClient(hit_tokens=0)
     scheduler.enable_lookup = True
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
@@ -825,11 +823,8 @@ class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
         self.num_tokens: list[int] = []
-        self.submitted: list[str] = []
+        self.prefetch_probes: list[str] = []
         self.discarded: list[str] = []
-
-    def submit_lookup(self, req_id, num_tokens, block_hashes):
-        self.submitted.append(req_id)
 
     def discard(self, req_id):
         self.discarded.append(req_id)
@@ -840,8 +835,14 @@ class _StubLookupClient:
         num_tokens: int,
         block_hashes: list[bytes],
         non_block: bool = False,
+        *,
+        prefetch: bool = False,
     ) -> MooncakeLookupResult:
-        self.num_tokens.append(num_tokens)
+        if prefetch:
+            assert non_block
+            self.prefetch_probes.append(req_id)
+        else:
+            self.num_tokens.append(num_tokens)
         return MooncakeLookupResult(self._hit_tokens)
 
 
@@ -860,18 +861,16 @@ def test_admission_lookup_waits_to_create_load_until_local_hit_is_known():
     request = _make_admission_request()
 
     scheduler.on_new_request(request)
-    scheduler.on_new_request(request)
 
-    assert scheduler.client.submitted == [request.request_id]
+    assert scheduler.client.prefetch_probes == [request.request_id]
     assert scheduler.load_specs == {}
     assert scheduler._unfinished_requests == {}
     assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
     assert scheduler.load_specs[request.request_id].vllm_cached_tokens == 16
     assert scheduler.load_specs[request.request_id].can_load is False
-    assert scheduler._admission_lookups == {}
 
 
-@pytest.mark.parametrize("option", ["sync", "disabled", "limit", "short", "no_hash"])
+@pytest.mark.parametrize("option", ["sync", "disabled", "short", "no_hash"])
 def test_admission_lookup_skips_ineligible_requests(option):
     scheduler = _make_bare_scheduler()
     scheduler.lookup_async = True
@@ -881,8 +880,6 @@ def test_admission_lookup_skips_ineligible_requests(option):
         scheduler.lookup_async = False
     elif option == "disabled":
         scheduler.enable_lookup = False
-    elif option == "limit":
-        scheduler.lookup_prefetch_limit = 0
     elif option == "short":
         request.num_tokens = 12
     else:
@@ -890,51 +887,7 @@ def test_admission_lookup_skips_ineligible_requests(option):
 
     scheduler.on_new_request(request)
 
-    assert scheduler.client.submitted == []
-    assert scheduler._admission_lookups == {}
-
-
-def test_admission_lookup_limit_leaves_scheduler_lookup_available():
-    scheduler = _make_bare_scheduler()
-    scheduler.lookup_async = scheduler.load_async = True
-    scheduler.lookup_prefetch_limit = 1
-    scheduler.client = _StubLookupClient(hit_tokens=32)
-    scheduler.on_new_request(_make_admission_request())
-    request = _make_admission_request("req-1")
-    scheduler.on_new_request(request)
-
-    assert scheduler.client.submitted == ["req-0"]
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
-    assert scheduler.client.num_tokens == [48]
-    scheduler.get_num_new_matched_tokens(_make_admission_request(), 0)
-    scheduler.on_new_request(_make_admission_request("req-2"))
-    assert scheduler.client.submitted == ["req-0", "req-2"]
-
-
-@pytest.mark.parametrize("change", ["tokens", "hash", "expired"])
-def test_admission_lookup_discards_changed_or_expired_query(monkeypatch, change):
-    scheduler = _make_bare_scheduler()
-    scheduler.lookup_async = scheduler.load_async = True
-    scheduler.client = _StubLookupClient(hit_tokens=32)
-    request = _make_admission_request()
-    clock = [0.0]
-    monkeypatch.setattr(
-        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler."
-        "time.monotonic",
-        lambda: clock[0],
-    )
-    scheduler.on_new_request(request)
-    if change == "tokens":
-        request.num_tokens += 1
-    elif change == "hash":
-        request.block_hashes[-1] = b"different-tail"
-    else:
-        clock[0] = 3.0
-
-    scheduler.get_num_new_matched_tokens(request, 0)
-
-    assert scheduler.client.discarded == [request.request_id]
-    assert scheduler._admission_lookups == {}
+    assert scheduler.client.prefetch_probes == []
 
 
 @pytest.mark.parametrize("preempted", [False, True])
@@ -952,7 +905,6 @@ def test_admission_lookup_is_discarded_on_finish_or_preemption(preempted):
     scheduler.build_connector_meta(output)
 
     assert scheduler.client.discarded == [request.request_id]
-    assert scheduler._admission_lookups == {}
 
 
 def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():

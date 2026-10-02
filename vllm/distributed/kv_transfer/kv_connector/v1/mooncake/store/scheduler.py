@@ -5,8 +5,6 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
-import time
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -64,9 +62,6 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
-        self.lookup_prefetch_limit = kvc_extra_config.get("lookup_prefetch_limit", 64)
-        self.lookup_prefetch_ttl_s = kvc_extra_config.get("lookup_prefetch_ttl_s", 2.0)
-        self._admission_lookups: dict[str, tuple[float, tuple[int, int, bytes]]] = {}
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
@@ -120,15 +115,6 @@ class MooncakeStoreScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
 
-    @staticmethod
-    def _lookup_signature(request: Request) -> tuple[int, int, bytes]:
-        # Block hashes form a cumulative chain; its last hash identifies it.
-        return (
-            request.num_tokens,
-            len(request.block_hashes),
-            bytes(request.block_hashes[-1]) if request.block_hashes else b"",
-        )
-
     def on_new_request(self, request: Request) -> None:
         """Start a bounded async lookup without allocating KV or creating a load."""
         align = (
@@ -139,16 +125,14 @@ class MooncakeStoreScheduler:
             or not self.lookup_async
             or request.num_tokens < align
             or not request.block_hashes
-            or request.request_id in self._admission_lookups
-            or len(self._admission_lookups) >= self.lookup_prefetch_limit
         ):
             return
-        self.client.submit_lookup(
-            request.request_id, request.num_tokens, request.block_hashes
-        )
-        self._admission_lookups[request.request_id] = (
-            time.monotonic(),
-            self._lookup_signature(request),
+        self.client.lookup(
+            request.request_id,
+            request.num_tokens,
+            request.block_hashes,
+            non_block=True,
+            prefetch=True,
         )
 
     def get_num_new_matched_tokens(
@@ -163,16 +147,6 @@ class MooncakeStoreScheduler:
         """
         if not self.enable_lookup:
             return 0, False
-
-        admission = self._admission_lookups.get(request.request_id)
-        if admission is not None:
-            submitted_at, signature = admission
-            if (
-                signature != self._lookup_signature(request)
-                or time.monotonic() - submitted_at > self.lookup_prefetch_ttl_s
-            ):
-                self._admission_lookups.pop(request.request_id)
-                self.client.discard(request.request_id)
 
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
@@ -191,7 +165,6 @@ class MooncakeStoreScheduler:
         if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
-        self._admission_lookups.pop(request.request_id, None)
         num_external_hit_tokens = lookup_result.hit_length
 
         if num_external_hit_tokens < num_computed_tokens:
@@ -265,7 +238,6 @@ class MooncakeStoreScheduler:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
-            self._admission_lookups.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -273,8 +245,7 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
-            if self._admission_lookups.pop(req_id, None) is not None:
-                self.client.discard(req_id)
+            self.client.discard(req_id)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
