@@ -395,3 +395,44 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
             assert (view[b].view(torch.int8) == 1).all(), layout
     zero_bytes = int((raw == 0).sum().item())
     assert zero_bytes == num_layers * spec.page_size_bytes, layout
+
+
+def test_split_cross_layer_segments_zero_only_their_block():
+    """With block rows holding both layers, each layer's segments cover only
+    its own kernel pages of the block, never the next block's row."""
+    device = torch.device("cpu")
+    num_blocks, num_layers, ppl = 3, 2, 4
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    caches = dense_kv_cache_views(
+        raw, spec, num_blocks, num_layers, KVCacheLayout.BLHNC, kernel_block_size=4
+    )
+    layer_names = [f"layer.{i}" for i in range(num_layers)]
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[AttentionGroup(None, layer_names, spec, 0)],
+        kernel_block_sizes=[4],
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=cache)
+            for name, cache in zip(layer_names, caches)
+        },
+        num_blocks=num_blocks,
+    )
+    assert zeroer._meta is not None
+    seg_addrs, seg_block_strides, seg_page_sizes, *_ = zeroer._meta
+
+    row_bytes = num_layers * spec.page_size_bytes
+    for block_id in range(num_blocks):
+        zeroed: set[int] = set()
+        for addr, stride, page in zip(
+            seg_addrs.tolist(), seg_block_strides.tolist(), seg_page_sizes.tolist()
+        ):
+            start = addr - raw.data_ptr() + block_id * stride * 4
+            zeroed.update(range(start, start + page * 4))
+        assert zeroed == set(range(block_id * row_bytes, (block_id + 1) * row_bytes))
+    assert len(seg_addrs) == num_layers * ppl

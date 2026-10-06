@@ -89,6 +89,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
+    require_compact_kernel_block_ids,
 )
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
@@ -1398,6 +1399,7 @@ class NixlBaseConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
+        require_compact_kernel_block_ids(kv_caches.values(), "NixlConnector")
         use_layer_name_routing = self._requires_layer_name_routing()
         route_packed_layers = self._has_packed_cache and use_layer_name_routing
         self.transfer_topo = TransferTopology(

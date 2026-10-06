@@ -31,6 +31,7 @@ class BlockTables:
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
+        kernel_slots_per_block: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -56,6 +57,12 @@ class BlockTables:
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
         ]
+        # Kernel block id spacing between consecutive manager blocks; equals
+        # blocks_per_kv_block unless manager blocks are not dense pages.
+        if kernel_slots_per_block is None:
+            kernel_slots_per_block = list(self.blocks_per_kv_block)
+        assert len(kernel_slots_per_block) == self.num_kv_cache_groups
+        self.kernel_slots_per_block = kernel_slots_per_block
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
@@ -128,7 +135,8 @@ class BlockTables:
             block_ids = new_block_ids[i]
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
-                block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+                spb = self.kernel_slots_per_block[i]
+                block_ids = [b * spb + k for b in block_ids for k in range(bpk)]
             if self.redirect_writes_to_null_block:
                 block_ids = [0] * len(block_ids)
             end = start + len(block_ids)

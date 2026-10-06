@@ -15,7 +15,7 @@ import pytest
 import torch
 
 import vllm.v1.hisparse.binding as attn_utils_module
-from tests.v1.attention.utils import dense_kv_cache_views
+from tests.v1.attention.utils import dense_kv_cache_tensor, dense_kv_cache_views
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
@@ -23,6 +23,7 @@ from vllm.v1.hisparse.binding import allocate_hisparse_kv_caches
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     HiSparseResidentSpec,
+    KernelBlockGeometry,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -30,7 +31,11 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SparseCacheRole,
     compute_layout_strides,
+    get_kernel_block_geometry,
+    group_kernel_blocks,
+    require_compact_kernel_block_ids,
 )
+from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.gpu.attn_utils import (
     FastPrefillHelper,
@@ -42,6 +47,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
+    prepare_kernel_slots_per_block,
 )
 
 
@@ -633,9 +639,11 @@ def test_copy_kv_cache_blocks_separate_head_groups():
     "layout,num_layers",
     [
         (KVCacheLayout.LBHNC, 2),
-        # Splitting needs a manager block to be one dense page, which a
-        # block-outermost layout only gives when the block holds one layer.
         (KVCacheLayout.BLHNC, 1),
+        # Block rows hold both layers, so kernel block ids skip the other
+        # layer's page.
+        (KVCacheLayout.BLHNC, 2),
+        (KVCacheLayout.BLNHC, 2),
     ],
 )
 def test_copy_kv_cache_blocks_with_virtual_block_splitting(
@@ -658,11 +666,16 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
         layout,
         kernel_block_size=spec.block_size // physical_per_logical,
     )
+    blocks = [group_kernel_blocks(cache, num_blocks) for cache in caches]
 
-    for layer_idx, cache in enumerate(caches):
-        for block_idx in range(cache.shape[0]):
-            cache[block_idx].fill_(100 * layer_idx + block_idx)
-    expected = [[cache[i].clone() for i in range(cache.shape[0])] for cache in caches]
+    for layer_idx, layer_blocks in enumerate(blocks):
+        assert layer_blocks.shape[:2] == (num_blocks, physical_per_logical)
+        for block_idx in range(num_blocks):
+            for physical_idx in range(physical_per_logical):
+                layer_blocks[block_idx, physical_idx].fill_(
+                    100 * layer_idx + 10 * block_idx + physical_idx
+                )
+    expected = [layer_blocks.clone() for layer_blocks in blocks]
 
     copy_kv_cache_blocks_inplace(
         caches,
@@ -670,11 +683,162 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
         [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)],
     )
 
-    dst_start = 2 * physical_per_logical
+    for layer_idx, layer_blocks in enumerate(blocks):
+        want = expected[layer_idx].clone()
+        want[2] = expected[layer_idx][0]
+        torch.testing.assert_close(layer_blocks, want)
+
+
+@pytest.mark.parametrize("layout", [KVCacheLayout.BLHNC, KVCacheLayout.BLNHC])
+def test_split_cross_layer_views_cover_each_kernel_page_once(layout: KVCacheLayout):
+    """Kernel ids skip the other layer's page, so the layers' views tile the
+    buffer exactly once and each block keeps its own row."""
+    num_blocks, num_layers, ppl = 3, 2, 4
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    caches = dense_kv_cache_views(
+        raw, spec, num_blocks, num_layers, layout, kernel_block_size=16 // ppl
+    )
+
+    slots_per_block = num_layers * ppl
+    row_bytes = num_layers * spec.page_size_bytes
     for layer_idx, cache in enumerate(caches):
-        for physical_idx in range(physical_per_logical):
-            torch.testing.assert_close(
-                cache[dst_start + physical_idx], expected[layer_idx][physical_idx]
+        assert get_kernel_block_geometry(cache, num_blocks) == KernelBlockGeometry(
+            ppl, slots_per_block
+        )
+        assert cache.shape[0] == (num_blocks - 1) * slots_per_block + ppl
+        layer_blocks = group_kernel_blocks(cache, num_blocks)
+        for block_idx in range(num_blocks):
+            assert (
+                layer_blocks[block_idx].data_ptr() - raw.data_ptr()
+                == block_idx * row_bytes + layer_idx * spec.page_size_bytes
+            )
+        layer_blocks += 1
+
+    assert torch.equal(raw.view(torch.float32), torch.ones(raw.numel() // 4))
+
+
+def test_split_padded_pages_skip_the_padding():
+    num_blocks, ppl = 3, 2
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+        page_size_padded=96,  # 64-byte page + 32 bytes = one kernel page of padding
+    )
+    raw = torch.zeros(num_blocks * spec.page_size_bytes, dtype=torch.int8)
+    (cache,) = dense_kv_cache_views(
+        raw, spec, num_blocks, 1, KVCacheLayout.LBHNC, kernel_block_size=4 // ppl
+    )
+
+    assert get_kernel_block_geometry(cache, num_blocks) == KernelBlockGeometry(ppl, 3)
+    group_kernel_blocks(cache, num_blocks).fill_(1)
+
+    rows = raw.view(torch.float32).view(num_blocks, -1)
+    real = spec.real_page_size_bytes // 4
+    assert torch.equal(rows[:, :real], torch.ones(num_blocks, real))
+    assert torch.equal(rows[:, real:], torch.zeros_like(rows[:, real:]))
+
+
+@pytest.mark.parametrize(
+    "layout,page_size_padded,num_kv_heads",
+    [
+        # 80 bytes is not a multiple of the 32-byte kernel block.
+        (KVCacheLayout.LBHNC, 80, 1),
+        # Heads sit outside the block, so a kernel block is not one byte run.
+        (KVCacheLayout.LHBNC, None, 2),
+    ],
+)
+def test_split_rejects_blocks_off_the_kernel_block_grid(
+    layout: KVCacheLayout, page_size_padded: int | None, num_kv_heads: int
+):
+    num_blocks = 3
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=num_kv_heads,
+        head_size=2,
+        dtype=torch.float32,
+        page_size_padded=page_size_padded,
+    )
+    raw = torch.zeros(num_blocks * 2 * spec.page_size_bytes, dtype=torch.int8)
+    with pytest.raises(ValueError, match="kernel block"):
+        dense_kv_cache_views(raw, spec, num_blocks, 1, layout, kernel_block_size=2)
+
+
+@pytest.mark.parametrize(
+    "layout,rejected",
+    [(KVCacheLayout.LBHNC, False), (KVCacheLayout.BLHNC, True)],
+)
+def test_compact_only_consumers_reject_spaced_kernel_ids(
+    layout: KVCacheLayout, rejected: bool
+):
+    num_blocks, num_layers = 3, 2
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=2, dtype=torch.float32
+    )
+    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    caches = dense_kv_cache_views(
+        raw, spec, num_blocks, num_layers, layout, kernel_block_size=2
+    )
+    if rejected:
+        with pytest.raises(NotImplementedError, match="TestConnector"):
+            require_compact_kernel_block_ids(caches, "TestConnector")
+    else:
+        require_compact_kernel_block_ids(caches, "TestConnector")
+
+
+def test_block_table_kernel_ids_address_their_pages():
+    """Block table ids from the per-group spacing land on each layer's pages."""
+    layout = KVCacheLayout.BLHNC
+    num_blocks, ppl, kernel_block_size = 3, 4, 4
+    layers = ["layer.0", "layer.1"]
+    spec = FullAttentionSpec(
+        block_size=ppl * kernel_block_size,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    size = num_blocks * len(layers) * spec.page_size_bytes
+    tensor = dense_kv_cache_tensor(
+        torch.empty(size, dtype=torch.int8),
+        spec,
+        num_blocks,
+        len(layers),
+        layout,
+        layer_names=layers,
+    )
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[tensor],
+        kv_cache_groups=[KVCacheGroupSpec(layers, spec)],
+    )
+
+    (slots_per_block,) = prepare_kernel_slots_per_block(
+        config, [kernel_block_size], layout
+    )
+    assert slots_per_block == len(layers) * ppl
+    kernel_ids = BlockTable.map_to_kernel_blocks(
+        np.array([2, 0]), ppl, np.arange(ppl).reshape(1, -1), slots_per_block
+    )
+    assert kernel_ids.tolist() == [16, 17, 18, 19, 0, 1, 2, 3]
+
+    caches = allocate_kv_cache(config, torch.device("cpu"), layout, [kernel_block_size])
+    base = caches[layers[0]].data_ptr()
+    kernel_page_bytes = spec.page_size_bytes // ppl
+    row_bytes = len(layers) * spec.page_size_bytes
+    for layer_idx, layer in enumerate(layers):
+        for i, kernel_id in enumerate(kernel_ids.tolist()):
+            block_id, page_idx = [2, 0][i // ppl], i % ppl
+            assert caches[layer][kernel_id].data_ptr() - base == (
+                block_id * row_bytes
+                + layer_idx * spec.page_size_bytes
+                + page_idx * kernel_page_bytes
             )
 
 
