@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_layout import (
     SingleRunStrategy,
     Staged,
     Unsupported,
+    block_ratio_plan,
     complement,
     composition,
     head_range,
@@ -286,32 +287,51 @@ def test_mla_pages_are_one_run():
     assert isinstance(SingleRunStrategy().choose(mla), Direct)
 
 
-# ------------------------------------------------- staged fix-up equivalence
+# ---------------------------------------------------------- fix-up executor
 
 
-def _receive_staged(plan, pages, tokens, heads, head_dim):
-    """Apply the staged runs: each source page lands whole in the block."""
-    block = torch.empty(tokens * heads * head_dim, dtype=torch.int64)
-    for (src, dst, n), src_page in zip(plan.runs, pages):
-        block[dst * head_dim : (dst + n) * head_dim] = src_page.reshape(-1)[
+def _hnd_pages(truth, heads_per_page, tokens_per_page):
+    """Split a logical [H, N, D] block into HND pages of the given size."""
+    pages = []
+    for h in range(0, truth.shape[0], heads_per_page):
+        for t in range(0, truth.shape[1], tokens_per_page):
+            pages.append(
+                truth[h : h + heads_per_page, t : t + tokens_per_page].contiguous()
+            )
+    return pages
+
+
+def _receive(runs, pages, numel, head_dim):
+    """Land each page whole at its staged offset (in head-token units)."""
+    block = torch.full((numel,), -1, dtype=torch.int64)
+    for (src, dst, n), page in zip(runs, pages):
+        block[dst * head_dim : (dst + n) * head_dim] = page.reshape(-1)[
             src * head_dim : (src + n) * head_dim
         ]
     return block
 
 
-def test_staged_transpose_fixup_matches_legacy_postprocess():
-    """Direct runs and the staged copy plus the planner's permute must leave
-    the same NHD block, and the legacy HND -> NHD helper must agree.
+def _caches(order, tokens, heads, head_dim, received):
+    """A logical [B, H, N, D] view over a physical block that holds ``received``,
+    plus the physical tensor, for either page order."""
+    if order == "HND":
+        phys = torch.empty(1, heads, tokens, head_dim, dtype=torch.int64)
+        phys.reshape(-1)[:] = received
+        return phys, phys
+    phys = torch.empty(1, tokens, heads, head_dim, dtype=torch.int64)
+    phys.reshape(-1)[:] = received
+    return phys, phys.permute(0, 2, 1, 3)
 
-    Fan-in: D0 (NHD, 4 heads) reads P0 and P1 (HND, 2 heads each).
-    """
-    from vllm.distributed.kv_transfer.kv_connector.utils import (
-        kv_postprocess_layout_on_receive,
-    )
+
+def test_apply_local_permute_transpose_hn_on_logical_nhd_view():
+    """Fan-in of HND pages into an NHD cache: the staged copy plus the
+    planner's permute leaves the same bytes as direct runs, applied through
+    the logical [B, H, N, D] view NIXL registers."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import apply_local_permute
 
     tokens, heads, head_dim = 16, 4, 8
     truth = torch.arange(heads * tokens * head_dim).reshape(heads, tokens, head_dim)
-    p_pages = [truth[0:2].contiguous(), truth[2:4].contiguous()]  # HND pages
+    pages = _hnd_pages(truth, 2, tokens)
     pairs = [
         plan_pair(
             KVPage.attention(tokens, 2, 2 * p, "HND"),
@@ -321,27 +341,58 @@ def test_staged_transpose_fixup_matches_legacy_postprocess():
     ]
     plan = staged_plan(pairs)
     assert plan.fixup.kind == "transpose_hn"
-    expected = truth.permute(1, 0, 2).contiguous()  # physical NHD block
 
-    # Direct: every run lands in its final place.
-    direct = torch.empty_like(expected).reshape(-1)
-    for pair, src_page in zip(pairs, p_pages):
+    direct = torch.empty(truth.numel(), dtype=torch.int64)
+    for pair, page in zip(pairs, pages):
         for src, dst, n in pair.runs:
-            direct[dst * head_dim : (dst + n) * head_dim] = src_page.reshape(-1)[
+            direct[dst * head_dim : (dst + n) * head_dim] = page.reshape(-1)[
                 src * head_dim : (src + n) * head_dim
             ]
-    assert torch.equal(direct.reshape(expected.shape), expected)
+    received = _receive(plan.runs, pages, truth.numel(), head_dim)
+    phys, cache = _caches("NHD", tokens, heads, head_dim, received)
+    apply_local_permute(cache, torch.tensor([0]), plan.fixup)
+    assert torch.equal(phys.reshape(-1), direct)
+    assert torch.equal(cache[0], truth)
 
-    # Staged: whole pages, then the planner's permute of the received block.
-    received = _receive_staged(plan, p_pages, tokens, heads, head_dim)
-    dims = plan.fixup.view_dims + (head_dim,)
-    perm = plan.fixup.perm + (len(plan.fixup.perm),)
-    fixed = received.reshape(dims).permute(perm).reshape(expected.shape)
-    assert torch.equal(fixed, expected)
 
-    # The legacy helper is the same transpose, applied to the block in its
-    # physical [B, N, H, D] order (its documented source/target shapes).
-    phys = torch.empty(1, tokens, heads, head_dim, dtype=torch.int64)
-    phys.reshape(-1)[:] = received
-    kv_postprocess_layout_on_receive(phys, torch.tensor([0]))
-    assert torch.equal(phys[0], expected)
+@pytest.mark.parametrize("dst_order", ["HND", "NHD"])
+def test_apply_local_permute_block_ratio(dst_order):
+    """A block of 16 tokens receives four HND pages of 4 tokens landed one
+    after another; the planner's block-ratio permute puts every token of
+    every head where the page expects it."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import apply_local_permute
+
+    tokens, heads, head_dim, ratio = 16, 2, 8, 4
+    truth = torch.arange(heads * tokens * head_dim).reshape(heads, tokens, head_dim)
+    dst = KVPage.attention(tokens, heads, 0, dst_order)
+    fixup = block_ratio_plan("HND", dst, ratio)
+    assert fixup.kind == (
+        "block_ratio" if dst_order == "HND" else "block_ratio_transpose_hn"
+    )
+    pages = _hnd_pages(truth, heads, tokens // ratio)
+    chunk = heads * tokens // ratio
+    received = _receive(
+        [(0, i * chunk, chunk) for i in range(ratio)], pages, truth.numel(), head_dim
+    )
+    phys, cache = _caches(dst_order, tokens, heads, head_dim, received)
+    apply_local_permute(cache, torch.tensor([0]), fixup)
+    assert torch.equal(cache[0], truth)
+
+
+def test_block_ratio_same_order_pages_need_no_permute():
+    """NHD pages landed in token order already form an NHD block, and a
+    single-head (MLA) block never needs a permute whatever the orders."""
+    assert block_ratio_plan("NHD", KVPage.attention(16, 4, 0, "NHD"), 4).is_identity
+    assert block_ratio_plan(
+        "HND", KVPage.attention(64, 1, 0, "NHD", unit=656), 2
+    ).is_identity
+    assert not block_ratio_plan("HND", KVPage.attention(16, 4, 0, "HND"), 4).is_identity
+
+
+def test_strategy_allows_only_executable_fixups():
+    nixl_default = SingleRunStrategy(frozenset({"identity", "block_ratio"}))
+    hnd_hnd = block_ratio_plan("HND", KVPage.attention(16, 2, 0, "HND"), 2)
+    hnd_nhd = block_ratio_plan("HND", KVPage.attention(16, 2, 0, "NHD"), 2)
+    assert nixl_default.allows(hnd_hnd)
+    assert not nixl_default.allows(hnd_nhd)
+    assert SingleRunStrategy(frozenset({"block_ratio_transpose_hn"})).allows(hnd_nhd)

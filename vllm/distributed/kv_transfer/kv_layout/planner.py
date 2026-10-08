@@ -55,6 +55,7 @@ class KVPage:
 
     layout: Layout
     head_lo: int
+    order: PageOrder | None = None
 
     @classmethod
     def attention(
@@ -71,7 +72,7 @@ class KVPage:
             stride = (1, unit * local_heads, unit)
         else:
             raise ValueError(f"unknown page order {order!r}")
-        return cls(Layout((unit, tokens, local_heads), stride), head_lo)
+        return cls(Layout((unit, tokens, local_heads), stride), head_lo, order)
 
     @property
     def unit(self) -> int:
@@ -177,6 +178,7 @@ class LocalPermute:
     shape: tuple[int, ...]
     staging: Layout
     actual: Layout
+    tag: str = "general"
 
     @property
     def is_identity(self) -> bool:
@@ -202,28 +204,26 @@ class LocalPermute:
 
     @property
     def kind(self) -> str:
-        """Which fix-up kernel is needed.
+        """Which fix-up is needed: ``identity`` when the received order already
+        is the page's order, else the ``tag`` the planner attached
+        (``transpose_hn``, ``block_ratio``, ``block_ratio_transpose_hn`` or
+        ``general``)."""
+        return "identity" if self.is_identity else self.tag
 
-        ``identity``: none. ``transpose_hn``: the whole block changes from heads
-        outer to tokens outer (HND → NHD). ``general``: anything else.
-        """
-        if self.is_identity:
-            return "identity"
-        # Modes are (unit, token, head modes...); build the two page orders
-        # over the same modes and compare coalesced forms.
-        unit, tokens, heads = self.shape[0], self.shape[1], self.shape[2:]
-        hnd = [1, unit]
-        nhd = [1, unit * prod(heads)]
-        for i, h in enumerate(heads):
-            hnd.append(unit * tokens * prod(heads[:i]))
-            nhd.append(unit * prod(heads[:i]))
-        staging, actual = self.staging.coalesce(), self.actual.coalesce()
-        if (
-            staging == Layout(self.shape, tuple(hnd)).coalesce()
-            and actual == Layout(self.shape, tuple(nhd)).coalesce()
-        ):
-            return "transpose_hn"
-        return "general"
+
+def _is_transpose_hn(shape: tuple[int, ...], staging: Layout, actual: Layout) -> bool:
+    """Staging is the whole block in HND order and the page wants NHD, over
+    modes (unit, token, head modes...)."""
+    unit, tokens, heads = shape[0], shape[1], shape[2:]
+    hnd = [1, unit]
+    nhd = [1, unit * prod(heads)]
+    for i in range(len(heads)):
+        hnd.append(unit * tokens * prod(heads[:i]))
+        nhd.append(unit * prod(heads[:i]))
+    return (
+        staging.coalesce() == Layout(shape, tuple(hnd)).coalesce()
+        and actual.coalesce() == Layout(shape, tuple(nhd)).coalesce()
+    )
 
 
 @dataclass(frozen=True)
@@ -277,9 +277,33 @@ def staged_plan(pairs: Sequence[PairPlan]) -> StagedPlan | None:
             dst_layout.stride[2] * k,
         ),
     )
-    return StagedPlan(
-        tuple(ordered), runs, LocalPermute((unit, tokens, k, n_src), staging, actual)
-    )
+    shape = (unit, tokens, k, n_src)
+    tag = "transpose_hn" if _is_transpose_hn(shape, staging, actual) else "general"
+    return StagedPlan(tuple(ordered), runs, LocalPermute(shape, staging, actual, tag))
+
+
+def block_ratio_plan(src_order: PageOrder, dst: KVPage, ratio: int) -> LocalPermute:
+    """The fix-up for a destination block that receives ``ratio`` source pages
+    of ``tokens / ratio`` tokens each, holding the destination's heads in the
+    source's page order, landed one after another in token order.
+
+    Modes are (unit, token within a source page, head, which source page).
+    """
+    if dst.tokens % ratio:
+        raise ValueError(f"{dst.tokens} tokens do not split into {ratio} pages")
+    kb = dst.tokens // ratio
+    chunk = KVPage.attention(kb, dst.local_heads, dst.head_lo, src_order, dst.unit)
+    cs, ds = chunk.layout.stride, dst.layout.stride
+    shape = (dst.unit, kb, dst.local_heads, ratio)
+    staging = Layout(shape, (cs[0], cs[1], cs[2], chunk.size))
+    actual = Layout(shape, (ds[0], ds[1], ds[2], ds[1] * kb))
+    if dst.order == src_order:
+        tag = "block_ratio"
+    elif src_order == "HND" and dst.order == "NHD":
+        tag = "block_ratio_transpose_hn"
+    else:
+        tag = "general"
+    return LocalPermute(shape, staging, actual, tag)
 
 
 @dataclass(frozen=True)
@@ -320,6 +344,10 @@ class SingleRunStrategy:
     def __init__(self, supported_fixups: frozenset[str] = frozenset({"identity"})):
         self.supported_fixups = supported_fixups
 
+    def allows(self, fixup: LocalPermute) -> bool:
+        """Whether the receiver can execute this fix-up after a staged copy."""
+        return fixup.kind in self.supported_fixups
+
     def choose(self, pairs: Sequence[PairPlan]) -> Direct | Staged | Unsupported:
         if not pairs:
             return Unsupported("no source rank shares a KV head with this rank")
@@ -333,7 +361,7 @@ class SingleRunStrategy:
                 f"{worst.dst.layout} and not one run in {worst.src.layout}: "
                 "heads are not contiguous on either side"
             )
-        if plan.fixup.kind not in self.supported_fixups:
+        if not self.allows(plan.fixup):
             return Unsupported(
                 f"shared heads are {worst.num_runs} runs of {worst.run_len} units; "
                 f"staging would need a {plan.fixup.kind!r} permute "
