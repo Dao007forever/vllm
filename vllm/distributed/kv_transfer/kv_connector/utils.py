@@ -15,6 +15,7 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_layout import LocalPermute
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
@@ -240,85 +241,25 @@ def copy_kv_blocks(
         copy_fn(src_tensor, dst_tensor, src_indices, dst_indices)
 
 
-def kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio):
-    """Transforms the layout of received KV cache blocks to the local block_size.
-    (Only works for local blocksize > remote blocksize)
+def apply_local_permute(
+    cache: torch.Tensor, indices: torch.Tensor, fixup: LocalPermute
+) -> None:
+    """Reorder the received blocks ``indices`` of ``cache`` in place.
 
-    Example:
-    local blocksize = 16 tokens, remote blocksize = 4 tokens
-    local block[0] = remote block[0, 1, 2, 3]
-    remote is |h0-b0|h1-b0|h2-b0|h3-b0|h0-b1|h1-b1|h2-b1|h3-b1|...
-    local is  |h0-b0..................|h1-b0..................|...
-    permute is to:
-    1. view => view remote as n_blocks * remote_shape(H,remoteN,D)
-    2. permute => (H, nblocks, remoteN, D)
-    3. flatten => (H, localN, D)
-
+    ``cache`` is a per-layer view whose first dimension is the block. Its
+    physical order is read from its strides, so a logical ``[B, H, N, C]``
+    view with NHD strides is handled the same as a physically ordered tensor.
+    The transfer left each block's bytes laid out as ``fixup.staging``; they
+    are viewed as ``fixup.view_dims`` plus the per-head-token payload,
+    transposed by ``fixup.perm`` and written back in the page's order.
     """
-    blocks_to_update = cache.index_select(0, indices)
-    # use physical order
-    blocks_to_update = blocks_to_update.permute(0, 2, 1, 3)
-    n_kv_heads, block_size, head_size = blocks_to_update.shape[1:]
-    remote_block_size = block_size // block_size_ratio
-    n_blocks = block_size_ratio
-
-    permuted_blocks = (
-        blocks_to_update.reshape(-1, n_blocks, n_kv_heads, remote_block_size, head_size)
-        .permute(0, 2, 1, 3, 4)
-        .flatten(2, 3)
-    )
-    permuted_blocks = permuted_blocks.permute(0, 2, 1, 3)
-    cache.index_copy_(0, indices, permuted_blocks)
-
-
-def kv_postprocess_layout_on_receive(cache, indices):
-    """Transforms the layout of received KV cache blocks to the local format.
-
-    This method corrects layout mismatches from direct memory copies by
-    permuting the tensor dimensions.
-
-    4D cache:
-    - **Source Layout:** `[num_blocks, n_kv_head, block_size, head_dim]`
-    - **Target Layout:** `[num_blocks, block_size, n_kv_head, head_dim]`
-    5D cache:
-    - **Source Layout:** `[num_blocks, kv_dim, n_kv_head, block_size, head_dim]`
-    - **Target Layout:** `[num_blocks, kv_dim, block_size, n_kv_head, head_dim]`
-
-    Implementation:
-    - x = blocks_to_update.reshape(src_shape) # view local kv with sender layout
-    - permuted_blocks = x.permute(*inv_order) # transpose n_kv_heads, block_size
-    - cache.index_copy_(0, indices, permuted_blocks) # copy permuted kv back
-
-    """
-    blocks_to_update = cache.index_select(0, indices)
-    target_shape = list(blocks_to_update.shape)
-    target_shape[0] = -1
-    inv_order = [0, 1, 3, 2, 4] if blocks_to_update.ndim == 5 else [0, 2, 1, 3]
-    src_shape = tuple(target_shape[i] for i in inv_order)
-    blocks_to_update = cache.index_select(0, indices)
-    permuted_blocks = blocks_to_update.reshape(src_shape).permute(*inv_order)
-    cache.index_copy_(0, indices, permuted_blocks)
-
-
-def kv_postprocess_blksize_and_layout_on_receive(cache, indices, block_size_ratio):
-    """Transforms the layout of received KV cache to the local block_size and LBHNC.
-    (Only works for local blocksize > remote blocksize)
-
-    prefill is LBHNC, smaller block_size
-    decode(local) is LBNHC, larger block_size
-    """
-    blocks_to_update = cache.index_select(0, indices)
-
-    block_size, n_kv_heads, head_size = blocks_to_update.shape[1:]
-    remote_block_size = block_size // block_size_ratio
-    n_blocks = block_size_ratio
-
-    permuted_blocks = (
-        blocks_to_update.reshape(-1, n_blocks, n_kv_heads, remote_block_size, head_size)
-        .permute(0, 1, 3, 2, 4)
-        .flatten(1, 2)
-    )
-    cache.index_copy_(0, indices, permuted_blocks)
+    strides = cache.stride()
+    order = sorted(range(1, cache.ndim), key=lambda d: -strides[d])
+    physical = cache.permute(0, *order)
+    blocks = physical.index_select(0, indices)
+    staged = blocks.reshape(blocks.shape[0], *fixup.view_dims, -1)
+    fixed = staged.permute(0, *(d + 1 for d in fixup.perm), staged.ndim - 1)
+    physical.index_copy_(0, indices, fixed.reshape(blocks.shape))
 
 
 def yield_req_data(
