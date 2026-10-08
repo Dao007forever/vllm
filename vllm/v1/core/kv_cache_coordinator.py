@@ -10,6 +10,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashList,
     KVCacheBlock,
     eagle_proof_margin,
     partial_hash_hits_enabled,
@@ -622,6 +623,156 @@ class SpecGroup(NamedTuple):
     use_eagle: bool
 
 
+class HitLookupGroup(NamedTuple):
+    """A spec group and the cache it is looked up in.
+
+    ``block_pool`` is the GPU ``BlockPool`` for core lookups or any object with
+    the same ``get_cached_block`` (e.g. an external store's existence set).
+    ``block_size`` is the effective token span of a block after DCP/PCP.
+    """
+
+    spec: KVCacheSpec
+    group_ids: list[int]
+    manager_cls: type[SingleTypeKVCacheManager]
+    use_eagle: bool
+    block_pool: BlockPool
+    block_size: int
+    dcp_world_size: int = 1
+    pcp_world_size: int = 1
+    retains_longer_hit: bool = False
+
+
+def find_hybrid_cache_hit(
+    groups: Sequence[HitLookupGroup],
+    num_kv_cache_groups: int,
+    block_hashes: BlockHashList,
+    max_cache_hit_length: int,
+    hash_block_size: int,
+    alignment_tokens: int,
+    enable_partial_hash_hits: bool,
+    apply_eagle: bool = True,
+) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
+    """Find the longest hit every group accepts, by iterating to a fixed point.
+
+    Each attention type either accepts the current candidate length or
+    reduces it. If any type reduces the length, restart checks over all
+    types. This converges because length monotonically decreases and is
+    bounded below by 0. Full attention, when present, must come first.
+
+    ``apply_eagle=False`` skips the EAGLE drop, for callers whose length was
+    already dropped by an earlier lookup.
+
+    Returns:
+        A tuple containing:
+            - The cache hit blocks for each KV cache group.
+            - The number of tokens of the reconciled (combined) cache hit.
+            - ``num_uncached_common_prefix_tokens``: a shared prefix that a
+              sparse-retention group has not cached yet.
+
+    """
+    hit_length = max_cache_hit_length
+    longest_hit_length = 0
+    hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_kv_cache_groups
+    hit_length_by_group: list[int] = [0] * num_kv_cache_groups
+
+    # Simple hybrid (1 full attn + 1 other): one iteration suffices.
+    is_simple_hybrid = len(groups) == 2 and isinstance(
+        groups[0].spec, FullAttentionSpec
+    )
+
+    # Attention-group indices whose EAGLE drop is verified at the current
+    # ``curr_hit_length``. Each eagle group applies the drop at most once
+    # per candidate length (see issue #32802).
+    eagle_verified: set[int] = set()
+
+    while True:
+        curr_hit_length = hit_length
+
+        for idx, group in enumerate(groups):
+            first_group_id = group.group_ids[0]
+            cached_blocks = hit_blocks_by_group[first_group_id]
+            if isinstance(group.spec, FullAttentionSpec) and cached_blocks is not None:
+                # Full attention is downward-closed: we only need to look
+                # up cached blocks once; on subsequent iterations just trim
+                # to the (reduced) current hit length.
+                curr_hit_length = min(
+                    curr_hit_length, hit_length_by_group[first_group_id]
+                )
+                continue
+
+            drop_eagle_block = (
+                apply_eagle and group.use_eagle and idx not in eagle_verified
+            )
+
+            _max_length = curr_hit_length
+            # Eagle matches one extra drop unit (one hash unit for
+            # fine-grained managers, else one cache block) and then drops
+            # it, landing back at the candidate length. No margin for
+            # mamba: its finder never drops (draft models have no mamba
+            # layers), so a widened bound would match past the
+            # attention-verified hit and resume from speculative state (#43559).
+            if drop_eagle_block and not isinstance(group.spec, MambaSpec):
+                eagle_margin = eagle_proof_margin(
+                    group.block_size,
+                    hash_block_size,
+                    enable_partial_hash_hits
+                    and group.manager_cls.supports_fine_grained_hash_lookup,
+                )
+                _max_length = min(
+                    curr_hit_length + eagle_margin,
+                    len(block_hashes) * hash_block_size,
+                )
+            hit_blocks, _new_hit_length = group.manager_cls.find_longest_cache_hit(
+                block_hashes=block_hashes,
+                max_length=_max_length,
+                kv_cache_group_ids=group.group_ids,
+                block_pool=group.block_pool,
+                kv_cache_spec=group.spec,
+                drop_eagle_block=drop_eagle_block,
+                alignment_tokens=alignment_tokens,
+                dcp_world_size=group.dcp_world_size,
+                pcp_world_size=group.pcp_world_size,
+            )
+            if drop_eagle_block:
+                eagle_verified.add(idx)
+            elif _new_hit_length < curr_hit_length:
+                # length shrunk; invalidate previous eagle verifications
+                eagle_verified.clear()
+            curr_hit_length = _new_hit_length
+            for group_id, blocks in zip(group.group_ids, hit_blocks):
+                hit_blocks_by_group[group_id] = blocks
+                hit_length_by_group[group_id] = _new_hit_length
+
+            longest_hit_length = max(longest_hit_length, curr_hit_length)
+
+        if curr_hit_length >= hit_length:
+            break
+        hit_length = curr_hit_length
+        if is_simple_hybrid:
+            break
+
+    # Truncate every full-attention group (target and draft) blocks
+    # to final hit_length. cdiv keeps a partial tail block when hit_length is
+    # not block-aligned.
+    for group in groups:
+        if not isinstance(group.spec, FullAttentionSpec) or group.retains_longer_hit:
+            continue
+        num_blocks = cdiv(hit_length, group.block_size)
+        for group_id in group.group_ids:
+            if (blks := hit_blocks_by_group[group_id]) is not None:
+                del blks[num_blocks:]
+                hit_length_by_group[group_id] = hit_length
+
+    # Uncached shared prefix detection: if any attn. group cached a longer
+    # prefix than the reconciled hit, it is an uncached common prefix across
+    # requests that a sparse-retention group hasn't cached yet.
+    num_uncached_common_prefix_tokens = longest_hit_length - hit_length
+    cache_hit_blocks = tuple(
+        blocks if blocks is not None else [] for blocks in hit_blocks_by_group
+    )
+    return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
+
+
 class HybridKVCacheCoordinator(KVCacheCoordinator):
     """KV cache coordinator for hybrid models with multiple KV cache types, and
     thus multiple kv cache groups.
@@ -828,137 +979,37 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
-        """Find the longest cache hit using an iterative fixed-point algorithm.
-
-        Each attention type either accepts the current candidate length or
-        reduces it. If any type reduces the length, restart checks over all
-        types. This converges because length monotonically decreases and is
-        bounded below by 0.
-
-        Args:
-            block_hashes: The block hashes of the request.
-            max_cache_hit_length: The maximum length of the cache hit.
-
-        Returns:
-            A tuple containing:
-                - A tuple of the cache hit blocks for each single type manager.
-                - The number of tokens of the reconciled (combined) cache hit.
-                - ``num_uncached_common_prefix_tokens``: a shared prefix that a
-                  sparse-retention group has not cached yet (0 unless hybrid).
-
-        """
-        num_groups = len(self.kv_cache_config.kv_cache_groups)
-        hit_length = max_cache_hit_length
-        longest_hit_length = 0
-        hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
-        hit_length_by_group: list[int] = [0] * num_groups
-
-        # Simple hybrid (1 full attn + 1 other): one iteration suffices.
-        # Full attn is always first if it exists.
-        is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
-            self.attention_groups[0].spec, FullAttentionSpec
+        """Find the longest hit all groups accept; see ``find_hybrid_cache_hit``."""
+        return find_hybrid_cache_hit(
+            self._hit_lookup_groups(),
+            len(self.kv_cache_config.kv_cache_groups),
+            block_hashes,
+            max_cache_hit_length,
+            hash_block_size=self.hash_block_size,
+            alignment_tokens=self._cache_hit_alignment_tokens,
+            enable_partial_hash_hits=self.enable_partial_hash_hits,
         )
 
-        # Attention-group indices whose EAGLE drop is verified at the current
-        # ``curr_hit_length``. Each eagle group applies the drop at most once
-        # per candidate length (see issue #32802).
-        eagle_verified: set[int] = set()
-
-        while True:
-            curr_hit_length = hit_length
-
-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
-                self.attention_groups
-            ):
-                first_group_id = group_ids[0]
-                # DCP/PCP shard each block's KV across ranks, so the manager's
-                # effective block size may exceed the spec's.
-                group_block_size = self.single_type_managers[first_group_id].block_size
-                cached_blocks = hit_blocks_by_group[first_group_id]
-                if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
-                    # Full attention is downward-closed: we only need to look
-                    # up cached blocks once; on subsequent iterations just trim
-                    # to the (reduced) current hit length.
-                    curr_hit_length = min(
-                        curr_hit_length, hit_length_by_group[first_group_id]
-                    )
-                    continue
-
-                drop_eagle_block = use_eagle and idx not in eagle_verified
-
-                _max_length = curr_hit_length
-                # Eagle matches one extra drop unit (one hash unit for
-                # fine-grained managers, else one cache block) and then drops
-                # it, landing back at the candidate length. No margin for
-                # mamba: its finder never drops (draft models have no mamba
-                # layers), so the hit would grow past the candidate.
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
-                    eagle_margin = eagle_proof_margin(
-                        group_block_size,
-                        self.hash_block_size,
-                        self.enable_partial_hash_hits
-                        and manager_cls.supports_fine_grained_hash_lookup,
-                    )
-                    _max_length = min(
-                        curr_hit_length + eagle_margin,
-                        len(block_hashes) * self.hash_block_size,
-                    )
-                hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
-                    block_hashes=block_hashes,
-                    max_length=_max_length,
-                    kv_cache_group_ids=group_ids,
-                    block_pool=self.single_type_managers[first_group_id].block_pool,
-                    kv_cache_spec=spec,
-                    drop_eagle_block=drop_eagle_block,
-                    alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=self.single_type_managers[
-                        first_group_id
-                    ].dcp_world_size,
-                    pcp_world_size=self.single_type_managers[
-                        first_group_id
-                    ].pcp_world_size,
+    def _hit_lookup_groups(self) -> list[HitLookupGroup]:
+        groups = []
+        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+            # DCP/PCP shard each block's KV across ranks, so the manager's
+            # effective block size may exceed the spec's.
+            manager = self.single_type_managers[group_ids[0]]
+            groups.append(
+                HitLookupGroup(
+                    spec=spec,
+                    group_ids=group_ids,
+                    manager_cls=manager_cls,
+                    use_eagle=use_eagle,
+                    block_pool=manager.block_pool,
+                    block_size=manager.block_size,
+                    dcp_world_size=manager.dcp_world_size,
+                    pcp_world_size=manager.pcp_world_size,
+                    retains_longer_hit=manager.retains_longer_hit,
                 )
-                if drop_eagle_block:
-                    eagle_verified.add(idx)
-                elif _new_hit_length < curr_hit_length:
-                    # length shrunk; invalidate previous eagle verifications
-                    eagle_verified.clear()
-                curr_hit_length = _new_hit_length
-                for group_id, blocks in zip(group_ids, hit_blocks):
-                    hit_blocks_by_group[group_id] = blocks
-                    hit_length_by_group[group_id] = _new_hit_length
-
-                longest_hit_length = max(longest_hit_length, curr_hit_length)
-
-            if curr_hit_length >= hit_length:
-                break
-            hit_length = curr_hit_length
-            if is_simple_hybrid:
-                break
-
-        # Truncate every full-attention group (target and draft) blocks
-        # to final hit_length.
-        for group in self.attention_groups:
-            if not isinstance(group.spec, FullAttentionSpec):
-                continue
-            manager = self.single_type_managers[group.group_ids[0]]
-            if manager.retains_longer_hit:
-                continue
-            group_block_size = manager.block_size
-            num_blocks = cdiv(hit_length, group_block_size)
-            for group_id in group.group_ids:
-                if (blks := hit_blocks_by_group[group_id]) is not None:
-                    del blks[num_blocks:]
-                    hit_length_by_group[group_id] = hit_length
-
-        # Uncached shared prefix detection: if any attn. group cached a longer
-        # prefix than the reconciled hit, it is an uncached common prefix across
-        # requests that a sparse-retention group hasn't cached yet.
-        num_uncached_common_prefix_tokens = longest_hit_length - hit_length
-        cache_hit_blocks = tuple(
-            blocks if blocks is not None else [] for blocks in hit_blocks_by_group
-        )
-        return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
+            )
+        return groups
 
     def find_longest_cache_hit_per_group(
         self,

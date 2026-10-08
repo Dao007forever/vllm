@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import HitLookupGroup, find_hybrid_cache_hit
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -77,7 +78,7 @@ class ExternalCachedBlockPool:
 
 
 class MooncakeStoreCoordinator:
-    """Mirror of ``HybridKVCacheCoordinator.find_longest_cache_hit`` over an
+    """Runs the core hybrid hit search (``find_hybrid_cache_hit``) over an
     ``ExternalCachedBlockPool``."""
 
     def __init__(
@@ -374,8 +375,7 @@ class MooncakeStoreCoordinator:
         *,
         apply_eagle: bool = True,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        """Mirrors HybridKVCacheCoordinator.find_longest_cache_hit but
-        dispatches via spec_manager_map (we don't allocate managers).
+        """Run the core hybrid hit search over the external existence set.
 
         When ``apply_eagle`` is False, ignore each group's ``use_eagle`` —
         used by ``load_mask`` to avoid popping a second block on top of the
@@ -403,89 +403,28 @@ class MooncakeStoreCoordinator:
                 blocks_by_group[gid] = blks
             return tuple(blocks_by_group), hit_length
 
-        num_groups = len(self.kv_cache_groups)
-        hit_length = max_length
-        hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
-        hit_length_by_group: list[int] = [0] * num_groups
-
-        is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
-            self.attention_groups[0].spec, FullAttentionSpec
-        )
-        eagle_verified: set[int] = set()
-
-        while True:
-            curr_hit_length = hit_length
-
-            for idx, (spec, group_ids, manager_cls, group_eagle) in enumerate(
-                self.attention_groups
-            ):
-                first_group_id = group_ids[0]
-                cached = hit_blocks_by_group[first_group_id]
-                if isinstance(spec, FullAttentionSpec) and cached is not None:
-                    curr_hit_length = min(
-                        curr_hit_length, hit_length_by_group[first_group_id]
-                    )
-                    continue
-
-                drop_eagle_block = (
-                    apply_eagle and group_eagle and idx not in eagle_verified
-                )
-                _max_length = curr_hit_length
-                # No eagle peek margin for a recurrent (Mamba) group: its finder
-                # never drops a block, so a widened bound would match past the
-                # attention-verified hit and resume from speculative state (#43559).
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
-                    eagle_margin = eagle_proof_margin(
-                        spec.block_size,
-                        self.hash_block_size,
-                        self.enable_partial_hash_hits
-                        and manager_cls.supports_fine_grained_hash_lookup,
-                    )
-                    _max_length = min(
-                        curr_hit_length + eagle_margin,
-                        len(block_hashes) * self.hash_block_size,
-                    )
-                hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
-                    block_hashes=block_hashes,  # type: ignore[arg-type]
-                    max_length=_max_length,
-                    kv_cache_group_ids=group_ids,
+        hit_blocks, hit_length, _ = find_hybrid_cache_hit(
+            [
+                HitLookupGroup(
+                    spec=spec,
+                    group_ids=group_ids,
+                    manager_cls=manager_cls,
+                    use_eagle=group_eagle,
                     block_pool=cast(BlockPool, cached_block_pool),
-                    kv_cache_spec=spec,
-                    drop_eagle_block=drop_eagle_block,
-                    alignment_tokens=alignment_tokens,
+                    # Specs are already DCP-resolved.
+                    block_size=spec.block_size,
                 )
-                if drop_eagle_block:
-                    eagle_verified.add(idx)
-                elif _new_hit_length < curr_hit_length:
-                    eagle_verified.clear()
-                curr_hit_length = _new_hit_length
-                for gid, blocks in zip(group_ids, hit_blocks, strict=True):
-                    hit_blocks_by_group[gid] = blocks
-                    hit_length_by_group[gid] = _new_hit_length
-
-            if curr_hit_length >= hit_length:
-                break
-            hit_length = curr_hit_length
-            if is_simple_hybrid:
-                break
-
-        # Truncate full-attention hit_blocks to final converged length;
-        # other specs already trim themselves inside their hit logic. cdiv keeps
-        # the partial tail block when hit_length is not block-aligned.
-        for group in self.attention_groups:
-            if not isinstance(group.spec, FullAttentionSpec):
-                continue
-            num_blocks = cdiv(hit_length, group.spec.block_size)
-            for group_id in group.group_ids:
-                full_blks = hit_blocks_by_group[group_id]
-                assert full_blks is not None
-                del full_blks[num_blocks:]
-                hit_length_by_group[group_id] = hit_length
-
-        return (
-            tuple(blks if blks is not None else [] for blks in hit_blocks_by_group),
-            hit_length,
+                for spec, group_ids, manager_cls, group_eagle in self.attention_groups
+            ],
+            len(self.kv_cache_groups),
+            block_hashes,  # type: ignore[arg-type]
+            max_length,
+            hash_block_size=self.hash_block_size,
+            alignment_tokens=alignment_tokens,
+            enable_partial_hash_hits=self.enable_partial_hash_hits,
+            apply_eagle=apply_eagle,
         )
+        return hit_blocks, hit_length
 
 
 def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
