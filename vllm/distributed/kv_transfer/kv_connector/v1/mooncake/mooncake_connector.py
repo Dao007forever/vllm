@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    require_compact_kernel_block_ids,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.request import RequestStatus
@@ -1972,6 +1973,7 @@ class MooncakeConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
+        require_compact_kernel_block_ids(kv_caches.values(), "MooncakeConnector")
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
 
         kv_data_ptrs: list[int] = []

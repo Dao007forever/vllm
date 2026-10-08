@@ -234,6 +234,7 @@ from .utils import (
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
+    prepare_kernel_slots_per_block,
     sanity_check_mm_encoder_outputs,
 )
 
@@ -719,6 +720,7 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        self._init_kernel_slots_per_block = [1]
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
         self.cp_kv_cache_interleave_size = (
@@ -7177,9 +7179,15 @@ class GPUModelRunner(
             )
             max_num_blocks.append(max_num_blocks_per_req)
 
+        kernel_slots_per_block = prepare_kernel_slots_per_block(
+            kv_cache_config,
+            kernel_block_sizes,
+            self.cache_config.get_resolved_kv_cache_layout(),
+        )
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
+            or kernel_slots_per_block != self._init_kernel_slots_per_block
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
             or self.cp_kv_cache_interleave_size
@@ -7187,6 +7195,7 @@ class GPUModelRunner(
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
+            self._init_kernel_slots_per_block = kernel_slots_per_block
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
             self.cp_kv_cache_interleave_size = (
@@ -7211,6 +7220,7 @@ class GPUModelRunner(
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
+                    kernel_slots_per_block=kernel_slots_per_block,
                 )
 
         assert self._init_block_sizes == block_sizes, (

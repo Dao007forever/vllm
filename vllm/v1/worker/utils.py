@@ -26,7 +26,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, _get_per_layer_spec
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -37,7 +37,10 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    compute_kernel_block_geometry,
     create_kv_cache_views,
+    get_kernel_block_geometry,
+    group_kernel_blocks,
 )
 from vllm.v1.worker.block_table import get_block_table_width
 
@@ -170,16 +173,12 @@ class KVBlockZeroer:
                     continue
                 dp = kv.data_ptr()
 
-                assert kv.shape[0] % num_blocks == 0, (
-                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
-                )
-                ratio = kv.shape[0] // num_blocks
+                geometry = get_kernel_block_geometry(kv, num_blocks)
+                ratio = geometry.blocks_per_kv_block
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(0) * el
                 assert block_stride_bytes % 4 == 0
-                assert kv.shape[0] % ratio == 0
                 outer_dims = [
                     d
                     for d in range(1, kv.ndim)
@@ -191,7 +190,9 @@ class KVBlockZeroer:
                     (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
                 )
                 assert kernel_page_bytes % 4 == 0
-                logical_block_stride_bytes = block_stride_bytes * ratio
+                logical_block_stride_bytes = (
+                    block_stride_bytes * geometry.slots_per_block
+                )
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     assert (dp + off_bytes) % 4 == 0
@@ -526,6 +527,50 @@ def prepare_kernel_block_sizes(
     return kernel_block_sizes
 
 
+def prepare_kernel_slots_per_block(
+    kv_cache_config: KVCacheConfig,
+    kernel_block_sizes: list[int],
+    layout: KVCacheLayout,
+) -> list[int]:
+    """Kernel-block id spacing between consecutive manager blocks, per group.
+
+    Parallel to ``kernel_block_sizes``. A group's manager block ``b`` maps to kernel
+    block ids ``b * slots_per_block + j``. This equals the number of kernel blocks
+    per manager block unless the group's manager blocks are further apart than one
+    dense page (see :func:`compute_kernel_block_geometry`).
+    """
+    slots_per_block: list[int] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if isinstance(spec, EncoderOnlyAttentionSpec):
+            continue
+        kernel_block_size = kernel_block_sizes[len(slots_per_block)]
+        blocks_per_kv_block = spec.block_size // kernel_block_size
+        if blocks_per_kv_block == 1 or not isinstance(spec, AttentionSpec):
+            slots_per_block.append(blocks_per_kv_block)
+            continue
+        group_slots = {
+            compute_kernel_block_geometry(
+                _get_per_layer_spec(group, tensor.layers[0]),
+                tensor.block_stride,
+                layout,
+                kernel_block_size,
+            ).slots_per_block
+            for tensor in kv_cache_config.kv_cache_tensors
+            if tensor.layers[0] in group.layer_names
+        }
+        assert len(group_slots) <= 1, (
+            "Layers of one KV cache group need the same kernel block spacing, "
+            f"got {sorted(group_slots)}"
+        )
+        slots_per_block.append(
+            group_slots.pop() if group_slots else blocks_per_kv_block
+        )
+    return slots_per_block
+
+
 def sanity_check_mm_encoder_outputs(
     mm_embeddings: MultiModalEmbeddings,
     expected_num_items: int,
@@ -769,15 +814,11 @@ def copy_kv_cache_blocks_inplace(
         assert cache.device == indices.device
         src, dst = indices.unbind(dim=1)
 
-        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
-        assert remainder == 0, (
-            f"{cache.shape[0]} kernel blocks not divisible by "
-            f"{num_blocks} scheduler blocks"
-        )
+        geometry = get_kernel_block_geometry(cache, num_blocks)
         storage = cache.untyped_storage()
         storage_key = (cache.device, storage.data_ptr())
         scheduler_block_stride = (
-            cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+            cache.stride(0) * cache.element_size() * geometry.slots_per_block
         )
         if storage.nbytes() == num_blocks * scheduler_block_stride:
             if storage_key in copied_storages:
@@ -788,8 +829,8 @@ def copy_kv_cache_blocks_inplace(
             blocks = blocks.view(num_blocks, -1)
         else:
             # Fold virtual block splitting into the shape so that dim 0 counts
-            # scheduler blocks; unflatten of dim 0 is always a view.
-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+            # scheduler blocks; this is always a view.
+            blocks = group_kernel_blocks(cache, num_blocks)
         blocks[dst] = blocks[src]
 
 

@@ -66,6 +66,7 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        kernel_slots_per_block: int | None = None,
     ):
         """Args:
         block_size: Block size used for KV cache memory allocation
@@ -80,6 +81,10 @@ class BlockTable:
         slot_mapping_mode: How this cache group maps scheduled tokens to
             cache slots. Mamba-like state caches do not use token slot
             mappings and should use SlotMappingMode.NONE.
+        kernel_slots_per_block: Kernel block id spacing between consecutive
+            KV cache manager blocks. Defaults to the number of kernel blocks per
+            manager block (compact ids); larger when manager blocks are further
+            apart than one dense page, e.g. in block-outermost layouts.
 
         """
         self.max_num_reqs = max_num_reqs
@@ -108,6 +113,11 @@ class BlockTable:
             self.block_size = kernel_block_size
             self.blocks_per_kv_block = block_size // kernel_block_size
             self.use_hybrid_blocks = True
+
+        if kernel_slots_per_block is None:
+            kernel_slots_per_block = self.blocks_per_kv_block
+        assert kernel_slots_per_block >= self.blocks_per_kv_block
+        self.kernel_slots_per_block = kernel_slots_per_block
 
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
@@ -164,7 +174,10 @@ class BlockTable:
 
         if self.use_hybrid_blocks:
             block_ids = self.map_to_kernel_blocks(
-                np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange
+                np.array(block_ids),
+                self.blocks_per_kv_block,
+                self._kernel_block_arange,
+                self.kernel_slots_per_block,
             )
 
         num_blocks = len(block_ids)
@@ -240,8 +253,13 @@ class BlockTable:
         kv_manager_block_ids: np.ndarray,
         blocks_per_kv_block: int,
         kernel_block_arange: np.ndarray,
+        kernel_slots_per_block: int | None = None,
     ) -> np.ndarray:
         """Convert kv_manager_block_id IDs to kernel block IDs.
+
+        Manager block ``b`` maps to kernel blocks ``b * kernel_slots_per_block + j``
+        for ``j < blocks_per_kv_block``; ``kernel_slots_per_block`` defaults to
+        ``blocks_per_kv_block`` (compact ids).
 
         Example:
             # kv_manager_block_ids: 32 tokens,
@@ -258,9 +276,11 @@ class BlockTable:
         """
         if blocks_per_kv_block == 1:
             return kv_manager_block_ids
+        if kernel_slots_per_block is None:
+            kernel_slots_per_block = blocks_per_kv_block
 
         kernel_block_ids = (
-            kv_manager_block_ids.reshape(-1, 1) * blocks_per_kv_block
+            kv_manager_block_ids.reshape(-1, 1) * kernel_slots_per_block
             + kernel_block_arange
         )
 
@@ -300,6 +320,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        kernel_slots_per_block: list[int] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -311,6 +332,19 @@ class MultiGroupBlockTable:
         if len(slot_mapping_modes) != len(block_sizes):
             raise ValueError(
                 f"slot_mapping_modes length ({len(slot_mapping_modes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+
+        if kernel_slots_per_block is None:
+            kernel_slots_per_block = [
+                block_size // kernel_block_size
+                for block_size, kernel_block_size in zip(
+                    block_sizes, kernel_block_sizes
+                )
+            ]
+        if len(kernel_slots_per_block) != len(block_sizes):
+            raise ValueError(
+                f"kernel_slots_per_block length ({len(kernel_slots_per_block)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
@@ -342,14 +376,20 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                kernel_slots_per_block=slots_per_block,
             )
             for (
                 block_size,
                 kernel_block_size,
                 max_num_blocks_per_req,
                 slot_mapping_mode,
+                slots_per_block,
             ) in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                slot_mapping_modes,
+                kernel_slots_per_block,
             )
         ]
 

@@ -98,6 +98,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     is_full_attention_spec,
+    require_compact_kernel_block_ids,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
@@ -2330,6 +2331,7 @@ class MoRIIOConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in moriio."""
+        require_compact_kernel_block_ids(kv_caches.values(), "MoRIIOConnector")
         kv_caches = {
             layer_name: kv_cache
             for layer_name, kv_cache in kv_caches.items()

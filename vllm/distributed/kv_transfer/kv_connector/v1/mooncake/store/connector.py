@@ -44,7 +44,10 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    require_compact_kernel_block_ids,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -336,6 +339,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
+        require_compact_kernel_block_ids(kv_caches.values(), "MooncakeStoreConnector")
         self.connector_worker.register_kv_caches(kv_caches)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:

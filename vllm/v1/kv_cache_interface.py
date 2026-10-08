@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
@@ -287,16 +287,147 @@ class KVCacheSpec:
         return True
 
 
+@dataclass(frozen=True)
+class KernelBlockGeometry:
+    """How one layer's cache view splits each manager block into kernel blocks.
+
+    Manager block ``b`` holds kernel blocks ``b * slots_per_block + j`` for
+    ``j < blocks_per_kv_block``. When a block is one dense page the numbering is
+    compact (``slots_per_block == blocks_per_kv_block``). When the manager-block
+    stride is larger than the page (other layers' pages or page padding sit between
+    blocks), the remaining slots of each block row hold that other data, and kernel
+    block ids skip them.
+    """
+
+    blocks_per_kv_block: int
+    slots_per_block: int
+
+    def __post_init__(self) -> None:
+        assert 1 <= self.blocks_per_kv_block <= self.slots_per_block
+
+    @property
+    def is_compact(self) -> bool:
+        return self.slots_per_block == self.blocks_per_kv_block
+
+    def num_slots(self, num_blocks: int) -> int:
+        """Kernel slots a view needs to reach the last block's last kernel block."""
+        if num_blocks == 0:
+            return 0
+        return (num_blocks - 1) * self.slots_per_block + self.blocks_per_kv_block
+
+
+_KERNEL_BLOCK_GEOMETRY_ATTR = "_vllm_kernel_block_geometry"
+
+
+def get_kernel_block_geometry(
+    cache: torch.Tensor, num_blocks: int
+) -> KernelBlockGeometry:
+    """Kernel-block geometry of a layer cache view.
+
+    Views built by :func:`create_kv_cache_views` record their geometry. Any other
+    cache (host buffers, test tensors) must store manager blocks densely, so the
+    geometry follows from its shape.
+    """
+    geometry = getattr(cache, _KERNEL_BLOCK_GEOMETRY_ATTR, None)
+    if geometry is not None:
+        assert geometry.num_slots(num_blocks) == cache.shape[0], (
+            f"Cache has {cache.shape[0]} kernel slots, expected "
+            f"{geometry.num_slots(num_blocks)} for {num_blocks} blocks"
+        )
+        return geometry
+    ratio, remainder = divmod(cache.shape[0], num_blocks)
+    assert remainder == 0, (
+        f"{cache.shape[0]} kernel blocks not divisible by {num_blocks} blocks"
+    )
+    return KernelBlockGeometry(ratio, ratio)
+
+
+def require_compact_kernel_block_ids(kv_caches: Iterable[object], owner: str) -> None:
+    """Reject cache views whose kernel block ids skip slots between blocks.
+
+    For code that still maps manager block ``b`` to kernel blocks
+    ``b * blocks_per_kv_block + j``.
+    """
+    for cache in kv_caches:
+        geometry = getattr(cache, _KERNEL_BLOCK_GEOMETRY_ATTR, None)
+        if geometry is not None and not geometry.is_compact:
+            raise NotImplementedError(
+                f"{owner} requires KV cache blocks stored as dense pages when they "
+                f"are split into {geometry.blocks_per_kv_block} kernel blocks, but "
+                f"this KV cache layout spaces them {geometry.slots_per_block} "
+                "kernel blocks apart. Use a layer-compact layout (e.g. "
+                "VLLM_KV_CACHE_LAYOUT=LBNHC) or a --block-size the attention "
+                "backend supports directly."
+            )
+
+
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
     """View a kernel-block-granular layer cache with manager blocks as dim 0.
 
-    Kernel block splitting subdivides each manager block into uniformly strided
-    kernel blocks, so grouping is a pure view: ``(num_blocks * ratio, ...)``
+    Returns ``(num_blocks, blocks_per_kv_block, ...)`` when blocks are split, and
+    ``cache`` itself otherwise. Only this layer's kernel blocks are covered, even
+    when block rows also hold other layers' pages.
     """
     if cache.shape[0] == num_blocks:
         return cache
-    assert cache.shape[0] % num_blocks == 0
-    return cache.unflatten(0, (num_blocks, -1))
+    geometry = get_kernel_block_geometry(cache, num_blocks)
+    if geometry.is_compact:
+        return cache.unflatten(0, (num_blocks, -1))
+    return cache.as_strided(
+        (num_blocks, geometry.blocks_per_kv_block, *cache.shape[1:]),
+        (
+            cache.stride(0) * geometry.slots_per_block,
+            cache.stride(0),
+            *cache.stride()[1:],
+        ),
+    )
+
+
+def compute_kernel_block_geometry(
+    spec: KVCacheSpec,
+    block_stride: int,
+    layout: KVCacheLayout,
+    kernel_block_size: int | None,
+) -> KernelBlockGeometry:
+    """Kernel-block geometry for a layer whose manager blocks are ``block_stride``
+    bytes apart.
+
+    A kernel id must map to its kernel block with a single stride. When a manager
+    block is one dense page, consecutive blocks' kernel blocks are evenly spaced and
+    the ids are compact. Otherwise the kernel block size in bytes must divide the
+    block stride, so every kernel block still starts on a kernel-block-sized grid;
+    the ids then skip the grid slots that belong to other data.
+    """
+    blocks_per_kv_block = compute_layer_kv_cache_shape_bytes(
+        spec, 1, kernel_block_size
+    )[0]
+    if blocks_per_kv_block == 1:
+        return KernelBlockGeometry(1, 1)
+    dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
+    if block_stride == dense_page_size:
+        assert block_stride % blocks_per_kv_block == 0, (
+            f"Block stride {block_stride} must divide into "
+            f"{blocks_per_kv_block} equal kernel blocks."
+        )
+        return KernelBlockGeometry(blocks_per_kv_block, blocks_per_kv_block)
+    kernel_page_size = prod(
+        compute_layer_kv_cache_shape_bytes(spec, 1, kernel_block_size)[1:]
+    )
+    if (
+        not layout.is_block_compact
+        or kernel_page_size * blocks_per_kv_block != dense_page_size
+        or block_stride % kernel_page_size != 0
+    ):
+        raise ValueError(
+            f"The resolved KV cache layout ({layout.name}) stores blocks "
+            f"{block_stride} bytes apart, which is not a multiple of the "
+            f"{kernel_page_size}-byte kernel block, so a manager block cannot be "
+            f"split into {blocks_per_kv_block} kernel blocks of "
+            f"{kernel_block_size} tokens. Reduce --block-size to "
+            f"{kernel_block_size} or set VLLM_KV_CACHE_LAYOUT to a "
+            "layer-compact layout (e.g. LBNHC)."
+        )
+    return KernelBlockGeometry(blocks_per_kv_block, block_stride // kernel_page_size)
 
 
 def compute_layer_kv_cache_shape_bytes(
@@ -335,6 +466,9 @@ def compute_layout_strides(
     )
     order = layout.stride_order
     padded_page_size = getattr(spec, "page_size_padded", None)
+    if fixed_strides[_DIM_L] is not None and fixed_strides[_DIM_B] is not None:
+        # The page grid's strides are given, so padding has nothing to place.
+        padded_page_size = None
     if padded_page_size is not None:
         assert kernel_block_size is None or kernel_block_size == spec.block_size, (
             "Padded KV pages do not support kernel block splitting."
@@ -376,26 +510,14 @@ def create_kv_cache_views(
     shape_bytes = compute_layer_kv_cache_shape_bytes(
         spec, num_blocks, kernel_block_size
     )
-    ratio = shape_bytes[0] // num_blocks
-    if ratio > 1:
-        # Kernel blocks subdivide a manager block into `ratio` equal pieces, so
-        # they sit a constant stride apart only if a block is one dense page: no
-        # padding at its end, and no other layer's page before the next block.
-        dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
-        if block_stride != dense_page_size:
-            raise ValueError(
-                f"The resolved KV cache layout ({layout.name}) does not store "
-                "blocks as dense, unpadded pages (block stride "
-                f"{block_stride} != page {dense_page_size}), so a manager "
-                f"block cannot be split into {ratio} kernel blocks of "
-                f"{kernel_block_size} tokens. Reduce --block-size to "
-                f"{kernel_block_size} or set VLLM_KV_CACHE_LAYOUT to a "
-                "layer-compact layout (e.g. LBNHC)."
-            )
-        assert block_stride % ratio == 0, (
-            f"Block stride {block_stride} must divide into {ratio} equal kernel blocks."
-        )
-        block_stride //= ratio
+    geometry = compute_kernel_block_geometry(
+        spec, block_stride, layout, kernel_block_size
+    )
+    if geometry.blocks_per_kv_block > 1:
+        # Kernel blocks sit on a grid of `slots_per_block` slots per manager block;
+        # the view covers that grid up to the last block's last kernel block.
+        block_stride //= geometry.slots_per_block
+        shape_bytes = (geometry.num_slots(num_blocks), *shape_bytes[1:])
 
     logical_shape = (num_layers, *shape_bytes)
     strides = compute_layout_strides(
@@ -420,6 +542,8 @@ def create_kv_cache_views(
         cache_logical = view_5d[layer_idx]
         if dtype is not None:
             cache_logical = cache_logical.view(dtype)
+        if not geometry.is_compact:
+            setattr(cache_logical, _KERNEL_BLOCK_GEOMETRY_ATTR, geometry)
         views.append(cache_logical)
     return views
 
