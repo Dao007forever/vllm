@@ -3,6 +3,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -725,6 +726,154 @@ def _gated_recv(gate: threading.Event, value: int):
     return recv
 
 
+def test_admission_lookup_retains_completed_result_until_scheduled():
+    """A fast admission lookup must not be consumed or submitted twice."""
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"lookup_async": True, "lookup_prefetch_limit": 1},
+    )
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "worker.make_zmq_socket"
+        ) as mock_make_socket,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, _make_kv_cache_config()
+        )
+    request = SimpleNamespace(
+        request_id="req1", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+    )
+    mock_make_socket.return_value.recv.return_value = (32).to_bytes(4, "big")
+    try:
+        connector.on_new_request(request)
+        sched = connector.connector_scheduler
+        assert sched is not None
+        future = sched.client._lookups[request.request_id].future
+        assert future.result(timeout=5).hit_length == 32
+        connector.on_new_request(request)
+        assert sched.load_specs == {}
+        assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
+        assert mock_make_socket.return_value.send_multipart.call_count == 1
+        assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
+        assert mock_make_socket.return_value.send_multipart.call_count == 1
+    finally:
+        connector.shutdown()
+
+
+def _make_lookup_client(extra_config=None):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config=extra_config,
+    )
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+        "worker.make_zmq_socket"
+    ) as make_socket:
+        client = worker.LookupKeyClient(vllm_config)
+    return client, make_socket.return_value
+
+
+@pytest.mark.parametrize("limit", [None, 0, 1])
+def test_lookup_prefetch_cap_keeps_normal_scheduler_probes_available(limit):
+    client, sock = _make_lookup_client(
+        {} if limit is None else {"lookup_prefetch_limit": limit}
+    )
+    gate = threading.Event()
+    sock.recv.side_effect = _gated_recv(gate, 32)
+    try:
+        client.lookup("first", 48, [], non_block=True, prefetch=True)
+        assert client.lookup("next", 48, [], non_block=True, prefetch=True) is None
+        assert "next" not in client._lookups
+        assert client.lookup("next", 48, [], non_block=True) is None
+        assert "next" in client._lookups
+        if limit:
+            client.lookup("first", 48, [], non_block=True)
+            assert client._num_prefetches == 0
+            client.lookup("later", 48, [], non_block=True, prefetch=True)
+            assert client._num_prefetches == 1
+            client.discard("later")
+            assert client._num_prefetches == 0
+    finally:
+        gate.set()
+        client.close()
+
+
+@pytest.mark.parametrize("change", ["tokens", "hash", "expired", "cached_expired"])
+def test_lookup_client_refreshes_changed_or_expired_query(monkeypatch, change):
+    client, sock = _make_lookup_client({"lookup_prefetch_limit": 1})
+    sock.recv.return_value = (32).to_bytes(4, "big")
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    num_tokens, hashes = 48, [b"h0", b"h1", b"h2"]
+    try:
+        client.lookup("req", num_tokens, hashes, non_block=True, prefetch=True)
+        first = client._lookups["req"].future
+        assert first.result(timeout=5).hit_length == 32
+        assert (
+            client.lookup(
+                "req", num_tokens, hashes, non_block=True, prefetch=True
+            ).hit_length
+            == 32
+        )
+        if change == "tokens":
+            num_tokens += 1
+        elif change == "hash":
+            hashes[-1] = b"different-tail"
+        else:
+            if change == "cached_expired":
+                client.lookup("req", num_tokens, hashes, non_block=True)
+            clock[0] = 3.0
+
+        client.lookup("req", num_tokens, hashes, non_block=True)
+        refreshed = client._lookups["req"].future
+        assert refreshed is not first
+        assert refreshed.result(timeout=5).hit_length == 32
+        assert client.lookup("req", num_tokens, hashes, non_block=True).hit_length == 32
+        assert sock.send_multipart.call_count == 2
+        assert client._num_prefetches == 0
+    finally:
+        client.close()
+
+
+def test_normal_pending_lookup_is_not_restarted_by_result_cache_ttl(monkeypatch):
+    client, sock = _make_lookup_client()
+    gate = threading.Event()
+    sock.recv.side_effect = _gated_recv(gate, 32)
+    clock = [0.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+    try:
+        assert client.lookup("req", 48, [], non_block=True) is None
+        first = client._lookups["req"].future
+        clock[0] = 3.0
+        assert client.lookup("req", 48, [], non_block=True) is None
+        assert client._lookups["req"].future is first
+        gate.set()
+        assert first.result(timeout=5).hit_length == 32
+        assert client.lookup("req", 48, [], non_block=True).hit_length == 32
+        assert sock.send_multipart.call_count == 1
+    finally:
+        gate.set()
+        client.close()
+
+
+def test_reset_clears_cached_async_results():
+    client, sock = _make_lookup_client({"lookup_prefetch_limit": 1})
+    sock.recv.return_value = (32).to_bytes(4, "big")
+    try:
+        client.lookup("req", 48, [], non_block=True, prefetch=True)
+        assert client._lookups["req"].future.result(timeout=5).hit_length == 32
+        sock.recv.return_value = protocol.RESP_OK
+        assert client.reset() is True
+        assert client._lookups == {}
+        assert client._num_prefetches == 0
+    finally:
+        client.close()
+
+
 def test_lookup_key_client_non_block_lookup_async():
     """Non-blocking lookup defers to the executor: None first, hit once the
     Future resolves."""
@@ -746,8 +895,10 @@ def test_lookup_key_client_non_block_lookup_async():
     # Release the executor; a later poll returns the hit length.
     gate.set()
     assert _poll_lookup(client, "req1") == 7
-    # Future is consumed (popped) on read.
-    assert "req1" not in client.futures
+    # Repeated reads reuse the completed result until expiry or discard.
+    assert _poll_lookup(client, "req1") == 7
+    assert fake_socket.send_multipart.call_count == 1
+    client.close()
 
 
 def test_lookup_key_client_discard_clears_state():
@@ -765,17 +916,17 @@ def test_lookup_key_client_discard_clears_state():
     fake_socket.recv.side_effect = _gated_recv(gate, 9)
 
     # Submit while gated so the call returns None and the Future stays in
-    # `futures` (unconsumed) once it resolves.
+    # the client once it resolves.
     assert client.lookup("req2", 128, [], non_block=True) is None
     gate.set()
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        if client.futures["req2"].done():
+        if client._lookups["req2"].future.done():
             break
         time.sleep(0.005)
     # discard() drops the completed result before any lookup consumes it.
     client.discard("req2")
-    assert "req2" not in client.futures
+    assert "req2" not in client._lookups
     # A fresh query re-submits rather than returning a stale value: hold the
     # gate so the resubmitted lookup stays in flight.
     gate.clear()

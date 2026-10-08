@@ -2493,6 +2493,15 @@ class LookupKeyServer:
 # ============================================================
 
 
+@dataclasses.dataclass
+class _LookupState:
+    future: Future[MooncakeLookupResult]
+    signature: tuple[int, int, bytes]
+    submitted_at: float
+    prefetched: bool
+    cached_at: float | None = None
+
+
 class LookupKeyClient:
     """ZMQ client for the LookupKey admin channel.
 
@@ -2515,7 +2524,12 @@ class LookupKeyClient:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
-        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        self._lookups: dict[str, _LookupState] = {}
+        self._num_prefetches = 0
+        assert vllm_config.kv_transfer_config is not None
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._prefetch_limit = extra_config.get("lookup_prefetch_limit", 0)
+        self._lookup_ttl_s = extra_config.get("lookup_prefetch_ttl_s", 2.0)
 
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
@@ -2537,28 +2551,68 @@ class LookupKeyClient:
         num_tokens: int,
         block_hashes: list[BlockHash],
         non_block: bool = False,
+        *,
+        prefetch: bool = False,
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
-        so the caller retries on a later step."""
-        future = self.futures.get(req_id)
-        if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
-            self.futures[req_id] = future
-        if non_block and not future.done():
+        then cache it until expiry or discard(). Prefetch probes are bounded;
+        normal scheduler probes bypass the cap and release prefetch capacity.
+        """
+        now = time.monotonic()
+        # Block hashes form a cumulative chain; its last hash identifies it.
+        signature = (
+            num_tokens,
+            len(block_hashes),
+            bytes(block_hashes[-1]) if block_hashes else b"",
+        )
+        state = self._lookups.get(req_id)
+        if state is not None and (
+            state.signature != signature
+            or (state.prefetched and now - state.submitted_at > self._lookup_ttl_s)
+            or (
+                state.cached_at is not None
+                and now - state.cached_at > self._lookup_ttl_s
+            )
+        ):
+            self.discard(req_id)
+            state = None
+        if state is None:
+            if prefetch and self._num_prefetches >= self._prefetch_limit:
+                return None
+            state = _LookupState(
+                future=self.executor.submit(
+                    self._lookup, num_tokens, list(block_hashes)
+                ),
+                signature=signature,
+                submitted_at=now,
+                prefetched=prefetch,
+            )
+            self._lookups[req_id] = state
+            self._num_prefetches += int(prefetch)
+        if state.prefetched and not prefetch:
+            state.prefetched = False
+            self._num_prefetches -= 1
+        if non_block and not state.future.done():
             return None
         try:
-            return future.result()
+            result = state.future.result()
         except Exception as e:
-            logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
-            return MooncakeLookupResult(0)
-        finally:
-            del self.futures[req_id]
+            if state.cached_at is None:
+                logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
+            result = MooncakeLookupResult(0)
+        if non_block:
+            if state.cached_at is None:
+                state.cached_at = time.monotonic()
+        else:
+            self.discard(req_id)
+        return result
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
-        future = self.futures.pop(req_id, None)
-        if future is not None:
-            future.cancel()
+        state = self._lookups.pop(req_id, None)
+        if state is not None:
+            self._num_prefetches -= int(state.prefetched)
+            state.future.cancel()
 
     def _reset(self) -> bool:
         """Trigger ``store.remove_all(force=True)`` on worker rank 0.
@@ -2573,9 +2627,15 @@ class LookupKeyClient:
         return bytes(resp) == RESP_OK
 
     def reset(self) -> bool:
-        return self.executor.submit(self._reset).result()
+        success = self.executor.submit(self._reset).result()
+        if success:
+            for req_id in list(self._lookups):
+                self.discard(req_id)
+        return success
 
     def close(self):
+        for req_id in list(self._lookups):
+            self.discard(req_id)
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.socket.close(linger=0)
 

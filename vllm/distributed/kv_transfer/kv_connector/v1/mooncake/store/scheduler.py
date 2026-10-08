@@ -115,6 +115,26 @@ class MooncakeStoreScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
 
+    def on_new_request(self, request: Request) -> None:
+        """Start a bounded async lookup without allocating KV or creating a load."""
+        align = (
+            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
+        )
+        if (
+            not self.enable_lookup
+            or not self.lookup_async
+            or request.num_tokens < align
+            or not request.block_hashes
+        ):
+            return
+        self.client.lookup(
+            request.request_id,
+            request.num_tokens,
+            request.block_hashes,
+            non_block=True,
+            prefetch=True,
+        )
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -225,6 +245,7 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
+            self.client.discard(req_id)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
