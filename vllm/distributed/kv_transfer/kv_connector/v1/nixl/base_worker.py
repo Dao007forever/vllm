@@ -66,6 +66,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     MambaConvSplitInfo,
     derive_mamba_conv_split,
 )
+from vllm.distributed.kv_transfer.kv_layout import (
+    KVPage,
+    PairPlan,
+    SingleRunStrategy,
+    Staged,
+    TransferStrategy,
+    Unsupported,
+    head_range,
+    plan_pair,
+)
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
     get_pcp_group,
@@ -719,6 +729,15 @@ class NixlBaseConnectorWorker:
 
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
+        # How this worker realises a planned transfer. NIXL issues one
+        # descriptor per block per source, so a direct transfer needs the
+        # shared heads to be one run; otherwise whole pages are staged and
+        # permuted on receive, which the receiver only implements for an
+        # HND -> NHD transpose and only when the user opted in.
+        fixups = {"identity"}
+        if self.kv_transfer_config.enable_permute_local_kv:
+            fixups.add("transpose_hn")
+        self._transfer_strategy: TransferStrategy = SingleRunStrategy(frozenset(fixups))
         self.enable_heterogeneous_attn_post_process = False
 
         # KV Caches and nixl tracking data.
@@ -2477,6 +2496,164 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
+    # Order of the head and token modes inside one block, for the layouts
+    # whose block is one contiguous page. Layouts that spread a block's heads
+    # over separate regions (e.g. LHBNC) are not described by a single page.
+    _PAGE_ORDERS = {"LBHNC": "HND", "BLHNC": "HND", "LBNHC": "NHD", "BLNHC": "NHD"}
+
+    def _attention_pairs(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        kv_cache_layout: str,
+    ) -> list[PairPlan] | None:
+        """Plan this rank's attention page against every source rank's page.
+
+        Pages are in head-token units, so the plan holds for any head size.
+        Returns ``None`` when there is nothing to plan: no attention group, or
+        a layout that is not a single page per block, in which case the
+        legacy layout check decides.
+        """
+        local_order = self._PAGE_ORDERS.get(kv_cache_layout)
+        remote_order = self._PAGE_ORDERS.get(nixl_agent_meta.kv_cache_layout)
+        if local_order is None or remote_order is None:
+            return None
+        assert self.transfer_topo is not None
+        topo = self.transfer_topo
+        tokens = nixl_agent_meta.block_size
+        if self.use_mla:
+            # Replicated: one head that every rank holds.
+            local_heads = remote_heads = 1
+            local_lo = 0
+            remote_lo = {r: 0 for r in range(remote_tp_size)}
+        else:
+            total = topo.total_num_kv_heads
+            local_heads = max(1, total // topo.tp_size)
+            remote_heads = max(1, total // remote_tp_size)
+            local_lo = head_range(topo.tp_rank, topo.tp_size, total)[0]
+            remote_lo = {
+                r: head_range(r, remote_tp_size, total)[0]
+                for r in range(remote_tp_size)
+            }
+        local = KVPage.attention(tokens, local_heads, local_lo, local_order)
+        fa_idx = next(
+            (i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)),
+            None,
+        )
+        if fa_idx is None:
+            return None
+        sources = self.tp_mappings[nixl_agent_meta.engine_id].source_ranks_per_group[
+            fa_idx
+        ]
+        pairs = []
+        for remote_rank in sources:
+            remote = KVPage.attention(
+                tokens, remote_heads, remote_lo[remote_rank], remote_order
+            )
+            pair = plan_pair(remote, local)
+            if pair is not None:
+                pairs.append(pair)
+        return pairs
+
+    def _choose_transfer_strategy(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        kv_cache_layout: str,
+        tp_ratio: int,
+        block_size_ratio: int,
+    ) -> None:
+        """Decide how attention pages move from the remote engine to this rank.
+
+        The planner gives the byte correspondence between the two pages and
+        the connector's :class:`TransferStrategy` picks direct runs or a
+        staged copy with a permute on receive. Heterogeneous block sizes keep
+        the legacy decision until the planner's tiling lands.
+        """
+        pairs = None
+        if block_size_ratio == 1:
+            pairs = self._attention_pairs(
+                nixl_agent_meta, remote_tp_size, kv_cache_layout
+            )
+        if pairs is None:
+            self._legacy_layout_check(nixl_agent_meta, kv_cache_layout, tp_ratio)
+            return
+        choice = self._transfer_strategy.choose(pairs)
+        assert self.transfer_topo is not None
+        if isinstance(choice, Unsupported):
+            raise RuntimeError(
+                "No supported KV transfer from remote "
+                f"{nixl_agent_meta.kv_cache_layout} TP {remote_tp_size} to local "
+                f"{kv_cache_layout} TP {self.transfer_topo.tp_size}: {choice.reason}. "
+                "Use the same block-contiguous layout (e.g. LBHNC) on both sides, "
+                "or set 'enable_permute_local_kv'=True in --kv-transfer-config to "
+                "stage LBHNC pages and permute them into a LBNHC cache on receive."
+            )
+        if isinstance(choice, Staged):
+            assert not self._is_hma_required, (
+                "HMA does not support block size post processing"
+            )
+            logger.info(
+                "Remote is %s and local is %s: staging whole pages and permuting "
+                "on receive (%s).",
+                nixl_agent_meta.kv_cache_layout,
+                kv_cache_layout,
+                choice.plan.fixup.kind,
+            )
+            self.enable_permute_local_kv = True
+        else:
+            logger.debug(
+                "Direct transfer from %s TP %s to %s TP %s: %s",
+                nixl_agent_meta.kv_cache_layout,
+                remote_tp_size,
+                kv_cache_layout,
+                self.transfer_topo.tp_size,
+                [p.runs for p in choice.pairs],
+            )
+
+    def _legacy_layout_check(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        kv_cache_layout: str,
+        tp_ratio: int,
+    ) -> None:
+        """Layout rules for cases the planner does not cover yet."""
+        assert self.transfer_topo is not None
+        remote_engine_id = nixl_agent_meta.engine_id
+        if not self.use_mla and nixl_agent_meta.kv_cache_layout != kv_cache_layout:
+            if (
+                self.kv_transfer_config.enable_permute_local_kv
+                and nixl_agent_meta.kv_cache_layout == "LBHNC"
+            ):
+                logger.info(
+                    "Remote is LBHNC and local is LBNHC, enabled additional permute "
+                    "on local device KV."
+                )
+                assert not self._is_hma_required, (
+                    "HMA does not support block size post processing"
+                )
+                self.enable_permute_local_kv = True
+            else:
+                raise RuntimeError(
+                    "Heterogeneous TP expects same kv_cache_layout. "
+                    "Or enable experimental feature to use HND to NHD support by "
+                    "setting 'enable_permute_local_kv'=True in --kv-transfer-config."
+                )
+        # Heterogeneous TP requires head-splitting, which only works with
+        # block-contiguous layouts (e.g. LBHNC). MLA and replicated-KV cases
+        # don't split on heads. Mamba doesn't support heterogeneous TP.
+        if (
+            abs(tp_ratio) != 1
+            and not self.use_mla
+            and not self.transfer_topo.is_kv_replicated(remote_engine_id)
+            and not KVCacheLayout[kv_cache_layout].is_block_contiguous
+            and not self.enable_permute_local_kv
+        ):
+            raise RuntimeError(
+                "Heterogeneous TP head-dimension splitting requires contiguous heads. "
+                "Use a block-contiguous layout (e.g. LBHNC) on the prefill side."
+            )
+
     def _validate_remote_agent_handshake(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2560,25 +2737,9 @@ class NixlBaseConnectorWorker:
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout
         )
-        if not self.use_mla and nixl_agent_meta.kv_cache_layout != kv_cache_layout:
-            if (
-                self.kv_transfer_config.enable_permute_local_kv
-                and nixl_agent_meta.kv_cache_layout == "LBHNC"
-            ):
-                logger.info(
-                    "Remote is LBHNC and local is LBNHC, enabled additional permute "
-                    "on local device KV."
-                )
-                assert not self._is_hma_required, (
-                    "HMA does not support block size post processing"
-                )
-                self.enable_permute_local_kv = True
-            else:
-                raise RuntimeError(
-                    "Heterogeneous TP expects same kv_cache_layout. "
-                    "Or enable experimental feature to use HND to NHD support by "
-                    "setting 'enable_permute_local_kv'=True in --kv-transfer-config."
-                )
+        self._choose_transfer_strategy(
+            nixl_agent_meta, remote_tp_size, kv_cache_layout, tp_ratio, block_size_ratio
+        )
         # if remote_agent used attn is not same as local,
         # hint heterogenuous attn post process
         if (
@@ -2594,21 +2755,6 @@ class NixlBaseConnectorWorker:
                 "hint heterogeneous attn post process"
             )
             self.enable_heterogeneous_attn_post_process = True
-
-        # Heterogeneous TP requires head-splitting, which only works with
-        # block-contiguous layouts (e.g. LBHNC). MLA and replicated-KV cases
-        # don't split on heads. Mamba doesn't support heterogeneous TP.
-        if (
-            abs(tp_ratio) != 1
-            and not self.use_mla
-            and not self.transfer_topo.is_kv_replicated(remote_engine_id)
-            and not KVCacheLayout[kv_cache_layout].is_block_contiguous
-            and not self.enable_permute_local_kv
-        ):
-            raise RuntimeError(
-                "Heterogeneous TP head-dimension splitting requires contiguous heads. "
-                "Use a block-contiguous layout (e.g. LBHNC) on the prefill side."
-            )
 
         # Per-region block_len validation enforcing the P/D invariant.
         # REPLICATE regions (MLA, or a whole-model MLA / replicated-KV transfer)
