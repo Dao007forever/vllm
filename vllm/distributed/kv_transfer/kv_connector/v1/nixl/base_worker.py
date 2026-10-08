@@ -28,10 +28,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     EngineTransferInfo,
     TransferTopology,
+    apply_local_permute,
     get_current_attn_backends,
-    kv_postprocess_blksize_and_layout_on_receive,
-    kv_postprocess_blksize_on_receive,
-    kv_postprocess_layout_on_receive,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
@@ -68,11 +66,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 )
 from vllm.distributed.kv_transfer.kv_layout import (
     KVPage,
+    LocalPermute,
+    PageOrder,
     PairPlan,
     SingleRunStrategy,
     Staged,
-    TransferStrategy,
     Unsupported,
+    block_ratio_plan,
     head_range,
     plan_pair,
 )
@@ -734,10 +734,13 @@ class NixlBaseConnectorWorker:
         # shared heads to be one run; otherwise whole pages are staged and
         # permuted on receive, which the receiver only implements for an
         # HND -> NHD transpose and only when the user opted in.
-        fixups = {"identity"}
+        fixups = {"identity", "block_ratio"}
         if self.kv_transfer_config.enable_permute_local_kv:
-            fixups.add("transpose_hn")
-        self._transfer_strategy: TransferStrategy = SingleRunStrategy(frozenset(fixups))
+            fixups.update({"transpose_hn", "block_ratio_transpose_hn"})
+        self._transfer_strategy = SingleRunStrategy(frozenset(fixups))
+        # The receive fix-up per remote block-size ratio, from the planner;
+        # None when received bytes already sit in the page's order.
+        self._local_permutes: dict[int, LocalPermute | None] = {}
         self.enable_heterogeneous_attn_post_process = False
 
         # KV Caches and nixl tracking data.
@@ -2499,61 +2502,117 @@ class NixlBaseConnectorWorker:
     # Order of the head and token modes inside one block, for the layouts
     # whose block is one contiguous page. Layouts that spread a block's heads
     # over separate regions (e.g. LHBNC) are not described by a single page.
-    _PAGE_ORDERS = {"LBHNC": "HND", "BLHNC": "HND", "LBNHC": "NHD", "BLNHC": "NHD"}
+    _PAGE_ORDERS: dict[str, PageOrder] = {
+        "LBHNC": "HND",
+        "BLHNC": "HND",
+        "LBNHC": "NHD",
+        "BLNHC": "NHD",
+    }
 
-    def _attention_pairs(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_size: int,
-        kv_cache_layout: str,
-    ) -> list[PairPlan] | None:
-        """Plan this rank's attention page against every source rank's page.
-
-        Pages are in head-token units, so the plan holds for any head size.
-        Returns ``None`` when there is nothing to plan: no attention group, or
-        a layout that is not a single page per block, in which case the
-        legacy layout check decides.
-        """
-        local_order = self._PAGE_ORDERS.get(kv_cache_layout)
-        remote_order = self._PAGE_ORDERS.get(nixl_agent_meta.kv_cache_layout)
-        if local_order is None or remote_order is None:
-            return None
-        assert self.transfer_topo is not None
-        topo = self.transfer_topo
-        tokens = nixl_agent_meta.block_size
-        if self.use_mla:
-            # Replicated: one head that every rank holds.
-            local_heads = remote_heads = 1
-            local_lo = 0
-            remote_lo = {r: 0 for r in range(remote_tp_size)}
-        else:
-            total = topo.total_num_kv_heads
-            local_heads = max(1, total // topo.tp_size)
-            remote_heads = max(1, total // remote_tp_size)
-            local_lo = head_range(topo.tp_rank, topo.tp_size, total)[0]
-            remote_lo = {
-                r: head_range(r, remote_tp_size, total)[0]
-                for r in range(remote_tp_size)
-            }
-        local = KVPage.attention(tokens, local_heads, local_lo, local_order)
+    def _attention_sources(
+        self, nixl_agent_meta: NixlAgentMetadata
+    ) -> tuple[int, ...] | None:
+        """Remote ranks this rank reads attention pages from, or ``None`` for
+        a model without an attention group."""
         fa_idx = next(
             (i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)),
             None,
         )
         if fa_idx is None:
             return None
-        sources = self.tp_mappings[nixl_agent_meta.engine_id].source_ranks_per_group[
+        return self.tp_mappings[nixl_agent_meta.engine_id].source_ranks_per_group[
             fa_idx
         ]
+
+    def _attention_page(
+        self, tokens: int, tp_size: int, tp_rank: int, order: PageOrder
+    ) -> KVPage:
+        """One rank's attention page in head-token units. MLA is replicated:
+        one head that every rank holds."""
+        assert self.transfer_topo is not None
+        if self.use_mla:
+            return KVPage.attention(tokens, 1, 0, order)
+        total = self.transfer_topo.total_num_kv_heads
+        heads = max(1, total // tp_size)
+        return KVPage.attention(
+            tokens, heads, head_range(tp_rank, tp_size, total)[0], order
+        )
+
+    def _attention_pairs(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        local_order: PageOrder,
+        remote_order: PageOrder,
+        sources: tuple[int, ...],
+    ) -> list[PairPlan]:
+        """Plan this rank's attention page against every source rank's page."""
+        assert self.transfer_topo is not None
+        tokens = nixl_agent_meta.block_size
+        topo = self.transfer_topo
+        local = self._attention_page(tokens, topo.tp_size, topo.tp_rank, local_order)
         pairs = []
         for remote_rank in sources:
-            remote = KVPage.attention(
-                tokens, remote_heads, remote_lo[remote_rank], remote_order
+            remote = self._attention_page(
+                tokens, remote_tp_size, remote_rank, remote_order
             )
             pair = plan_pair(remote, local)
             if pair is not None:
                 pairs.append(pair)
         return pairs
+
+    def _block_ratio_fixup(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        local_order: PageOrder,
+        remote_order: PageOrder,
+        sources: tuple[int, ...],
+        block_size_ratio: int,
+    ) -> LocalPermute:
+        """The receive fix-up when each local block holds ``block_size_ratio``
+        remote pages: every page lands whole, in the remote's order."""
+        assert self.transfer_topo is not None
+        topo = self.transfer_topo
+        remote_tokens = nixl_agent_meta.block_size
+        local = self._attention_page(
+            self.block_size, topo.tp_size, topo.tp_rank, local_order
+        )
+        remote = self._attention_page(
+            remote_tokens, remote_tp_size, sources[0], remote_order
+        )
+        # Each remote page must hold this rank's heads as one run to land whole.
+        local_chunk = self._attention_page(
+            remote_tokens, topo.tp_size, topo.tp_rank, local_order
+        )
+        pair = plan_pair(remote, local_chunk)
+        if pair is None or not pair.src_contiguous:
+            raise RuntimeError(
+                "No supported KV transfer from remote "
+                f"{nixl_agent_meta.kv_cache_layout} TP {remote_tp_size} to local "
+                f"{self.kv_cache_layout} TP {topo.tp_size} with block size ratio "
+                f"{block_size_ratio}: this rank's heads are not one run in the "
+                f"remote page {remote.layout}."
+            )
+        return block_ratio_plan(remote_order, local, block_size_ratio)
+
+    def _record_fixup(self, block_size_ratio: int, fixup: LocalPermute | None) -> None:
+        if fixup is not None and fixup.is_identity:
+            fixup = None
+        if block_size_ratio in self._local_permutes:
+            if self._local_permutes[block_size_ratio] != fixup:
+                raise RuntimeError(
+                    "Remote engines with block size ratio "
+                    f"{block_size_ratio} need different receive fix-ups: "
+                    f"{self._local_permutes[block_size_ratio]} vs {fixup}"
+                )
+            return
+        self._local_permutes[block_size_ratio] = fixup
+        if fixup is not None and "transpose_hn" in fixup.kind:
+            assert not self._is_hma_required, (
+                "HMA does not support block size post processing"
+            )
+            self.enable_permute_local_kv = True
 
     def _choose_transfer_strategy(
         self,
@@ -2570,46 +2629,64 @@ class NixlBaseConnectorWorker:
         staged copy with a permute on receive. Heterogeneous block sizes keep
         the legacy decision until the planner's tiling lands.
         """
-        pairs = None
+        assert self.transfer_topo is not None
+        local_order = self._PAGE_ORDERS.get(kv_cache_layout)
+        remote_order = self._PAGE_ORDERS.get(nixl_agent_meta.kv_cache_layout)
+        sources = self._attention_sources(nixl_agent_meta)
+        if local_order is None or remote_order is None or sources is None:
+            self._legacy_layout_check(nixl_agent_meta, kv_cache_layout, tp_ratio)
+            if block_size_ratio != 1 and sources is not None:
+                raise RuntimeError(
+                    "Heterogeneous block sizes need a block-compact KV cache layout "
+                    f"on both sides, got remote {nixl_agent_meta.kv_cache_layout} "
+                    f"and local {kv_cache_layout}."
+                )
+            return
+        unsupported = (
+            "No supported KV transfer from remote "
+            f"{nixl_agent_meta.kv_cache_layout} TP {remote_tp_size} to local "
+            f"{kv_cache_layout} TP {self.transfer_topo.tp_size}: {{}}. "
+            "Use the same block-contiguous layout (e.g. LBHNC) on both sides, "
+            "or set 'enable_permute_local_kv'=True in --kv-transfer-config to "
+            "stage LBHNC pages and permute them into a LBNHC cache on receive."
+        )
+        fixup: LocalPermute | None
         if block_size_ratio == 1:
             pairs = self._attention_pairs(
-                nixl_agent_meta, remote_tp_size, kv_cache_layout
+                nixl_agent_meta, remote_tp_size, local_order, remote_order, sources
             )
-        if pairs is None:
-            self._legacy_layout_check(nixl_agent_meta, kv_cache_layout, tp_ratio)
-            return
-        choice = self._transfer_strategy.choose(pairs)
-        assert self.transfer_topo is not None
-        if isinstance(choice, Unsupported):
-            raise RuntimeError(
-                "No supported KV transfer from remote "
-                f"{nixl_agent_meta.kv_cache_layout} TP {remote_tp_size} to local "
-                f"{kv_cache_layout} TP {self.transfer_topo.tp_size}: {choice.reason}. "
-                "Use the same block-contiguous layout (e.g. LBHNC) on both sides, "
-                "or set 'enable_permute_local_kv'=True in --kv-transfer-config to "
-                "stage LBHNC pages and permute them into a LBNHC cache on receive."
-            )
-        if isinstance(choice, Staged):
-            assert not self._is_hma_required, (
-                "HMA does not support block size post processing"
-            )
-            logger.info(
-                "Remote is %s and local is %s: staging whole pages and permuting "
-                "on receive (%s).",
-                nixl_agent_meta.kv_cache_layout,
-                kv_cache_layout,
-                choice.plan.fixup.kind,
-            )
-            self.enable_permute_local_kv = True
+            choice = self._transfer_strategy.choose(pairs)
+            if isinstance(choice, Unsupported):
+                raise RuntimeError(unsupported.format(choice.reason))
+            fixup = choice.plan.fixup if isinstance(choice, Staged) else None
         else:
-            logger.debug(
-                "Direct transfer from %s TP %s to %s TP %s: %s",
-                nixl_agent_meta.kv_cache_layout,
+            fixup = self._block_ratio_fixup(
+                nixl_agent_meta,
                 remote_tp_size,
-                kv_cache_layout,
-                self.transfer_topo.tp_size,
-                [p.runs for p in choice.pairs],
+                local_order,
+                remote_order,
+                sources,
+                block_size_ratio,
             )
+            if not self._transfer_strategy.allows(fixup):
+                raise RuntimeError(
+                    unsupported.format(
+                        f"receiving {block_size_ratio} remote pages per block needs a "
+                        f"{fixup.kind!r} permute {fixup.staging} -> {fixup.actual}"
+                    )
+                )
+        self._record_fixup(block_size_ratio, fixup)
+        logger.info(
+            "KV transfer from %s TP %s to %s TP %s (block size ratio %s): %s",
+            nixl_agent_meta.kv_cache_layout,
+            remote_tp_size,
+            kv_cache_layout,
+            self.transfer_topo.tp_size,
+            block_size_ratio,
+            "direct"
+            if fixup is None or fixup.is_identity
+            else f"staged, {fixup.kind} on receive",
+        )
 
     def _legacy_layout_check(
         self,
@@ -2929,16 +3006,15 @@ class NixlBaseConnectorWorker:
         self,
         block_size_ratio: int,
         block_ids_list: list[tuple[list[int], int]],
-        convert: bool = True,
+        fixup: LocalPermute | None = None,
     ):
         """Post process device kv cache after receiving from remote.
 
-        3 types of conversion supported (``convert``):
-            * kv_cache_postprocess_layout => convert from HND to NHD
-            * kv_cache_postprocess_blksize => convert from small block size
-              to large block size
-            * kv_cache_postprocess_blksize_and_layout => convert from small
-              block size to large block size and convert from HND to NHD
+        ``fixup`` is the planner's description of how the received bytes
+        differ from the page's order (HND pages into an NHD cache, smaller
+        remote pages landed one after another, or both); ``None`` means the
+        bytes already sit where the page wants them and only clipped blocks
+        need zeroing.
 
         The transfer only covers ``covered_sub_blocks`` remote-sized
         sub-blocks of each request's local attention blocks; the rest was
@@ -2953,29 +3029,13 @@ class NixlBaseConnectorWorker:
             return
         assert block_size_ratio >= 1, "Only nP < nD supported currently."
         assert self.transfer_topo is not None
-        if not convert:
-            logger.debug(
-                "Post-processing device kv cache on receive by zeroing "
-                "untransferred blocks."
-            )
-        elif self.enable_permute_local_kv and block_size_ratio > 1:
-            logger.debug(
-                "Post-processing device kv cache on receive by converting "
-                "block_size with %sx bigger and permuting layout from HND"
-                " to NHD.",
-                block_size_ratio,
-            )
-        elif self.enable_permute_local_kv:
-            logger.debug(
-                "Post-processing device kv cache on receive by permuting layout"
-                "from HND to NHD."
-            )
-        else:
-            logger.debug(
-                "Post-processing device kv cache on receive by converting "
-                "block_size with %sx bigger.",
-                block_size_ratio,
-            )
+        if fixup is not None and fixup.is_identity:
+            fixup = None
+        logger.debug(
+            "Post-processing device kv cache on receive: %s, zeroing untransferred "
+            "blocks.",
+            f"{fixup.kind} permute of received blocks" if fixup else "no permute",
+        )
 
         attn_caches = self._attention_kv_caches
         device = attn_caches[0].device
@@ -2988,29 +3048,20 @@ class NixlBaseConnectorWorker:
             first_stale = covered_blocks + (1 if sub_blocks_in_last else 0)
             has_stale = first_stale < len(block_ids)
             indices = None
-            if convert or has_stale:
+            if fixup is not None or has_stale:
                 indices = async_tensor_h2d(block_ids, device, torch.long)
 
-            if convert:
+            if fixup is not None:
                 for cache in attn_caches:
-                    if self.enable_permute_local_kv and block_size_ratio > 1:
-                        kv_postprocess_blksize_and_layout_on_receive(
-                            cache, indices, block_size_ratio
-                        )
-                    elif self.enable_permute_local_kv:
-                        kv_postprocess_layout_on_receive(cache, indices)
-                    else:
-                        kv_postprocess_blksize_on_receive(
-                            cache, indices, block_size_ratio
-                        )
+                    apply_local_permute(cache, indices, fixup)
 
             if sub_blocks_in_last:
                 last_block_id = block_ids[covered_blocks]
                 for cache in attn_caches:
-                    # Both post-processed layouts leave tokens on dim 1.
-                    sub_block_tokens = cache.shape[1] // block_size_ratio
+                    # Per-layer views are logical [B, H, N, C]: tokens on dim 2.
+                    sub_block_tokens = cache.shape[2] // block_size_ratio
                     zero_from = sub_blocks_in_last * sub_block_tokens
-                    cache[last_block_id, zero_from:].zero_()
+                    cache[last_block_id, :, zero_from:].zero_()
             if has_stale:
                 assert indices is not None
                 stale_ids = indices[first_stale:]
@@ -3169,13 +3220,10 @@ class NixlBaseConnectorWorker:
             block_size_ratio,
             block_ids_list,
         ) in block_ids_for_blocksize_post_process.items():
-            # MLA never needs the block-size/layout conversion, but its
-            # clipped blocks still need zeroing.
-            convert = not self.use_mla and (
-                block_size_ratio > 1 or self.enable_permute_local_kv
-            )
             self.post_process_device_kv_on_receive(
-                block_size_ratio, block_ids_list, convert
+                block_size_ratio,
+                block_ids_list,
+                self._local_permutes.get(block_size_ratio),
             )
 
         for block_ids in block_ids_for_heterogeneous_attn_post_process:
