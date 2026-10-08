@@ -3,6 +3,7 @@
 
 from math import lcm
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
@@ -481,6 +482,20 @@ def test_store_mask_retention_prefix_stable_as_aligned_length_grows():
     assert shorter is not None
     assert longer is not None
     assert longer[: len(shorter)] == shorter
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_partial_hit_swa_mask_keeps_prompt_window_without_densifying(use_eagle):
+    groups = [
+        KVCacheGroupSpec(["swa"], _swa(16, 32)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(64)),
+    ]
+    coord = _make_coord(groups, 16, use_eagle=use_eagle, retention_interval=0)
+    mask = coord.store_mask(176, num_prompt_tokens=177)[0]
+    kept = {6, 7, 8, 9, 10} if use_eagle else {6, 7, 9, 10}
+    assert mask == [i in kept for i in range(11)]
+    assert coord.store_mask(128, num_prompt_tokens=177)[0] == mask[:8]
+    assert coord.store_mask(176, start_token=128, num_prompt_tokens=177)[0] == mask[8:]
 
 
 def test_store_mask_excludes_mamba_groups_lookup_unaffected():

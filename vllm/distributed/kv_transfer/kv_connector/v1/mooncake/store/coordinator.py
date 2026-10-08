@@ -16,12 +16,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -160,6 +162,12 @@ class MooncakeStoreCoordinator:
         if self.use_eagle and not any(g.use_eagle for g in attention_groups):
             attention_groups = [g._replace(use_eagle=True) for g in attention_groups]
         self.attention_groups = attention_groups
+        self.full_attention_group_ids = {
+            gid
+            for g in attention_groups
+            if isinstance(g.spec, FullAttentionSpec)
+            for gid in g.group_ids
+        }
         # Per-group eagle bits. SpecGroup carries use_eagle for the whole
         # merged spec group, so the per-group store/lookup masks agree with
         # the merged-group hit check, which applies the eagle drop to every
@@ -231,7 +239,7 @@ class MooncakeStoreCoordinator:
         can consume it. ``None`` is the all-True sentinel for the suffix.
 
         Reuses the engine's ``SingleTypeKVCacheManager.reachable_block_mask``
-        so the store retains exactly the blocks the local prefix cache would.
+        for retained boundaries, plus the final SWA window for partial hits.
 
         Mamba groups are always all-False: the normal save resolves blocks
         positionally from the connector's append-only block-ID snapshot, but
@@ -315,6 +323,21 @@ class MooncakeStoreCoordinator:
             )
             if mask is not None:
                 assert len(mask) == end_chunk - start_chunk
+                if (
+                    exclude_mamba
+                    and self.enable_partial_hash_hits
+                    and isinstance(spec, SlidingWindowSpec)
+                    and num_prompt_tokens is not None
+                ):
+                    # The completed prompt tail can end between LCM boundaries.
+                    tail_end = num_prompt_tokens // spec.block_size
+                    need = SlidingWindowManager._contiguous_blocks_for_hit(
+                        spec.sliding_window, spec.block_size, use_eagle
+                    )
+                    for i in range(
+                        max(start_chunk, tail_end - need), min(end_chunk, tail_end)
+                    ):
+                        mask[i - start_chunk] = True
             masks.append(mask)
         return tuple(masks)
 
