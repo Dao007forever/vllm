@@ -766,18 +766,6 @@ def eagle_proof_margin(
     return block_size
 
 
-def eagle_scan_limit(
-    hit_limit: int, eagle_margin: int, num_hashes: int, hash_block_size: int
-) -> int:
-    """How far an EAGLE group may match before dropping back to ``hit_limit``.
-
-    The match must reach one margin past the candidate to prove the tokens the
-    drafter reads there, which may lie past ``prompt_len - 1``; it cannot go
-    past the last hash the request has.
-    """
-    return min(hit_limit + eagle_margin, num_hashes * hash_block_size)
-
-
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,

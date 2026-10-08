@@ -13,7 +13,6 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     KVCacheBlock,
     eagle_proof_margin,
-    eagle_scan_limit,
     partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -719,8 +718,9 @@ def find_hybrid_cache_hit(
                     enable_partial_hash_hits
                     and group.manager_cls.supports_fine_grained_hash_lookup,
                 )
-                _max_length = eagle_scan_limit(
-                    curr_hit_length, eagle_margin, len(block_hashes), hash_block_size
+                _max_length = min(
+                    curr_hit_length + eagle_margin,
+                    len(block_hashes) * hash_block_size,
                 )
             hit_blocks, _new_hit_length = group.manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
@@ -1036,11 +1036,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     self.enable_partial_hash_hits
                     and manager_cls.supports_fine_grained_hash_lookup,
                 )
-                lookup_length = eagle_scan_limit(
-                    max_cache_hit_length,
-                    eagle_margin,
-                    len(block_hashes),
-                    self.hash_block_size,
+                lookup_length = min(
+                    max_cache_hit_length + eagle_margin,
+                    len(block_hashes) * self.hash_block_size,
                 )
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
