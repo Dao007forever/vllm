@@ -67,6 +67,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -619,7 +620,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
         dcp_sharded = []
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
+        # (group index, block size, tokens retained below the window) for the
+        # groups whose freed entries update_requests nulls. Context parallelism
+        # is excluded: a row is not a contiguous token range there.
+        self.sliding_window_groups: list[tuple[int, int, int]] = []
+        use_cp = (
+            self.dcp_size > 1 or self.parallel_config.prefill_context_parallel_size > 1
+        )
+        for group_idx, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
             layer_spec = (
@@ -627,6 +635,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
             dcp_sharded.append(spec.dcp_sharded)
+            if isinstance(layer_spec, SlidingWindowSpec) and not use_cp:
+                self.sliding_window_groups.append(
+                    (group_idx, spec.block_size, layer_spec.num_retained_tokens)
+                )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -1222,14 +1234,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
                 self.block_tables.append_block_ids(idx, block_ids, overwrite=True)
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        req_indices: list[int] = []
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
+            req_indices.append(req_index)
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None and req_id not in table_updates:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
+                )
+        if self.sliding_window_groups and reqs.num_processed_tokens:
+            # Mirror the scheduler's out-of-window frees, which it never sends,
+            # on the committed count it freed on (never ahead of a free, even
+            # when rejected spec tokens roll num_computed_tokens back).
+            indices = np.asarray(req_indices, dtype=np.int32)
+            processed = np.asarray(reqs.num_processed_tokens, dtype=np.int64)
+            for (
+                group_idx,
+                block_size,
+                num_retained_tokens,
+            ) in self.sliding_window_groups:
+                num_skipped = np.maximum(processed - num_retained_tokens, 0)
+                self.block_tables.null_leading_blocks(
+                    group_idx, indices, num_skipped // block_size
                 )
 
         # Update CPU num_computed_prefill_tokens.

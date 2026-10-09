@@ -1705,6 +1705,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        num_processed_tokens: list[int] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1739,6 +1740,12 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            # The processed-token basis `allocate_slots` freed skipped blocks
+            # on. Both counters advance together in `_update_after_schedule`,
+            # after this snapshot, so it never exceeds what was freed.
+            num_processed_tokens.append(
+                max(0, req.num_computed_tokens - req.num_in_flight_tokens)
+            )
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1748,6 +1755,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            num_processed_tokens=num_processed_tokens,
         )
 
     def _reject_on_encoder_cache_embed_mismatch(

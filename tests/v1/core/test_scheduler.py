@@ -7544,3 +7544,38 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+def test_cached_request_data_carries_processed_tokens():
+    """The worker nulls sliding-window block-table entries from the same
+    committed count the scheduler freed on, so rejected spec tokens (which roll
+    num_computed_tokens back) can never leave the worker ahead of a free."""
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=2, num_tokens=40)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.scheduled_cached_reqs.num_processed_tokens == []
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id for request in requests],
+        req_id_to_index={request.request_id: i for i, request in enumerate(requests)},
+        sampled_token_ids=[[0], [0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, model_runner_output)
+    # Pretend one request still has tokens in flight from a concurrent step.
+    requests[1].num_in_flight_tokens = 7
+
+    output = scheduler.schedule()
+    cached = output.scheduled_cached_reqs
+    assert cached.req_ids == [request.request_id for request in requests]
+    # Both counters advance together after scheduling, so the difference is
+    # exactly what allocate_slots freed on.
+    assert cached.num_processed_tokens == [
+        max(0, request.num_computed_tokens - request.num_in_flight_tokens)
+        for request in requests
+    ]
+    assert cached.num_processed_tokens == [40, 33]
