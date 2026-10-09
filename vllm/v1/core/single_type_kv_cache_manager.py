@@ -1185,8 +1185,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             The number of tokens that will be skipped for attention computation.
 
         """
-        assert isinstance(self.kv_cache_spec, SlidingWindowSpec)
-        return self.kv_cache_spec.num_skipped_tokens(num_computed_tokens)
+        return max(
+            0,
+            num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
+        )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """NOTE(Chen): The prefix blocks are null blocks for sliding window layers.

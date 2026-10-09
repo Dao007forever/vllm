@@ -847,16 +847,11 @@ class SlidingWindowSpec(AttentionSpec):
     @property
     def num_retained_tokens(self) -> int:
         """Tokens kept below the next token's position: the window plus the
-        extra retained tail. Everything before them is freeable."""
-        return self.sliding_window - 1 + self.extra_retained_tokens
-
-    def num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """Leading tokens the next token's attention cannot reach.
-
-        Single source of truth for the scheduler's block frees and the worker's
-        block-table nulling, so neither can run ahead of the other.
+        extra retained tail. Must match the free rule in
+        ``SlidingWindowManager.get_num_skipped_tokens``; the worker nulls
+        block-table entries below ``num_computed_tokens - num_retained_tokens``.
         """
-        return max(0, num_computed_tokens - self.num_retained_tokens)
+        return self.sliding_window - 1 + self.extra_retained_tokens
 
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
