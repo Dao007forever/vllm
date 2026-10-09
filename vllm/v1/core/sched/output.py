@@ -150,6 +150,11 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Committed prefix length the KV cache manager evicted against this step
+    # (`num_computed_tokens` minus in-flight tokens), so the worker can null the
+    # same out-of-window block-table entries. Rejected spec tokens roll
+    # `num_computed_tokens` back; this value never runs ahead of a free.
+    num_processed_tokens: list[int] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -165,7 +170,8 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens}"
+            f"num_output_tokens={self.num_output_tokens},"
+            f"num_processed_tokens={self.num_processed_tokens}"
             f")"
         )
 
@@ -200,6 +206,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            num_processed_tokens=[],
         )
 
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -314,3 +315,52 @@ def test_dummy_request_slot_mapping_is_pad():
         num_tokens_padded=3,
     )
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
+
+
+def test_null_leading_blocks_stages_only_newly_dead_entries():
+    """Entries below a sliding window point at blocks the scheduler freed and
+    may have reused; nulling must land in the persistent table, expand to
+    kernel blocks, cap at the row length, and skip entries nulled before."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 32],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8, 8],
+        device=device,
+        kernel_block_sizes=[16, 16],
+    )
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([1, 2, 3, 4], [10, 11, 12]), overwrite=True
+    )
+    block_tables.append_block_ids(
+        req_index=1, new_block_ids=([5, 6], [13, 14]), overwrite=True
+    )
+    block_tables.apply_staged_writes()
+
+    req_indices = np.array([0, 1], dtype=np.int32)
+    # Group 1 has blocks_per_kv_block == 2: one KV block is two entries.
+    block_tables.null_leading_blocks(1, req_indices, np.array([1, 0]))
+    block_tables.null_leading_blocks(0, req_indices, np.array([2, 5]))
+    block_tables.apply_staged_writes()
+    torch.accelerator.synchronize()
+
+    assert block_tables.block_tables[1].gpu[0, :6].tolist() == [0, 0, 22, 23, 24, 25]
+    assert block_tables.block_tables[1].gpu[1, :4].tolist() == [26, 27, 28, 29]
+    assert block_tables.block_tables[0].gpu[0, :4].tolist() == [0, 0, 3, 4]
+    # Request 1 only has two blocks; the request for five is capped.
+    assert block_tables.block_tables[0].gpu[1, :2].tolist() == [0, 0]
+    assert block_tables.num_nulled_blocks[0].tolist()[:2] == [2, 2]
+
+    # Already-nulled entries are not staged again.
+    staged = block_tables.block_tables[0]._staged_write_indices
+    block_tables.null_leading_blocks(0, req_indices, np.array([2, 5]))
+    assert staged == []
+    block_tables.null_leading_blocks(0, req_indices, np.array([3, 5]))
+    assert staged == [0]
+
+    # Overwriting a row (resume, block_table_updates) resets the bookkeeping.
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([7, 8], [15]), overwrite=True
+    )
+    assert block_tables.num_nulled_blocks[:, 0].tolist() == [0, 0]

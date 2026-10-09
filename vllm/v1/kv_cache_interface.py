@@ -844,6 +844,20 @@ class SlidingWindowSpec(AttentionSpec):
     # of the sequence, and thus needs to delay freeing/caching of blocks.
     extra_retained_tokens: int = 0
 
+    @property
+    def num_retained_tokens(self) -> int:
+        """Tokens kept below the next token's position: the window plus the
+        extra retained tail. Everything before them is freeable."""
+        return self.sliding_window - 1 + self.extra_retained_tokens
+
+    def num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        """Leading tokens the next token's attention cannot reach.
+
+        Single source of truth for the scheduler's block frees and the worker's
+        block-table nulling, so neither can run ahead of the other.
+        """
+        return max(0, num_computed_tokens - self.num_retained_tokens)
+
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:

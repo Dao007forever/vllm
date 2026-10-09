@@ -67,6 +67,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -619,7 +620,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
         dcp_sharded = []
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
+        # Sliding-window groups whose freed, out-of-window block-table entries
+        # the worker nulls itself (see _null_blocks_below_sliding_windows).
+        # Skipped under context parallelism, where a row is not a contiguous
+        # token range; the sliding-window manager rejects CP anyway.
+        self.sliding_window_groups: list[tuple[int, SlidingWindowSpec]] = []
+        use_cp = (
+            self.dcp_size > 1 or self.parallel_config.prefill_context_parallel_size > 1
+        )
+        for group_idx, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
             layer_spec = (
@@ -627,6 +636,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
             dcp_sharded.append(spec.dcp_sharded)
+            if isinstance(spec, SlidingWindowSpec) and not use_cp:
+                self.sliding_window_groups.append((group_idx, spec))
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -1214,6 +1225,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
+    def _null_blocks_below_sliding_windows(
+        self, req_indices: list[int], num_processed_tokens: list[int]
+    ) -> None:
+        """Mirror the scheduler's sliding-window frees in the persistent tables.
+
+        The scheduler replaces blocks below a request's window with the null
+        block but only ever sends the worker new block ids, so the worker's rows
+        would keep ids the pool may have reused. Attention kernels load whole KV
+        tiles and can read such an entry even though the mask discards it;
+        reused bytes that decode as NaN then poison the output. Nulling from the
+        scheduler's committed count (`num_processed_tokens`) keeps the worker
+        exactly in step with what was freed, including spec-decode rollbacks.
+        """
+        indices = np.asarray(req_indices, dtype=np.int32)
+        processed = np.asarray(num_processed_tokens, dtype=np.int64)
+        for group_idx, spec in self.sliding_window_groups:
+            num_skipped = np.maximum(processed - spec.num_retained_tokens, 0)
+            self.block_tables.null_leading_blocks(
+                group_idx, indices, num_skipped // spec.block_size
+            )
+
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
@@ -1222,15 +1254,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
                 self.block_tables.append_block_ids(idx, block_ids, overwrite=True)
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        req_indices: list[int] = []
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
+            req_indices.append(req_index)
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None and req_id not in table_updates:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+        if self.sliding_window_groups and reqs.num_processed_tokens:
+            self._null_blocks_below_sliding_windows(
+                req_indices, reqs.num_processed_tokens
+            )
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
