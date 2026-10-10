@@ -845,11 +845,13 @@ class SlidingWindowSpec(AttentionSpec):
     extra_retained_tokens: int = 0
 
     @property
-    def num_retained_tokens(self) -> int:
+    def num_retained_tokens(self) -> int | None:
         """Tokens kept below the next token's position: the window plus the
         extra retained tail. Must match the free rule in
         ``SlidingWindowManager.get_num_skipped_tokens``; the worker nulls
         block-table entries below ``num_computed_tokens - num_retained_tokens``.
+        None means the manager never frees below the window, so the worker
+        must leave the table alone.
         """
         return self.sliding_window - 1 + self.extra_retained_tokens
 
@@ -1031,6 +1033,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 @dataclass(frozen=True, kw_only=True)
 class KpoolTailSpec(SlidingWindowSpec):
     """One-block circular scratch cache for a kpool indexer's raw tail."""
+
+    @property
+    def num_retained_tokens(self) -> int | None:
+        # Every position maps into the one ring block; it is never freed.
+        return None
 
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int

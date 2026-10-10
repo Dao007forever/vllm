@@ -636,9 +636,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
             dcp_sharded.append(spec.dcp_sharded)
             if isinstance(layer_spec, SlidingWindowSpec) and not use_cp:
-                self.sliding_window_groups.append(
-                    (group_idx, spec.block_size, layer_spec.num_retained_tokens)
-                )
+                # None opts out (e.g. KpoolTailSpec's one-block ring).
+                num_retained_tokens = layer_spec.num_retained_tokens
+                if num_retained_tokens is not None:
+                    self.sliding_window_groups.append(
+                        (group_idx, spec.block_size, num_retained_tokens)
+                    )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
