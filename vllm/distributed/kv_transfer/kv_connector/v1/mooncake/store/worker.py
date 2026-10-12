@@ -2494,12 +2494,23 @@ class LookupKeyServer:
 
 
 @dataclasses.dataclass
-class _LookupState:
+class LookupState:
     future: Future[MooncakeLookupResult]
     signature: tuple[int, int, bytes]
     submitted_at: float
     prefetched: bool
     cached_at: float | None = None
+
+
+def _lookup_signature(
+    num_tokens: int, block_hashes: list[BlockHash]
+) -> tuple[int, int, bytes]:
+    # Block hashes form a cumulative chain; its last hash identifies it.
+    return (
+        num_tokens,
+        len(block_hashes),
+        bytes(block_hashes[-1]) if block_hashes else b"",
+    )
 
 
 class LookupKeyClient:
@@ -2524,11 +2535,15 @@ class LookupKeyClient:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
-        self._lookups: dict[str, _LookupState] = {}
-        self._num_prefetches = 0
+        # Owned by the scheduler thread. prefetch() runs on the engine-core
+        # input thread and only touches the executor and the semaphore.
+        self._lookups: dict[str, LookupState] = {}
         assert vllm_config.kv_transfer_config is not None
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self._prefetch_limit = extra_config.get("lookup_prefetch_limit", 0)
+        prefetch_limit = extra_config.get("lookup_prefetch_limit", 0)
+        self._prefetch_slots = (
+            threading.BoundedSemaphore(prefetch_limit) if prefetch_limit > 0 else None
+        )
         self._lookup_ttl_s = extra_config.get("lookup_prefetch_ttl_s", 2.0)
 
     def _lookup(
@@ -2551,20 +2566,11 @@ class LookupKeyClient:
         num_tokens: int,
         block_hashes: list[BlockHash],
         non_block: bool = False,
-        *,
-        prefetch: bool = False,
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
-        then cache it until expiry or discard(). Prefetch probes are bounded;
-        normal scheduler probes bypass the cap and release prefetch capacity.
-        """
+        then cache it until expiry or discard()."""
         now = time.monotonic()
-        # Block hashes form a cumulative chain; its last hash identifies it.
-        signature = (
-            num_tokens,
-            len(block_hashes),
-            bytes(block_hashes[-1]) if block_hashes else b"",
-        )
+        signature = _lookup_signature(num_tokens, block_hashes)
         state = self._lookups.get(req_id)
         if state is not None and (
             state.signature != signature
@@ -2577,21 +2583,17 @@ class LookupKeyClient:
             self.discard(req_id)
             state = None
         if state is None:
-            if prefetch and self._num_prefetches >= self._prefetch_limit:
-                return None
-            state = _LookupState(
+            state = LookupState(
                 future=self.executor.submit(
                     self._lookup, num_tokens, list(block_hashes)
                 ),
                 signature=signature,
                 submitted_at=now,
-                prefetched=prefetch,
+                prefetched=False,
             )
             self._lookups[req_id] = state
-            self._num_prefetches += int(prefetch)
-        if state.prefetched and not prefetch:
-            state.prefetched = False
-            self._num_prefetches -= 1
+        # Submission-age expiry applies only until the first scheduler probe.
+        state.prefetched = False
         if non_block and not state.future.done():
             return None
         try:
@@ -2607,11 +2609,40 @@ class LookupKeyClient:
             self.discard(req_id)
         return result
 
+    def prefetch(
+        self, num_tokens: int, block_hashes: list[BlockHash]
+    ) -> LookupState | None:
+        """Thread-safe: submit a lookup without registering it. The caller
+        hands the returned state to adopt() on the scheduler thread. At most
+        ``lookup_prefetch_limit`` prefetches are in flight; beyond that,
+        returns None and the scheduler looks up as usual."""
+        slots = self._prefetch_slots
+        if slots is None or not slots.acquire(blocking=False):
+            return None
+        try:
+            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+        except RuntimeError:  # executor shut down
+            slots.release()
+            return None
+        future.add_done_callback(lambda _: slots.release())
+        return LookupState(
+            future=future,
+            signature=_lookup_signature(num_tokens, block_hashes),
+            submitted_at=time.monotonic(),
+            prefetched=True,
+        )
+
+    def adopt(self, req_id: str, state: LookupState) -> None:
+        """Register a prefetched lookup; a later lookup(req_id) reuses it."""
+        if req_id in self._lookups:
+            state.future.cancel()
+        else:
+            self._lookups[req_id] = state
+
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
         state = self._lookups.pop(req_id, None)
         if state is not None:
-            self._num_prefetches -= int(state.prefetched)
             state.future.cancel()
 
     def _reset(self) -> bool:

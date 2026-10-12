@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
+    LookupState,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -115,25 +116,30 @@ class MooncakeStoreScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
 
-    def on_new_request(self, request: Request) -> None:
-        """Start a bounded async lookup without allocating KV or creating a load."""
-        align = (
+    def _lookup_align(self) -> int:
+        # Fine-grained hits may land on a hash boundary inside a block; without
+        # partial hits, prefixes shorter than one physical block are skipped.
+        return (
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
+
+    def start_lookup_prefetch(self, request: Request) -> LookupState | None:
+        """Input thread: start a bounded async lookup. Reads only config."""
         if (
             not self.enable_lookup
             or not self.lookup_async
-            or request.num_tokens < align
+            or request.skip_reading_prefix_cache
+            or request.num_tokens < self._lookup_align()
             or not request.block_hashes
         ):
-            return
-        self.client.lookup(
-            request.request_id,
-            request.num_tokens,
-            request.block_hashes,
-            non_block=True,
-            prefetch=True,
-        )
+            return None
+        return self.client.prefetch(request.num_tokens, request.block_hashes)
+
+    def cancel_lookup_prefetch(self, request: Request) -> None:
+        """Cancel a prefetch whose request finished before its first probe."""
+        if (prefetched := request.kv_preschedule_handle) is not None:
+            request.kv_preschedule_handle = None
+            prefetched.future.cancel()
 
     def get_num_new_matched_tokens(
         self,
@@ -148,12 +154,11 @@ class MooncakeStoreScheduler:
         if not self.enable_lookup:
             return 0, False
 
-        # Fine-grained hits may land on a hash boundary inside a block; without
-        # partial hits, prefixes shorter than one physical block are skipped.
-        align = (
-            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
-        )
-        if request.num_tokens < align:
+        if (prefetched := request.kv_preschedule_handle) is not None:
+            request.kv_preschedule_handle = None
+            self.client.adopt(request.request_id, prefetched)
+
+        if request.num_tokens < self._lookup_align():
             return 0, False
 
         lookup_result = self.client.lookup(

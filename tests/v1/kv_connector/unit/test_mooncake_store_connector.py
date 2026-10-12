@@ -720,18 +720,23 @@ def test_admission_lookup_retains_completed_result_until_scheduled():
             vllm_config, KVConnectorRole.SCHEDULER, _make_kv_cache_config()
         )
     request = SimpleNamespace(
-        request_id="req1", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+        request_id="req1",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        skip_reading_prefix_cache=False,
+        kv_preschedule_handle=None,
     )
     mock_make_socket.return_value.recv.return_value = (32).to_bytes(4, "big")
     try:
-        connector.on_new_request(request)
+        request.kv_preschedule_handle = connector.on_preschedule_request(request)
         sched = connector.connector_scheduler
         assert sched is not None
-        future = sched.client._lookups[request.request_id].future
+        assert sched.client._lookups == {}
+        future = request.kv_preschedule_handle.future
         assert future.result(timeout=5).hit_length == 32
-        connector.on_new_request(request)
         assert sched.load_specs == {}
         assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
+        assert sched.client._lookups[request.request_id].future is future
         assert mock_make_socket.return_value.send_multipart.call_count == 1
         assert connector.get_num_new_matched_tokens(request, 16) == (16, True)
         assert mock_make_socket.return_value.send_multipart.call_count == 1
@@ -754,27 +759,49 @@ def _make_lookup_client(extra_config=None):
 
 
 @pytest.mark.parametrize("limit", [None, 0, 1])
-def test_lookup_prefetch_cap_keeps_normal_scheduler_probes_available(limit):
+def test_lookup_prefetch_cap_bounds_in_flight_prefetches(limit):
     client, sock = _make_lookup_client(
         {} if limit is None else {"lookup_prefetch_limit": limit}
     )
     gate = threading.Event()
     sock.recv.side_effect = _gated_recv(gate, 32)
     try:
-        client.lookup("first", 48, [], non_block=True, prefetch=True)
-        assert client.lookup("next", 48, [], non_block=True, prefetch=True) is None
-        assert "next" not in client._lookups
+        first = client.prefetch(48, [])
+        assert (first is not None) == bool(limit)
+        assert client.prefetch(48, []) is None
+        # Scheduler probes bypass the cap.
         assert client.lookup("next", 48, [], non_block=True) is None
         assert "next" in client._lookups
         if limit:
-            client.lookup("first", 48, [], non_block=True)
-            assert client._num_prefetches == 0
-            client.lookup("later", 48, [], non_block=True, prefetch=True)
-            assert client._num_prefetches == 1
-            client.discard("later")
-            assert client._num_prefetches == 0
+            gate.set()
+            first.future.result(timeout=5)
+            deadline = time.monotonic() + 5.0
+            while (later := client.prefetch(48, [])) is None:
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+            later.future.result(timeout=5)
     finally:
         gate.set()
+        client.close()
+
+
+def test_prefetch_from_another_thread_is_adopted_by_lookup():
+    client, sock = _make_lookup_client({"lookup_prefetch_limit": 1})
+    sock.recv.return_value = (32).to_bytes(4, "big")
+    states = []
+    try:
+        t = threading.Thread(target=lambda: states.append(client.prefetch(48, [])))
+        t.start()
+        t.join()
+        client.adopt("req", states[0])
+        assert states[0].future.result(timeout=5).hit_length == 32
+        assert client.lookup("req", 48, [], non_block=True).hit_length == 32
+        assert sock.send_multipart.call_count == 1
+        # A request already looked up keeps its own lookup.
+        dup = client.prefetch(48, [])
+        client.adopt("req", dup)
+        assert client._lookups["req"].future is states[0].future
+    finally:
         client.close()
 
 
@@ -786,23 +813,21 @@ def test_lookup_client_refreshes_changed_or_expired_query(monkeypatch, change):
     monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
     num_tokens, hashes = 48, [b"h0", b"h1", b"h2"]
     try:
-        client.lookup("req", num_tokens, hashes, non_block=True, prefetch=True)
-        first = client._lookups["req"].future
+        state = client.prefetch(num_tokens, hashes)
+        client.adopt("req", state)
+        first = state.future
         assert first.result(timeout=5).hit_length == 32
-        assert (
-            client.lookup(
-                "req", num_tokens, hashes, non_block=True, prefetch=True
-            ).hit_length
-            == 32
-        )
-        if change == "tokens":
-            num_tokens += 1
-        elif change == "hash":
-            hashes[-1] = b"different-tail"
-        else:
-            if change == "cached_expired":
-                client.lookup("req", num_tokens, hashes, non_block=True)
+        if change == "expired":
+            # Prefetched long before the scheduler's first probe.
             clock[0] = 3.0
+        else:
+            assert client.lookup("req", num_tokens, hashes, non_block=True) is not None
+            if change == "tokens":
+                num_tokens += 1
+            elif change == "hash":
+                hashes[-1] = b"different-tail"
+            else:
+                clock[0] = 3.0
 
         client.lookup("req", num_tokens, hashes, non_block=True)
         refreshed = client._lookups["req"].future
@@ -810,7 +835,6 @@ def test_lookup_client_refreshes_changed_or_expired_query(monkeypatch, change):
         assert refreshed.result(timeout=5).hit_length == 32
         assert client.lookup("req", num_tokens, hashes, non_block=True).hit_length == 32
         assert sock.send_multipart.call_count == 2
-        assert client._num_prefetches == 0
     finally:
         client.close()
 
@@ -837,15 +861,14 @@ def test_normal_pending_lookup_is_not_restarted_by_result_cache_ttl(monkeypatch)
 
 
 def test_reset_clears_cached_async_results():
-    client, sock = _make_lookup_client({"lookup_prefetch_limit": 1})
+    client, sock = _make_lookup_client()
     sock.recv.return_value = (32).to_bytes(4, "big")
     try:
-        client.lookup("req", 48, [], non_block=True, prefetch=True)
+        client.lookup("req", 48, [], non_block=True)
         assert client._lookups["req"].future.result(timeout=5).hit_length == 32
         sock.recv.return_value = protocol.RESP_OK
         assert client.reset() is True
         assert client._lookups == {}
-        assert client._num_prefetches == 0
     finally:
         client.close()
 
