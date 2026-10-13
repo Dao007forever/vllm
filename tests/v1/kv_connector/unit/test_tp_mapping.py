@@ -314,3 +314,42 @@ def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, comp
     else:
         with pytest.raises(ValueError, match="KV-head sharding boundary"):
             worker._validate_csa_linear_tp_layout(remote_tp)
+
+
+# ======================================================================
+# Planner-derived mapping equals the closed forms it replaced
+# ======================================================================
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4, 8, 32])
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("remote_tp_size", [1, 2, 4, 8])
+def test_planner_mapping_matches_closed_form(num_kv_heads, tp_size, remote_tp_size):
+    """Source ranks and the head offset come from the transfer planner's head
+    overlap; they must equal the hand-written TP-ratio arithmetic for every
+    rank, including GQA replication on either side."""
+    for tp_rank in range(tp_size):
+        m = _compute_mapping(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            remote_tp_size=remote_tp_size,
+            num_kv_heads=num_kv_heads,
+        )
+        if tp_size >= remote_tp_size:
+            expected_ranks = [tp_rank * remote_tp_size // tp_size]
+        else:
+            abs_tp = remote_tp_size // tp_size
+            start = tp_rank * abs_tp
+            heads = np.arange(start, start + abs_tp) * num_kv_heads // remote_tp_size
+            _, unique_idx = np.unique(heads, return_index=True)
+            expected_ranks = (start + np.sort(unique_idx)).tolist()
+        if tp_size <= remote_tp_size:
+            expected_offset = 0
+        elif tp_size > num_kv_heads:
+            local_head = tp_rank * num_kv_heads // tp_size
+            p_start = expected_ranks[0] * num_kv_heads // remote_tp_size
+            expected_offset = local_head - p_start
+        else:
+            expected_offset = tp_rank % (tp_size // remote_tp_size)
+        assert m.all_source_ranks == tuple(expected_ranks), (tp_rank, m)
+        assert m.rank_offset_factor == expected_offset, (tp_rank, m)

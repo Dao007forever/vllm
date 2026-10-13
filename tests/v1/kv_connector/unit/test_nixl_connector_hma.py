@@ -1420,6 +1420,7 @@ def test_post_process_zeroes_untransferred_tail(
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
+    from vllm.distributed.kv_transfer.kv_layout import KVPage, block_ratio_plan
 
     ratio = 4
     block_tokens = 8  # 2 tokens per remote sub-block
@@ -1428,8 +1429,15 @@ def test_post_process_zeroes_untransferred_tail(
     worker = MagicMock(spec=NixlConnectorWorker)
     worker.transfer_topo = MagicMock()
     worker.device_type = "cpu"
-    worker.enable_permute_local_kv = enable_permute_local_kv
-    worker.kv_cache_layout = kv_cache_layout
+    # The planner's fix-up for `ratio` remote pages per block: identity when
+    # both sides are token-major, a head regroup otherwise.
+    local_order = "NHD" if kv_cache_layout == "LBNHC" else "HND"
+    remote_order = "HND" if enable_permute_local_kv else local_order
+    fixup = block_ratio_plan(
+        remote_order,
+        KVPage.attention(block_tokens, num_kv_heads, 0, local_order),
+        ratio,
+    )
     # Attention caches are [B, H, N, C]; distinct values per head and token.
     expected = torch.arange(6 * num_kv_heads * block_tokens * 4).view(
         6, num_kv_heads, block_tokens, 4
@@ -1457,7 +1465,7 @@ def test_post_process_zeroes_untransferred_tail(
     _bind_worker_method(worker, "post_process_device_kv_on_receive")
 
     # Group 0 request in blocks [2, 3]; only 6 of 8 sub-blocks were received.
-    worker.post_process_device_kv_on_receive(ratio, [(0, [2, 3], 6)])
+    worker.post_process_device_kv_on_receive(ratio, [(0, [2, 3], 6)], fixup)
 
     # Block 2 fully covered; block 3 covered for 2 sub-blocks (4 tokens).
     assert torch.equal(attn_cache[2], expected[2])
