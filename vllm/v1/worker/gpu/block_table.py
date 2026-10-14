@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
-import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -70,11 +69,6 @@ class BlockTables:
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs), dtype=torch.int32
         )
-        # Leading entries per row already pointed at the null block by
-        # null_leading_blocks; lets repeated calls stage only newly dead blocks.
-        self.num_nulled_blocks = np.zeros(
-            (self.num_kv_cache_groups, self.max_num_reqs), dtype=np.int32
-        )
         self.fused_writer: FusedStagedWriter | None = None
         if self.num_kv_cache_groups > 1:
             # Only the multi-group path uses the fused writer.
@@ -129,8 +123,6 @@ class BlockTables:
         new_block_ids: tuple[list[int], ...],
         overwrite: bool,
     ) -> None:
-        if overwrite:
-            self.num_nulled_blocks[:, req_index] = 0
         for i in range(self.num_kv_cache_groups):
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
@@ -149,32 +141,21 @@ class BlockTables:
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
 
-    def null_leading_blocks(
-        self,
-        group_idx: int,
-        req_indices: np.ndarray,
-        num_kv_blocks: np.ndarray,
+    def null_block_range(
+        self, req_index: int, group_idx: int, start: int, end: int
     ) -> None:
-        """Point each row's leading ``num_kv_blocks`` KV blocks at the null block.
+        """Point KV blocks ``[start, end)`` of a row at the null block.
 
-        Used for blocks the scheduler freed below a sliding window: the worker's
-        table is otherwise append-only, so their entries would keep ids the
-        pool may have reused. Entries already nulled are skipped, so a call
-        costs only the newly dead blocks. Takes effect at the next
-        apply_staged_writes; slot mappings are untouched.
+        Mirrors the KV cache manager freeing those blocks (e.g. below a sliding
+        window); the table is otherwise append-only and would keep ids the pool
+        may reuse. Takes effect at the next apply_staged_writes.
         """
         bpk = self.blocks_per_kv_block[group_idx]
-        ends = np.minimum(
-            num_kv_blocks * bpk, self.num_blocks.np[group_idx, req_indices]
-        )
-        starts = self.num_nulled_blocks[group_idx, req_indices]
-        block_table = self.block_tables[group_idx]
-        for i in np.flatnonzero(ends > starts):
-            req_index = int(req_indices[i])
-            start = int(starts[i])
-            end = int(ends[i])
-            block_table.stage_write(req_index, start, [0] * (end - start))
-            self.num_nulled_blocks[group_idx, req_index] = end
+        end = min(end, int(self.num_blocks.np[group_idx, req_index]) // bpk)
+        if start < end:
+            # Same expansion append_block_ids gives the null block (id 0).
+            null_ids = list(range(bpk)) * (end - start)
+            self.block_tables[group_idx].stage_write(req_index, start * bpk, null_ids)
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:

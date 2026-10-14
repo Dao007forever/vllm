@@ -4930,31 +4930,3 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
-
-
-def test_sliding_window_num_retained_tokens():
-    """The worker nulls block-table entries below
-    num_computed_tokens - num_retained_tokens, so the value must match the
-    manager's free rule, and a never-freed ring (kpool tail) must opt out."""
-    spec = new_sliding_window_spec(sliding_window=64)
-    assert spec.num_retained_tokens == 63
-    spec = SlidingWindowSpec(
-        block_size=16,
-        num_kv_heads=2,
-        head_size=64,
-        dtype=torch.float32,
-        sliding_window=64,
-        extra_retained_tokens=3,
-    )
-    assert spec.num_retained_tokens == 66
-
-    tail = KpoolTailSpec(
-        block_size=4,
-        num_kv_heads=2,
-        head_size=128,
-        head_size_v=0,
-        dtype=torch.bfloat16,
-        sliding_window=4,
-        dcp_sharded=False,
-    )
-    assert tail.num_retained_tokens is None

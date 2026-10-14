@@ -150,11 +150,6 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
-    # Committed prefix length the KV cache manager evicted against this step
-    # (`num_computed_tokens` minus in-flight tokens), so the worker can null the
-    # same out-of-window block-table entries. Rejected spec tokens roll
-    # `num_computed_tokens` back; this value never runs ahead of a free.
-    num_processed_tokens: list[int] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -170,8 +165,7 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens},"
-            f"num_processed_tokens={self.num_processed_tokens}"
+            f"num_output_tokens={self.num_output_tokens}"
             f")"
         )
 
@@ -206,7 +200,6 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
-            num_processed_tokens=[],
         )
 
 
@@ -313,6 +306,12 @@ class SchedulerOutput:
 
     # Complete block-table rows that replace incrementally appended block IDs.
     block_table_updates: dict[str, tuple[list[int], ...]] | None = None
+
+    # Block-table entries the KV cache manager replaced with the null block
+    # (e.g. blocks below a sliding window) during this step, as
+    # {req_id: [(kv_cache_group_id, start, end), ...]} block-index ranges. The
+    # freed blocks may be reused, so the worker must stop pointing at them.
+    freed_block_ranges: dict[str, list[tuple[int, int, int]]] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None

@@ -1515,6 +1515,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+            freed_block_ranges=self.kv_cache_manager.take_freed_block_ranges() or None,
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
@@ -1705,7 +1706,6 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
-        num_processed_tokens: list[int] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1740,12 +1740,6 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
-            # The processed-token basis `allocate_slots` freed skipped blocks
-            # on. Both counters advance together in `_update_after_schedule`,
-            # after this snapshot, so it never exceeds what was freed.
-            num_processed_tokens.append(
-                max(0, req.num_computed_tokens - req.num_in_flight_tokens)
-            )
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1755,7 +1749,6 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
-            num_processed_tokens=num_processed_tokens,
         )
 
     def _reject_on_encoder_cache_embed_mismatch(

@@ -867,6 +867,19 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_freed_block_ranges(self) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain the block-table entries nulled since the last call, as
+        ``{req_id: [(kv_cache_group_id, start, end), ...]}`` block-index ranges.
+        """
+        ranges: dict[str, list[tuple[int, int, int]]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            group_id = mgr.kv_cache_group_id
+            for req_id, req_ranges in mgr.take_freed_block_ranges().items():
+                ranges.setdefault(req_id, []).extend(
+                    (group_id, start, end) for start, end in req_ranges
+                )
+        return ranges
+
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for
         zeroing, e.g. blocks a failed async KV load left unwritten.

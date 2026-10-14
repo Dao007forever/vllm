@@ -6284,3 +6284,53 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+def test_take_freed_block_ranges_reports_nulled_entries():
+    """The worker nulls exactly the block-table entries the manager freed, so
+    the reported ranges must be tagged with their group, cover only entries
+    now holding the null block, and be dropped when the request is freed."""
+    block_size = 16
+    full_spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    swa_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=block_size,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=20,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["full"], full_spec),
+                KVCacheGroupSpec(["swa"], swa_spec),
+            ],
+        ),
+        max_model_len=8192,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    req = make_request("0", [0] * (3 * block_size + 1), block_size, sha256)
+
+    assert manager.allocate_slots(req, req.num_tokens) is not None
+    assert manager.take_freed_block_ranges() == {}
+
+    req.num_computed_tokens = req.num_tokens
+    req.append_output_token_ids(0)
+    assert manager.allocate_slots(req, 1) is not None
+    # 49 computed tokens with a 16-token window: tokens [0, 34) are skipped.
+    assert manager.take_freed_block_ranges() == {"0": [(1, 0, 2)]}
+    swa_blocks = manager.coordinator.single_type_managers[1].req_to_blocks["0"]
+    assert [b.is_null for b in swa_blocks] == [True, True, False, False]
+    assert manager.take_freed_block_ranges() == {}
+
+    # A request freed before its ranges are drained must not report them.
+    req.append_output_token_ids([0] * block_size)
+    req.num_computed_tokens = req.num_tokens - 1
+    assert manager.allocate_slots(req, 1) is not None
+    manager.free(req)
+    assert manager.take_freed_block_ranges() == {}
