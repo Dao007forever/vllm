@@ -699,16 +699,12 @@ class SingleTypeKVCacheManager(ABC):
         if freed:
             self.block_pool.free_blocks(freed)
             if self._record_freed_blocks:
-                self._record_freed_range(
-                    request_id, last_block - len(freed), last_block
-                )
-
-    def _record_freed_range(self, request_id: str, start: int, end: int) -> None:
-        ranges = self.freed_block_ranges.setdefault(request_id, [])
-        if ranges and ranges[-1][1] == start:
-            ranges[-1] = (ranges[-1][0], end)
-        else:
-            ranges.append((start, end))
+                start = last_block - len(freed)
+                ranges = self.freed_block_ranges.setdefault(request_id, [])
+                if ranges and ranges[-1][1] == start:
+                    ranges[-1] = (ranges[-1][0], last_block)
+                else:
+                    ranges.append((start, last_block))
 
     def remove_skipped_blocks(
         self,
