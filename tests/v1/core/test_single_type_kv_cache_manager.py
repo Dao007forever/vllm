@@ -812,6 +812,10 @@ def test_sliding_window_remove_skipped_blocks():
     manager.remove_skipped_blocks("test", 11)
     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
 
+    # The worker nulls these block-table entries; adjacent frees coalesce.
+    assert manager.take_freed_block_ranges() == {"test": [(0, 4)]}
+    assert manager.take_freed_block_ranges() == {}
+
 
 def test_rswa_remove_skipped_blocks_gap_range():
     block_size = 4
@@ -856,6 +860,9 @@ def test_rswa_remove_skipped_blocks_gap_range():
     expected[5] = null_block_id
     expected[6] = null_block_id
     assert [b.block_id for b in block_table] == expected
+
+    # The gap is reported as a middle range, not a head prefix.
+    assert manager.take_freed_block_ranges() == {"test": [(4, 7)]}
 
 
 def test_get_num_blocks_to_allocate():

@@ -314,3 +314,37 @@ def test_dummy_request_slot_mapping_is_pad():
         num_tokens_padded=3,
     )
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
+
+
+def test_null_block_range_points_freed_entries_at_null_block():
+    """Blocks the KV cache manager freed may be reused, so their persistent
+    block-table entries must become the null block, expanded to kernel blocks
+    the same way append_block_ids expands it and capped at the row length."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 32],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8, 8],
+        device=device,
+        kernel_block_sizes=[16, 16],
+    )
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([1, 2, 3, 4], [10, 11, 12]), overwrite=True
+    )
+    block_tables.append_block_ids(
+        req_index=1, new_block_ids=([5, 6], [13]), overwrite=True
+    )
+    block_tables.apply_staged_writes()
+
+    block_tables.null_block_range(req_index=0, group_idx=0, start=1, end=3)
+    block_tables.null_block_range(req_index=0, group_idx=1, start=0, end=1)
+    # Request 1 only has two blocks in group 0; the range is capped.
+    block_tables.null_block_range(req_index=1, group_idx=0, start=0, end=5)
+    block_tables.apply_staged_writes()
+    torch.accelerator.synchronize()
+
+    assert block_tables.block_tables[0].gpu[0, :4].tolist() == [1, 0, 0, 4]
+    assert block_tables.block_tables[1].gpu[0, :6].tolist() == [0, 1, 22, 23, 24, 25]
+    assert block_tables.block_tables[0].gpu[1, :3].tolist() == [0, 0, 0]
+    assert block_tables.num_blocks.np[:, :2].tolist() == [[4, 2], [6, 2]]
