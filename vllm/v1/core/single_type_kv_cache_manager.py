@@ -118,6 +118,11 @@ class SingleTypeKVCacheManager(ABC):
             and not isinstance(kv_cache_spec, CircularBufferSpec)
         )
         self.new_block_ids: list[int] = []
+        # Block-index ranges [start, end) of req_to_blocks this manager nulled
+        # since the last take_freed_block_ranges, so the worker can null the
+        # same block-table entries instead of keeping ids the pool may reuse.
+        self._record_freed_blocks = isinstance(kv_cache_spec, AttentionSpec)
+        self.freed_block_ranges: dict[str, list[tuple[int, int]]] = {}
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
@@ -419,6 +424,12 @@ class SingleTypeKVCacheManager(ABC):
         self.new_block_ids = []
         return ids
 
+    def take_freed_block_ranges(self) -> dict[str, list[tuple[int, int]]]:
+        """Drain and return the block-index ranges nulled since the last call."""
+        ranges = self.freed_block_ranges
+        self.freed_block_ranges = {}
+        return ranges
+
     def take_pending_cow_copies(
         self,
     ) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
@@ -576,6 +587,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self.freed_block_ranges.pop(request_id, None)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -668,6 +680,13 @@ class SingleTypeKVCacheManager(ABC):
             blocks[i] = self._null_block
         if freed:
             self.block_pool.free_blocks(freed)
+            if self._record_freed_blocks:
+                start = last_block - len(freed)
+                ranges = self.freed_block_ranges.setdefault(request_id, [])
+                if ranges and ranges[-1][1] == start:
+                    ranges[-1] = (ranges[-1][0], last_block)
+                else:
+                    ranges.append((start, last_block))
 
     def remove_skipped_blocks(
         self,

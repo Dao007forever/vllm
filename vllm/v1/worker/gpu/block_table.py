@@ -128,6 +128,21 @@ class BlockTables:
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
 
+    def null_block_range(
+        self, req_index: int, group_idx: int, start: int, end: int
+    ) -> None:
+        """Point KV blocks ``[start, end)`` of a row at the null block.
+
+        Mirrors the KV cache manager freeing those blocks (e.g. below a sliding
+        window); the table is otherwise append-only and would keep ids the pool
+        may reuse. Takes effect at the next apply_staged_writes.
+        """
+        end = min(end, int(self.num_blocks.np[group_idx, req_index]))
+        if start < end:
+            self.block_tables[group_idx].stage_write(
+                req_index, start, [0] * (end - start)
+            )
+
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
             return

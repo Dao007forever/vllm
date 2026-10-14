@@ -301,6 +301,12 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Block-table entries the KV cache manager replaced with the null block
+    # (e.g. blocks below a sliding window) during this step, as
+    # {req_id: [(kv_cache_group_id, start, end), ...]} block-index ranges. The
+    # freed blocks may be reused, so the worker must stop pointing at them.
+    freed_block_ranges: dict[str, list[tuple[int, int, int]]] | None = None
+
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 

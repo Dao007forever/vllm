@@ -1246,6 +1246,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+        freed_block_ranges = scheduler_output.freed_block_ranges or {}
+        for req_id, ranges in freed_block_ranges.items():
+            if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
+                for group_idx, start, end in ranges:
+                    self.block_tables.null_block_range(idx, group_idx, start, end)
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
