@@ -2271,6 +2271,9 @@ def _run_recorded_copies(nixl):
     + [
         ("DeepSeek-V3", "BLNHC", "BLNHC"),
         ("DeepSeek-V3", "BLNHC", "LBNHC"),
+        ("Qwen3-Next-80B-A3B", "BLHNC", "BLHNC"),
+        ("NVIDIA-Nemotron-Nano-9B-v2", "BLHNC", "BLHNC"),
+        ("Kimi-Linear-48B-A3B", "BLNHC", "BLNHC"),
     ],
 )
 def test_real_model_layout_pull_copies_every_page(model, p_layout, d_layout):
