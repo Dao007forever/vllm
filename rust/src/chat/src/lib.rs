@@ -63,7 +63,7 @@ mod stream;
 use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::request::ReasoningParserKwargs;
-use vllm_llm::Llm;
+use vllm_llm::{GenerateOutput, GeneratePromptInfo, Llm};
 use vllm_text::{Prompt, TextLlm, TextRequest, TextRequestProcessor};
 
 /// Chat request preparation shared by inference and render-only frontends.
@@ -230,14 +230,7 @@ impl ChatRequestProcessor {
     ) -> Result<(TextRequest, DynChatOutputProcessor)> {
         request.validate()?;
 
-        let mut output_processor = self.backend.new_chat_output_processor(
-            &mut request,
-            NewChatOutputProcessorOptions {
-                tool_call_parser: &self.tool_call_parser,
-                reasoning_parser: &self.reasoning_parser,
-                tool_strict_level: self.tool_strict_level,
-            },
-        )?;
+        let mut output_processor = self.new_output_processor(&mut request)?;
         let mut text_request = self.prepare_text_request(request).await?;
 
         // Initialize the output processor from the final prompt token IDs and apply
@@ -250,6 +243,70 @@ impl ChatRequestProcessor {
         apply_output_grammar(&mut text_request, grammar)?;
 
         Ok((text_request, output_processor))
+    }
+
+    /// Parse output token IDs generated for a prepared request into the final
+    /// assistant message, without an engine.
+    ///
+    /// `request` must be the request passed to [`Self::prepare`] and
+    /// `prompt_token_ids` the prompt it produced, so that parsers resolve and
+    /// initialize the same way as they would during generation.
+    pub async fn detokenize(
+        &self,
+        mut request: ChatRequest,
+        text_processor: &TextRequestProcessor,
+        prompt_token_ids: Vec<u32>,
+        output_token_ids: Vec<u32>,
+        finish_reason: FinishReason,
+    ) -> Result<CollectedAssistantMessage> {
+        request.validate()?;
+
+        let mut output_processor = self.new_output_processor(&mut request)?;
+        output_processor.initialize(&prompt_token_ids)?;
+
+        let output = GenerateOutput {
+            request_id: request.request_id.clone(),
+            prompt_info: Some(Box::new(GeneratePromptInfo {
+                prompt_token_ids: prompt_token_ids.into(),
+                prompt_logprobs: None,
+                prompt_token_id_logprobs: None,
+            })),
+            token_ids: output_token_ids,
+            logprobs: None,
+            finish_reason: Some(finish_reason),
+            cached_token_count: 0,
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+            sampling_mask: None,
+            spec_decode_metrics: None,
+            weight_versions: None,
+            timestamps: Default::default(),
+        };
+        let decoded_stream = vllm_text::output::decoded_text_event_stream(
+            request.request_id.clone(),
+            text_processor.tokenizer(),
+            futures::stream::iter([Ok(output)]),
+            request.decode_options,
+            /* intermediate */ false,
+        )
+        .map_err(Error::from)
+        .boxed();
+
+        let structured_stream = output_processor.process(decoded_stream)?;
+        ChatEventStream::new(request.request_id, structured_stream)
+            .collect_message()
+            .await
+    }
+
+    fn new_output_processor(&self, request: &mut ChatRequest) -> Result<DynChatOutputProcessor> {
+        self.backend.new_chat_output_processor(
+            request,
+            NewChatOutputProcessorOptions {
+                tool_call_parser: &self.tool_call_parser,
+                reasoning_parser: &self.reasoning_parser,
+                tool_strict_level: self.tool_strict_level,
+            },
+        )
     }
 }
 
