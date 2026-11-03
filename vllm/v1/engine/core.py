@@ -31,7 +31,6 @@ from vllm.distributed import (
 from vllm.distributed.ec_transfer.ec_connector.encoder_output_width import (
     measure_encoder_output_widths,
 )
-from vllm.distributed.utils import sched_yield
 from vllm.envs import enable_envs_cache
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import configure_logging, init_logger
@@ -1285,9 +1284,6 @@ _INPUTS_HANDLED_DURING_STEP = (
     EngineCoreRequestType.EXECUTOR_FAILED,
     EngineCoreRequestType.WAKEUP,
 )
-# While waiting for a step's output, how long to busy-poll for new inputs
-# before falling back to a blocking wait for the output.
-_INPUT_SPIN_DURATION_S = 1.0
 
 
 class EngineCoreProc(EngineCore):
@@ -1895,16 +1891,16 @@ class EngineCoreProc(EngineCore):
         aborts as they arrive."""
         poll: Callable[[], bool] | None = getattr(future, "poll", None)
         if poll is not None:
+            wait_for_response: Callable[[], bool] | None = getattr(
+                future, "wait_for_response", None
+            )
             pending_inputs = self.input_queue.queue
-            spin_deadline = time.monotonic() + _INPUT_SPIN_DURATION_S
             while not self._deferred_inputs and not poll():
                 if pending_inputs:
                     self._handle_input_during_step(self.input_queue.get_nowait())
-                elif time.monotonic() < spin_deadline:
-                    sched_yield()
-                else:
-                    # Long-running step: stop busy-looping and block until the
-                    # output arrives. Later inputs are handled after the step.
+                elif wait_for_response is None or not wait_for_response():
+                    # Block until the output arrives. Later inputs are handled
+                    # after the step.
                     break
 
         return future.result()

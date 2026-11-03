@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import weakref
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -186,6 +187,11 @@ class SpinCondition:
             self.read_cancel_socket = None
             self.write_cancel_socket = None
             self.poller = None
+
+    def connect(self, notify_address: str) -> None:
+        """Also wake on notifications from another writer."""
+        assert self.is_reader, "Only readers can connect to more writers"
+        self.local_notify_socket.connect(notify_address)
 
     def record_read(self):
         self.last_read = time.monotonic()
@@ -617,6 +623,36 @@ class MessageQueue:
 
     def export_handle(self) -> Handle:
         return self.handle
+
+    @staticmethod
+    def create_reader_condition(
+        mqs: Sequence["MessageQueue"], busy_loop_s: float = 1
+    ) -> SpinCondition | None:
+        """A reader SpinCondition woken by a write to any of the given queues,
+        for waiting on several at once. None unless all are local readers."""
+        if not mqs or not all(mq._is_local_reader for mq in mqs):
+            return None
+        # Local readers' handles always have a notify address.
+        first_addr, *other_addrs = (
+            cast(str, mq.handle.local_notify_addr) for mq in mqs
+        )
+        context = Context()
+        condition = SpinCondition(
+            is_reader=True,
+            context=context,
+            notify_address=first_addr,
+            busy_loop_s=busy_loop_s,
+        )
+        for addr in other_addrs:
+            condition.connect(addr)
+        sockets = [
+            condition.local_notify_socket,
+            condition.read_cancel_socket,
+            condition.write_cancel_socket,
+        ]
+        finalizer = weakref.finalize(condition, _close_zmq, context, sockets)
+        finalizer.atexit = False  # type: ignore[misc]
+        return condition
 
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":

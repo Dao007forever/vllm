@@ -7,12 +7,10 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
-from unittest import mock
 
 import pytest
 
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine import core as engine_core
 from vllm.v1.engine.core import EngineCoreProc
 
 ADD = EngineCoreRequestType.ADD
@@ -30,10 +28,12 @@ class PollableFuture(Future):
         self,
         ready_after: int,
         on_poll: Callable[[int], None] | None = None,
+        can_wait: bool = True,
     ):
         super().__init__()
         self.ready_after = ready_after
         self.on_poll = on_poll
+        self.can_wait = can_wait
         self.polls = 0
 
     def poll(self) -> bool:
@@ -43,6 +43,10 @@ class PollableFuture(Future):
         if self.polls >= self.ready_after and not self.done():
             self.set_result("output")
         return self.done()
+
+    def wait_for_response(self) -> bool:
+        # Stands in for spinning or sleeping until a response may be ready.
+        return self.can_wait
 
     def result(self, timeout=None):
         # Stands in for blocking until the output arrives.
@@ -122,17 +126,12 @@ def test_future_without_poll_blocks_for_result():
     assert engine.input_queue.qsize() == 1
 
 
-def test_blocks_for_output_after_spin_period():
-    """Once the spin period has passed, pending inputs are still handled, then
-    the wait blocks for the output rather than busy-looping."""
+def test_blocks_for_output_if_it_cannot_wait_for_a_response():
+    """If the future can't wait for a response between polls, pending inputs
+    are still handled, then the wait blocks for the output."""
     engine, handled = make_engine()
     engine.input_queue.put((ADD, "a"))
-    future = PollableFuture(ready_after=1000)
-    with (
-        mock.patch.object(engine_core, "_INPUT_SPIN_DURATION_S", 0.0),
-        mock.patch.object(engine_core, "sched_yield") as sched_yield,
-    ):
-        assert engine._wait_for_output(future) == "output"
-    sched_yield.assert_not_called()
+    future = PollableFuture(ready_after=1000, can_wait=False)
+    assert engine._wait_for_output(future) == "output"
     assert future.polls == 2
     assert handled == [(ADD, "a")]

@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for non-blocking polling of multiproc executor futures."""
 
+import time
 from collections import deque
 
 import pytest
+import zmq
 
+from vllm.distributed.device_communicators.shm_broadcast import SpinCondition
+from vllm.utils.network_utils import get_open_zmq_ipc_path
 from vllm.v1.executor.multiproc_executor import FutureWrapper
 
 
@@ -82,3 +86,39 @@ def test_poll_sets_exception_from_response():
     assert future.poll()
     with pytest.raises(ValueError, match="worker failed"):
         future.result()
+
+
+def test_dispatch_starts_response_condition_busy_window():
+    """After a period with no responses, dispatching a new call makes waits
+    for its response spin rather than sleep, so it is seen promptly."""
+    context = zmq.Context()
+    condition = SpinCondition(
+        is_reader=True,
+        context=context,
+        notify_address=get_open_zmq_ipc_path(),
+        busy_loop_s=60,
+    )
+    try:
+        condition.last_read = time.monotonic() - 120  # Idle for a while.
+        start = time.monotonic()
+        condition.wait(timeout_ms=200)
+        assert time.monotonic() - start >= 0.15  # Slept.
+
+        response = Response("a", [])
+        FutureWrapper(
+            deque(),
+            response.get,
+            response_ready=response.ready,
+            response_condition=condition,
+        )
+        start = time.monotonic()
+        condition.wait(timeout_ms=5000)
+        assert time.monotonic() - start < 0.1  # Spun.
+    finally:
+        for sock in (
+            condition.local_notify_socket,
+            condition.read_cancel_socket,
+            condition.write_cancel_socket,
+        ):
+            sock.close(linger=0)
+        context.term()
