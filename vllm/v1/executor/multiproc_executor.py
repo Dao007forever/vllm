@@ -28,7 +28,11 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
-from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.distributed.device_communicators.shm_broadcast import (
+    Handle,
+    MessageQueue,
+    SpinCondition,
+)
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
@@ -95,10 +99,21 @@ class FutureWrapper(Future):
         futures_queue: deque["FutureWrapper"],
         get_response: Callable[[], Any],
         aggregate: Callable = lambda x: x,
+        response_ready: Callable[[], bool] | None = None,
+        response_condition: SpinCondition | None = None,
     ):
         self.futures_queue = futures_queue
         self.get_response = get_response
         self.aggregate = aggregate
+        # Non-blocking check for whether get_response() can return without
+        # waiting. If None, poll() treats the response as ready (and blocks).
+        self.response_ready = response_ready
+        # Woken by any write to the response queues; see wait_for_response().
+        self.response_condition = response_condition
+        if response_condition is not None:
+            # Spin rather than sleep while the response is likely imminent,
+            # including for the first step after the engine has been idle.
+            response_condition.record_read()
         super().__init__()
         self.futures_queue.appendleft(self)
 
@@ -112,9 +127,29 @@ class FutureWrapper(Future):
             future._wait_for_response()
         return super().result()
 
+    def poll(self) -> bool:
+        while not self.done():
+            future = self.futures_queue[-1]
+            if future.response_ready is not None and not future.response_ready():
+                return False
+            self.futures_queue.pop()
+            future._wait_for_response()
+        return True
+
+    def wait_for_response(self) -> bool:
+        """Between poll() calls, spin briefly or, if no response has arrived
+        recently, sleep until one may have. Returns False if unsupported; then
+        block in result() instead."""
+        if self.response_condition is None:
+            return False
+        self.response_condition.wait()
+        return True
+
     def _wait_for_response(self):
         try:
             response = self.aggregate(self.get_response())
+            if self.response_condition is not None:
+                self.response_condition.record_read()
             with suppress(InvalidStateError):
                 self.set_result(response)
         except Exception as e:
@@ -135,6 +170,7 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        self.response_condition: SpinCondition | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -271,6 +307,9 @@ class MultiprocExecutor(Executor):
             # Wait for all remote response mqs to be ready.
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready()
+            self.response_condition = MessageQueue.create_reader_condition(
+                self.response_mqs
+            )
 
             self.futures_queue = deque[FutureWrapper]()
 
@@ -550,7 +589,11 @@ class MultiprocExecutor(Executor):
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(
-            self.futures_queue, get_response=get_response, aggregate=aggregate
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+            response_ready=lambda: all(mq.readable() for mq in response_mqs),
+            response_condition=self.response_condition,
         )
 
         return future if non_block else future.result()
@@ -639,6 +682,9 @@ class MultiprocExecutor(Executor):
             for mq in response_mqs:
                 mq.shutdown()
             self.response_mqs = []
+        if response_condition := getattr(self, "response_condition", None):
+            # Wake the engine thread if it's waiting for a response.
+            response_condition.cancel()
 
         logger.debug_once("[shutdown] Executor: complete")
 

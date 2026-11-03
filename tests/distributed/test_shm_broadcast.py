@@ -726,6 +726,84 @@ def test_acquire_read_releases_slot_when_reader_raises():
         reader.shutdown()
 
 
+def test_readable_reports_pending_message_without_consuming():
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=2,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        assert not reader.readable()
+        writer.enqueue("first")
+        writer.enqueue("second")
+        # Checking readability doesn't consume the message.
+        assert reader.readable()
+        assert reader.readable()
+        assert reader.dequeue(timeout=5) == "first"
+        assert reader.readable()
+        assert reader.dequeue(timeout=5) == "second"
+        assert not reader.readable()
+
+        reader.shutdown()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            reader.readable()
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+
+
+def test_reader_condition_wakes_on_write_to_any_queue():
+    """An idle reader condition for several queues sleeps until a write to any
+    of them, or until cancelled."""
+    writers = [
+        MessageQueue(n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=2)
+        for _ in range(2)
+    ]
+    readers = [MessageQueue.create_from_handle(w.export_handle(), 0) for w in writers]
+    try:
+        for writer, reader in zip(writers, readers):
+            writer.wait_until_ready()
+            reader.wait_until_ready()
+        condition = MessageQueue.create_reader_condition(readers, busy_loop_s=0)
+        assert condition is not None
+        time.sleep(0.2)  # Let the notify subscriptions connect.
+
+        start = time.monotonic()
+        condition.wait(timeout_ms=200)
+        assert time.monotonic() - start >= 0.15
+
+        for writer, reader in zip(writers, readers):
+            threading.Timer(0.1, writer.enqueue, args=("msg",)).start()
+            start = time.monotonic()
+            condition.wait(timeout_ms=10_000)
+            assert time.monotonic() - start < 5
+            assert reader.dequeue(timeout=5) == "msg"
+
+        threading.Timer(0.1, condition.cancel).start()
+        start = time.monotonic()
+        condition.wait(timeout_ms=10_000)
+        assert time.monotonic() - start < 5
+    finally:
+        for mq in writers + readers:
+            mq.shutdown()
+
+
+def test_reader_condition_requires_local_readers():
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=2
+    )
+    try:
+        assert MessageQueue.create_reader_condition([]) is None
+        assert MessageQueue.create_reader_condition([writer]) is None
+    finally:
+        writer.shutdown()
+
+
 def test_reader_in_reference_cycle_is_collected_without_blocking():
     writer = MessageQueue(
         n_reader=1,

@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import weakref
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -186,6 +187,11 @@ class SpinCondition:
             self.read_cancel_socket = None
             self.write_cancel_socket = None
             self.poller = None
+
+    def connect(self, notify_address: str) -> None:
+        """Also wake on notifications from another writer."""
+        assert self.is_reader, "Only readers can connect to more writers"
+        self.local_notify_socket.connect(notify_address)
 
     def record_read(self):
         self.last_read = time.monotonic()
@@ -619,6 +625,36 @@ class MessageQueue:
         return self.handle
 
     @staticmethod
+    def create_reader_condition(
+        mqs: Sequence["MessageQueue"], busy_loop_s: float = 1
+    ) -> SpinCondition | None:
+        """A reader SpinCondition woken by a write to any of the given queues,
+        for waiting on several at once. None unless all are local readers."""
+        if not mqs or not all(mq._is_local_reader for mq in mqs):
+            return None
+        # Local readers' handles always have a notify address.
+        first_addr, *other_addrs = (
+            cast(str, mq.handle.local_notify_addr) for mq in mqs
+        )
+        context = Context()
+        condition = SpinCondition(
+            is_reader=True,
+            context=context,
+            notify_address=first_addr,
+            busy_loop_s=busy_loop_s,
+        )
+        for addr in other_addrs:
+            condition.connect(addr)
+        sockets = [
+            condition.local_notify_socket,
+            condition.read_cancel_socket,
+            condition.write_cancel_socket,
+        ]
+        finalizer = weakref.finalize(condition, _close_zmq, context, sockets)
+        finalizer.atexit = False  # type: ignore[misc]
+        return condition
+
+    @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
@@ -846,10 +882,7 @@ class MessageQueue:
         """Wait for the current block to be readable by this reader."""
 
         def check_readable():
-            memory_fence()
-            read_flag = metadata_buffer[self.local_reader_rank + 1]
-            written_flag = metadata_buffer[0]
-            return not (not written_flag or read_flag)
+            return self._is_readable(metadata_buffer)
 
         if SPINLOOP_EXT_ENABLED and not check_readable():
             spinloop(
@@ -877,6 +910,25 @@ class MessageQueue:
         if read_timeout.should_warn():
             logger.info(LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL)
         return False
+
+    def _is_readable(self, metadata_buffer) -> bool:
+        """Whether the current block is written and not yet read by this reader."""
+        memory_fence()
+        read_flag = metadata_buffer[self.local_reader_rank + 1]
+        written_flag = metadata_buffer[0]
+        return bool(written_flag) and not read_flag
+
+    def readable(self) -> bool:
+        """Non-blocking check for whether a message is ready to be dequeued.
+        Raises RuntimeError if the queue has been shut down."""
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                return self._is_readable(metadata_buffer)
+        if self._is_remote_reader:
+            return bool(self.remote_socket.poll(timeout=0))
+        raise RuntimeError("Only readers can check readability")
 
     @contextmanager
     def acquire_read(
