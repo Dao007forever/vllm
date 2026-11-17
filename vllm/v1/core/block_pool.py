@@ -838,6 +838,23 @@ class BlockPool:
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks, evict_first=evict_first)
 
+    def requeue_free_cached_block(self, block: KVCacheBlock) -> None:
+        """Move a cached block that no request holds to the back of the free
+        queue, as if it had just been freed, so that LRU evicts it last.
+
+        Args:
+            block: A free (ref_cnt 0) cached block.
+
+        """
+        if block.pool is not None and block.pool is not self._weak_self:
+            pool = block.pool()
+            if pool is not None:
+                pool.requeue_free_cached_block(block)
+            return
+        assert block.ref_cnt == 0 and block.block_hash is not None
+        self.free_block_queue.remove(block)
+        self.free_block_queue.append(block)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 

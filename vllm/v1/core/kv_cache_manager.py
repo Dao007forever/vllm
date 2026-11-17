@@ -649,13 +649,14 @@ class KVCacheManager:
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
-        first when caching is enabled.
+        first when caching is enabled. Cached Mamba states are queued next to
+        the attention blocks they need.
 
         Args:
             request: The request to free the blocks.
 
         """
-        self.coordinator.free(request.request_id)
+        self.coordinator.free(request.request_id, request.block_hashes)
 
     def remove_skipped_blocks(
         self,
