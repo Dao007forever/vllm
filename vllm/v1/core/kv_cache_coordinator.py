@@ -3,8 +3,10 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.dead_entry_tracker import DeadEntryTracker
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -25,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
     prefix_lookup_groups,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -93,6 +97,9 @@ class KVCacheCoordinator(ABC):
     """Coordinate the KV cache of different KV cache groups."""
 
     enable_partial_hash_hits = False
+    # Frees prefix-cache entries that can no longer hit
+    # (--free-dead-prefix-entries); only HybridKVCacheCoordinator sets it.
+    dead_tracker: DeadEntryTracker | None = None
 
     def __init__(
         self,
@@ -645,6 +652,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_hash_lookahead_tokens: int = 0,
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
+        free_dead_prefix_entries: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -717,6 +725,64 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        if free_dead_prefix_entries:
+            self.dead_tracker = self._make_dead_tracker()
+
+    def _make_dead_tracker(self) -> DeadEntryTracker | None:
+        """A tracker for models with one full-attention group and one or more
+        Mamba groups in align mode, all in one block pool and hashed at their
+        block size; None (with a warning) otherwise."""
+        groups = self.kv_cache_config.kv_cache_groups
+        managers = self.single_type_managers
+        # Plain full attention only: subclasses (sinks, R-SWA, ...) hit
+        # differently.
+        attn = [
+            i for i, g in enumerate(groups) if g.manager_cls is FullAttentionManager
+        ]
+        state = [i for i, m in enumerate(managers) if isinstance(m, MambaManager)]
+        others = [
+            i
+            for i, g in enumerate(groups)
+            if g.prefix_cacheable and i not in attn and i not in state
+        ]
+        if (
+            len(attn) != 1
+            or not state
+            or others
+            or self.enable_partial_hash_hits
+            or any(
+                isinstance(m, MambaManager) and m.mamba_cache_mode != "align"
+                for m in managers
+            )
+            or any(
+                managers[i].block_pool is not managers[attn[0]].block_pool
+                or managers[i].block_size != self.hash_block_size
+                for i in attn + state
+            )
+        ):
+            logger.warning(
+                "free_dead_prefix_entries supports one full-attention group and "
+                "Mamba groups in align mode, all hashed at their block size; "
+                "disabled for this model (attention groups %s, state groups %s, "
+                "other cacheable groups %s, partial hash hits %s, block sizes %s, "
+                "hash block size %d).",
+                attn,
+                state,
+                others,
+                self.enable_partial_hash_hits,
+                [m.block_size for m in managers],
+                self.hash_block_size,
+            )
+            return None
+        block_pool = managers[attn[0]].block_pool
+        tracker = DeadEntryTracker(block_pool, attn[0], tuple(state))
+        block_pool.dead_tracker = tracker
+        logger.info(
+            "Freeing dead prefix-cache entries (attention group %d, state groups %s)",
+            attn[0],
+            state,
+        )
+        return tracker
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -937,6 +1003,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
 
+        if self.dead_tracker is not None:
+            # Attention blocks freed as dead still mark a shared prefix.
+            longest_hit_length = max(
+                longest_hit_length,
+                self.dead_tracker.extend_with_ghosts(
+                    block_hashes,
+                    longest_hit_length // self.hash_block_size,
+                    max_cache_hit_length // self.hash_block_size,
+                )
+                * self.hash_block_size,
+            )
         # Uncached shared prefix detection: if any attn. group cached a longer
         # prefix than the reconciled hit, it is an uncached common prefix across
         # requests that a sparse-retention group hasn't cached yet.
@@ -1014,7 +1091,15 @@ def get_kv_cache_coordinator(
     num_hash_lookahead_tokens: int = 0,
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
+    free_dead_prefix_entries: bool = False,
 ) -> KVCacheCoordinator:
+    if free_dead_prefix_entries and (
+        not enable_caching or len(kv_cache_config.kv_cache_groups) == 1
+    ):
+        logger.warning(
+            "free_dead_prefix_entries only applies to hybrid models with "
+            "prefix caching enabled; ignored."
+        )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
@@ -1061,4 +1146,5 @@ def get_kv_cache_coordinator(
         num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         num_prefill_lookahead=num_prefill_lookahead,
         allow_partial_hash_hits=allow_partial_hash_hits,
+        free_dead_prefix_entries=free_dead_prefix_entries,
     )

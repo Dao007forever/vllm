@@ -326,6 +326,14 @@ class CacheConfig:
     prompt tail. Off by default; only takes effect with prefix caching enabled,
     EAGLE on the Mamba group, and a prefix match unit smaller than the Mamba
     block size."""
+    free_dead_prefix_entries: bool = False
+    """Free prefix-cache entries that can no longer serve a hit as soon as they
+    appear, instead of waiting for LRU to reach them: a Mamba state whose
+    full-attention prefix lost a block, and a full-attention block with no
+    cached state at or below it. Applies to hybrid models with one
+    full-attention group and one or more Mamba groups in "align" mode, all
+    hashed at their block size; other models run without it (with a
+    warning)."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton standard decode
     uses B physical rows; FlashInfer and Triton speculative decoding use B+T,
@@ -442,6 +450,7 @@ class CacheConfig:
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
+            "free_dead_prefix_entries",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",

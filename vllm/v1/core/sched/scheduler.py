@@ -369,6 +369,7 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            free_dead_prefix_entries=self.cache_config.free_dead_prefix_entries,
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (

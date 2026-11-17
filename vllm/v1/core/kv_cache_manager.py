@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Concatenate, Literal, ParamSpec, TypeVar, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -28,6 +29,26 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _drain_dead_entries_after(
+    method: Callable[Concatenate["KVCacheManager", _P], _R],
+) -> Callable[Concatenate["KVCacheManager", _P], _R]:
+    """Free the dead prefix-cache entries that the call's evictions and
+    releases created (--free-dead-prefix-entries)."""
+
+    @functools.wraps(method)
+    def wrapper(self: "KVCacheManager", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            if self.dead_tracker is not None:
+                self.dead_tracker.drain()
+
+    return wrapper
 
 
 @dataclass
@@ -146,6 +167,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        free_dead_prefix_entries: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -178,7 +200,9 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            free_dead_prefix_entries=free_dead_prefix_entries,
         )
+        self.dead_tracker = self.coordinator.dead_tracker
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
         # junction costs a forward pass and displaces the block-boundary stop.
@@ -313,6 +337,9 @@ class KVCacheManager:
         # or calls a pooling model with all pooling).
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
+        if self.dead_tracker is not None:
+            # Blocks freed outside this manager (e.g. by a KV connector).
+            self.dead_tracker.drain()
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
@@ -380,6 +407,8 @@ class KVCacheManager:
 
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0, False
+        if self.dead_tracker is not None:
+            self.dead_tracker.drain()
 
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         fa_group_id = coordinator.full_attention_group_id
@@ -397,6 +426,7 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    @_drain_dead_entries_after
     def allocate_slots(
         self,
         request: Request,
@@ -657,6 +687,8 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        if self.dead_tracker is not None:
+            self.dead_tracker.drain()
 
     def remove_skipped_blocks(
         self,
@@ -700,6 +732,8 @@ class KVCacheManager:
 
         """
         self.block_pool.evict_blocks(block_ids)
+        if self.dead_tracker is not None:
+            self.dead_tracker.drain()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
