@@ -729,27 +729,31 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             self.dead_tracker = self._make_dead_tracker()
 
     def _make_dead_tracker(self) -> DeadEntryTracker | None:
-        """A tracker for models with one full-attention group and one or more
-        Mamba groups in align mode, all in one block pool and hashed at their
-        block size; None (with a warning) otherwise."""
+        """A tracker for models with full-attention groups, one or more Mamba
+        groups in align mode and optionally sliding-window groups, all in one
+        block pool and hashed at their block size; None (with a warning)
+        otherwise."""
         groups = self.kv_cache_config.kv_cache_groups
         managers = self.single_type_managers
-        # Plain full attention only: subclasses (sinks, R-SWA, ...) hit
-        # differently.
+        # Plain full attention and sliding window only: subclasses (sinks,
+        # R-SWA, ...) hit differently.
         attn = [
             i for i, g in enumerate(groups) if g.manager_cls is FullAttentionManager
         ]
+        swa = [i for i, g in enumerate(groups) if g.manager_cls is SlidingWindowManager]
         state = [i for i, m in enumerate(managers) if isinstance(m, MambaManager)]
         others = [
             i
             for i, g in enumerate(groups)
-            if g.prefix_cacheable and i not in attn and i not in state
+            if g.prefix_cacheable and i not in attn + swa + state
         ]
         if (
-            len(attn) != 1
+            not attn
             or not state
             or others
             or self.enable_partial_hash_hits
+            # EAGLE drops a matched block, which moves the window a hit needs.
+            or self.drop_eagle_group_ids
             or any(
                 isinstance(m, MambaManager) and m.mamba_cache_mode != "align"
                 for m in managers
@@ -757,30 +761,42 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             or any(
                 managers[i].block_pool is not managers[attn[0]].block_pool
                 or managers[i].block_size != self.hash_block_size
-                for i in attn + state
+                for i in attn + swa + state
             )
         ):
             logger.warning(
-                "free_dead_prefix_entries supports one full-attention group and "
-                "Mamba groups in align mode, all hashed at their block size; "
-                "disabled for this model (attention groups %s, state groups %s, "
-                "other cacheable groups %s, partial hash hits %s, block sizes %s, "
-                "hash block size %d).",
+                "free_dead_prefix_entries supports full-attention, Mamba (align "
+                "mode) and sliding-window groups in one block pool, all hashed at "
+                "their block size, without EAGLE block drops; disabled for this "
+                "model (attention groups %s, sliding-window groups %s, state "
+                "groups %s, other cacheable groups %s, partial hash hits %s, "
+                "EAGLE drop groups %s, block sizes %s, hash block size %d).",
                 attn,
+                swa,
                 state,
                 others,
                 self.enable_partial_hash_hits,
+                sorted(self.drop_eagle_group_ids),
                 [m.block_size for m in managers],
                 self.hash_block_size,
             )
             return None
+        swa_window_blocks = {}
+        for i in swa:
+            manager = managers[i]
+            assert isinstance(manager, SlidingWindowManager)
+            swa_window_blocks[i] = SlidingWindowManager._contiguous_blocks_for_hit(
+                manager.sliding_window, manager.block_size, False
+            )
         block_pool = managers[attn[0]].block_pool
-        tracker = DeadEntryTracker(block_pool, attn[0], tuple(state))
+        tracker = DeadEntryTracker(block_pool, attn, state, swa_window_blocks)
         block_pool.dead_tracker = tracker
         logger.info(
-            "Freeing dead prefix-cache entries (attention group %d, state groups %s)",
-            attn[0],
+            "Freeing dead prefix-cache entries (attention groups %s, state groups "
+            "%s, sliding-window groups %s)",
+            attn,
             state,
+            swa_window_blocks,
         )
         return tracker
 

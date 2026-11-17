@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.v1.core.utils import (
+    chunked_local_layer,
     full_layer,
     mamba_layer,
     new_kv_cache_group,
@@ -106,7 +107,7 @@ def test_attention_past_the_last_state_is_freed_at_release():
         False
     ] * 2
     assert cached(pool, request, 3, STATE)
-    assert tracker.num_freed == [2, 0]
+    assert tracker.num_freed == [2, 0, 0]
     # The freed blocks are reused first.
     assert set(free_queue_head(pool, 2)) == {attn[4].block_id, attn[5].block_id}
     # The freed blocks are junction hints.
@@ -276,11 +277,16 @@ NUM_STATE_GROUPS = 3
 
 
 def hybrid_config(
-    num_blocks: int, block_size: int = MANAGER_BLOCK_SIZE, sliding_window: bool = False
+    num_blocks: int,
+    block_size: int = MANAGER_BLOCK_SIZE,
+    sliding_window: int | None = None,
+    num_attn_groups: int = 1,
+    chunked_local: bool = False,
 ):
     """Three Mamba groups (align mode) and one full-attention group, the
-    layout vLLM gives Qwen3-Next; optionally a sliding-window group too (a
-    layout the tracker does not support)."""
+    layout vLLM gives Qwen3-Next; optionally more full-attention groups, a
+    sliding-window group of ``sliding_window`` tokens, or a chunked-local
+    group (a layout the tracker does not support)."""
     attn = AttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
@@ -293,9 +299,15 @@ def hybrid_config(
         for i in range(NUM_STATE_GROUPS)
     ]
     groups.append(new_kv_cache_group(["attn"], full_layer(attn)))
-    if sliding_window:
+    for i in range(1, num_attn_groups):
+        groups.append(new_kv_cache_group([f"attn{i}"], full_layer(attn)))
+    if sliding_window is not None:
         groups.append(
-            new_kv_cache_group(["swa"], sliding_window_layer(attn, 2 * block_size))
+            new_kv_cache_group(["swa"], sliding_window_layer(attn, sliding_window))
+        )
+    if chunked_local:
+        groups.append(
+            new_kv_cache_group(["local"], chunked_local_layer(attn, 4 * block_size))
         )
     return KVCacheConfig(
         num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
@@ -306,10 +318,20 @@ ATTN_GROUP = NUM_STATE_GROUPS
 
 
 def make_manager(
-    num_blocks: int, free_dead: bool, sliding_window: bool = False, **kwargs
+    num_blocks: int,
+    free_dead: bool,
+    sliding_window: int | None = None,
+    num_attn_groups: int = 1,
+    chunked_local: bool = False,
+    **kwargs,
 ) -> KVCacheManager:
     return KVCacheManager(
-        hybrid_config(num_blocks, sliding_window=sliding_window),
+        hybrid_config(
+            num_blocks,
+            sliding_window=sliding_window,
+            num_attn_groups=num_attn_groups,
+            chunked_local=chunked_local,
+        ),
         max_model_len=8192,
         scheduler_block_size=MANAGER_BLOCK_SIZE,
         hash_block_size=MANAGER_BLOCK_SIZE,
@@ -353,7 +375,7 @@ def test_flag_attaches_tracker_only_for_supported_layouts():
     on = make_manager(64, free_dead=True)
     assert on.dead_tracker is not None
     assert on.block_pool.dead_tracker is on.dead_tracker
-    assert on.dead_tracker.attn == ATTN_GROUP
+    assert on.dead_tracker.attn == (ATTN_GROUP,)
     assert on.dead_tracker.states == tuple(range(NUM_STATE_GROUPS))
 
     off = make_manager(64, free_dead=False)
@@ -378,23 +400,19 @@ def test_flag_attaches_tracker_only_for_supported_layouts():
     )
     assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
 
-    # Two full-attention groups: unsupported, runs without the tracker.
-    config = KVCacheConfig(
-        num_blocks=64,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            new_kv_cache_group(["a0"], full_layer(attn)),
-            new_kv_cache_group(["a1"], full_layer(attn)),
-            *hybrid_config(64).kv_cache_groups[:1],
-        ],
+    # Several full-attention groups and a sliding-window group (e.g. a draft
+    # model's layers): supported.
+    manager = make_manager(
+        64, free_dead=True, sliding_window=2 * MANAGER_BLOCK_SIZE, num_attn_groups=2
     )
-    manager = KVCacheManager(
-        config,
-        max_model_len=8192,
-        scheduler_block_size=MANAGER_BLOCK_SIZE,
-        hash_block_size=MANAGER_BLOCK_SIZE,
-        free_dead_prefix_entries=True,
-    )
+    tracker = manager.dead_tracker
+    assert tracker is not None
+    assert tracker.attn == (ATTN_GROUP, ATTN_GROUP + 1)
+    # cdiv(2 * 16 - 1, 16) blocks before a hit.
+    assert tracker.swa_window_blocks == {ATTN_GROUP + 2: 2}
+
+    # A chunked-local group: unsupported, runs without the tracker.
+    manager = make_manager(64, free_dead=True, chunked_local=True)
     assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
 
 
@@ -440,10 +458,10 @@ def test_flag_on_changes_supported_runs_only():
     assert on.dead_tracker is not None and sum(on.dead_tracker.num_freed) > 0
 
     off = make_manager(
-        64, free_dead=False, sliding_window=True, enable_kv_cache_events=True
+        64, free_dead=False, chunked_local=True, enable_kv_cache_events=True
     )
     on = make_manager(
-        64, free_dead=True, sliding_window=True, enable_kv_cache_events=True
+        64, free_dead=True, chunked_local=True, enable_kv_cache_events=True
     )
     assert on.dead_tracker is None and on.block_pool.dead_tracker is None
     assert _trace(on, seed=0) == _trace(off, seed=0)
@@ -489,7 +507,7 @@ def test_dead_attention_chain_is_freed_after_its_state_is_evicted(free_dead):
     else:
         assert not any(attn_cached(manager, dead, i) for i in range(4))
         assert not any(state_cached(manager, dead, 3, g) for g in (1, 2))
-        assert manager.dead_tracker.num_freed == [4, 2]
+        assert manager.dead_tracker.num_freed == [4, 2, 0]
         # One BlockRemoved per dropped entry, with the right group.
         removed = [(e.group_idx, e.block_hashes[0]) for e in events]
         assert all(isinstance(e, BlockRemoved) for e in events)
@@ -532,3 +550,183 @@ def test_lru_eviction_through_allocate_slots_frees_the_chain():
     assert sum(manager.dead_tracker.num_freed) > 0
     manager.free(request)
     pool.free_blocks(held)
+
+
+# ---- several attention groups, sliding-window groups ----------------------
+
+SWA = 2
+
+
+def make_swa_pool(window_blocks: int, attn_groups=(ATTN,), num_blocks: int = 96):
+    pool = BlockPool(
+        num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=BLOCK_SIZE
+    )
+    tracker = DeadEntryTracker(pool, attn_groups, (STATE,), {SWA: window_blocks})
+    pool.dead_tracker = tracker
+    return pool, tracker
+
+
+def cache_chain(pool, request, num_blocks, group):
+    blocks = pool.get_new_blocks(num_blocks)
+    pool.cache_full_blocks(request, blocks, 0, num_blocks, BLOCK_SIZE, group)
+    return blocks
+
+
+def test_several_attention_groups():
+    """Attention layers can span several groups: a position has its
+    attention only while every group has it."""
+    other = 3
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=BLOCK_SIZE)
+    tracker = DeadEntryTracker(pool, (ATTN, other), (STATE,))
+    pool.dead_tracker = tracker
+    request = make_request("a", list(range(4 * BLOCK_SIZE)))
+    attn = {g: cache_chain(pool, request, 4, g) for g in (ATTN, other)}
+    state = cache_state(pool, request, 3)
+    for blocks in attn.values():
+        pool.free_blocks(reversed(blocks))
+    pool.free_blocks([state])
+    tracker.drain()
+    assert all(cached(pool, request, i, g) for i in range(4) for g in (ATTN, other))
+    pool.evict_blocks({attn[other][2].block_id})
+    tracker.drain()
+    assert not any(cached(pool, request, i, g) for i in range(4) for g in (ATTN, other))
+    assert not cached(pool, request, 3, STATE)
+    assert not tracker.parent
+
+
+def _swa_run(window_blocks, num_blocks, state_at, state_first=False):
+    pool, tracker = make_swa_pool(window_blocks)
+    request = make_request("a", list(range(num_blocks * BLOCK_SIZE)))
+    states = [cache_state(pool, request, i) for i in state_at] if state_first else []
+    attn = cache_chain(pool, request, num_blocks, ATTN)
+    swa = cache_chain(pool, request, num_blocks, SWA)
+    if not state_first:
+        states = [cache_state(pool, request, i) for i in state_at]
+    pool.free_blocks(reversed(attn))
+    pool.free_blocks(reversed(swa))
+    pool.free_blocks(states)
+    tracker.drain()
+    return pool, tracker, request, swa
+
+
+@pytest.mark.parametrize("state_first", [False, True])
+def test_window_blocks_outside_every_window_are_freed(state_first):
+    """A hit at a state needs the window ending there; W blocks outside every
+    usable state's window are freed when released. A state cached before its
+    window blocks (group order) becomes usable once they arrive."""
+    pool, tracker, request, _ = _swa_run(2, 6, [3], state_first)
+    assert [cached(pool, request, i, SWA) for i in range(6)] == [
+        False, False, True, True, False, False,
+    ]  # fmt: skip
+    assert [cached(pool, request, i, ATTN) for i in range(6)] == [True] * 4 + [
+        False
+    ] * 2
+    assert cached(pool, request, 3, STATE)
+    assert tracker.num_freed == [2, 0, 4]
+
+
+def test_losing_a_window_block_kills_the_state():
+    pool, tracker, request, swa = _swa_run(2, 6, [3])
+    pool.evict_blocks({swa[2].block_id})
+    tracker.drain()
+    assert not cached(pool, request, 3, STATE)
+    assert not any(cached(pool, request, i, g) for i in range(6) for g in (ATTN, SWA))
+    assert not tracker.parent
+
+
+def test_window_shared_by_two_states_outlives_the_newer_one():
+    """W blocks in the windows of two states stay while either is usable."""
+    pool, tracker, request, _ = _swa_run(3, 6, [3, 4])
+    assert [cached(pool, request, i, SWA) for i in range(6)] == [False] + [True] * 4 + [
+        False
+    ]
+    key = make_block_hash_with_group_id(request.block_hashes[4], STATE)
+    pool.evict_blocks({pool.cached_blocks_for(key)[0].block_id})
+    tracker.drain()
+    # Block 4 now only served the evicted state; 1-3 are the older one's window.
+    assert [cached(pool, request, i, SWA) for i in range(6)] == [False] + [True] * 3 + [
+        False
+    ] * 2
+    assert cached(pool, request, 3, STATE)
+    assert [cached(pool, request, i, ATTN) for i in range(6)] == [True] * 4 + [
+        False
+    ] * 2
+
+
+def test_window_reaching_the_start_of_the_sequence():
+    """Near the start, a hit needs every block from the start, not a full
+    window."""
+    pool, tracker, request, _ = _swa_run(3, 4, [1])
+    assert cached(pool, request, 1, STATE)
+    assert [cached(pool, request, i, SWA) for i in range(4)] == [True, True] + [
+        False
+    ] * 2
+    assert [cached(pool, request, i, ATTN) for i in range(4)] == [True, True] + [
+        False
+    ] * 2
+
+
+def _chunked_trace(manager: KVCacheManager, seed: int, chunk_blocks: int = 3) -> list:
+    """A random multi-turn workload with branches and chunked prefill (so
+    sliding-window blocks are released while requests run); returns the hit
+    and shared-prefix junction of every request."""
+    rng = random.Random(seed)
+    out: list = []
+    histories: dict[int, list[int]] = {}
+    for step in range(80):
+        session = rng.randrange(5)
+        history = histories.get(session, [session * 100_000])
+        if rng.random() < 0.25 and len(history) > 2 * MANAGER_BLOCK_SIZE:
+            history = history[: rng.randrange(MANAGER_BLOCK_SIZE, len(history))]
+        history = history + [
+            rng.randrange(50_000) for _ in range(rng.randrange(8, 120))
+        ]
+        histories[session] = history
+        request = make_request(str(step), history, MANAGER_BLOCK_SIZE)
+        blocks, num_hit, boundary = manager.get_computed_blocks(request)
+        out.append((num_hit, boundary))
+        computed = num_hit
+        first = True
+        while computed < request.num_tokens:
+            n = min(chunk_blocks * MANAGER_BLOCK_SIZE, request.num_tokens - computed)
+            if first:
+                new = manager.allocate_slots(request, n, num_hit, blocks)
+                first = False
+            else:
+                new = manager.allocate_slots(request, n)
+            assert new is not None
+            computed += n
+            request.num_computed_tokens = computed
+            manager.new_step_starts()
+        manager.free(request)
+    return out
+
+
+@pytest.mark.parametrize(
+    "sliding_window,num_attn_groups",
+    [(None, 2), (2 * MANAGER_BLOCK_SIZE, 1), (3 * MANAGER_BLOCK_SIZE + 5, 2)],
+)
+def test_never_frees_an_entry_that_could_hit(sliding_window, num_attn_groups):
+    """Without memory pressure LRU never evicts, so every entry the tracker
+    frees is one LRU would have kept: if any of them could serve a hit, a
+    later request would hit less (or find another junction) than with the
+    flag off."""
+    kwargs = dict(
+        sliding_window=sliding_window,
+        num_attn_groups=num_attn_groups,
+        enable_kv_cache_events=True,
+    )
+    off = make_manager(20_000, free_dead=False, **kwargs)
+    on = make_manager(20_000, free_dead=True, **kwargs)
+    trace_off = _chunked_trace(off, seed=1)
+    assert not any(isinstance(e, BlockRemoved) for e in off.take_events())
+    trace_on = _chunked_trace(on, seed=1)
+    assert trace_on == trace_off
+    # Sanity: the workload hits and branches, and the tracker had dead
+    # entries to free (attention past the last state; window blocks).
+    assert sum(hit for hit, _ in trace_off) > 0
+    assert any(boundary for _, boundary in trace_off)
+    assert on.dead_tracker is not None
+    freed = on.dead_tracker.num_freed
+    assert freed[0] > 0
+    assert (freed[2] > 0) == (sliding_window is not None)
