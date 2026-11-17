@@ -4,6 +4,7 @@
 
 import random
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +28,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     make_block_hash_with_group_id,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -284,6 +286,8 @@ def hybrid_config(
     num_attn_groups: int = 1,
     chunked_local: bool = False,
     eagle: str | None = None,
+    attn_block_size: int | None = None,
+    swa_block_size: int | None = None,
 ):
     """Three Mamba groups (align mode) and one full-attention group, the
     layout vLLM gives Qwen3-Next; optionally more full-attention groups, a
@@ -291,9 +295,19 @@ def hybrid_config(
     group (a layout the tracker does not support). ``eagle`` marks the
     groups holding EAGLE draft layers: "attn" (the target's attention group,
     as with an MTP layer), "draft" (an extra full-attention group), "swa"
-    (the sliding-window group) or "mamba" (unsupported)."""
+    (the sliding-window group) or "mamba" (unsupported). Full-attention and
+    sliding-window groups use ``block_size`` unless given their own."""
     attn = AttentionSpec(
-        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+        block_size=attn_block_size or block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    swa = AttentionSpec(
+        block_size=swa_block_size or block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
     )
     mamba = MambaSpec(block_size=block_size, shapes=((1, 1),), dtypes=(torch.float32,))
     groups = [
@@ -308,7 +322,7 @@ def hybrid_config(
         groups.append(new_kv_cache_group([f"attn{i}"], full_layer(attn)))
     if sliding_window is not None:
         groups.append(
-            new_kv_cache_group(["swa"], sliding_window_layer(attn, sliding_window))
+            new_kv_cache_group(["swa"], sliding_window_layer(swa, sliding_window))
         )
     if chunked_local:
         groups.append(
@@ -339,20 +353,28 @@ def make_manager(
     num_attn_groups: int = 1,
     chunked_local: bool = False,
     eagle: str | None = None,
+    block_size: int = MANAGER_BLOCK_SIZE,
+    attn_block_size: int | None = None,
     **kwargs,
 ) -> KVCacheManager:
+    """Hashes at ``MANAGER_BLOCK_SIZE``: a larger Mamba ``block_size`` turns on
+    fine-grained (partial) hash hits; the sliding-window group then uses the
+    hash block size (the only one at which partial hits stay on)."""
     if eagle is not None:
         kwargs["use_eagle"] = True
     return KVCacheManager(
         hybrid_config(
             num_blocks,
+            block_size=block_size,
             sliding_window=sliding_window,
             num_attn_groups=num_attn_groups,
             chunked_local=chunked_local,
             eagle=eagle,
+            attn_block_size=attn_block_size,
+            swa_block_size=MANAGER_BLOCK_SIZE,
         ),
         max_model_len=8192,
-        scheduler_block_size=MANAGER_BLOCK_SIZE,
+        scheduler_block_size=block_size,
         hash_block_size=MANAGER_BLOCK_SIZE,
         enable_caching=True,
         free_dead_prefix_entries=free_dead,
@@ -442,6 +464,30 @@ def test_flag_attaches_tracker_only_for_supported_layouts():
 
     # A chunked-local group: unsupported, runs without the tracker.
     manager = make_manager(64, free_dead=True, chunked_local=True)
+    assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
+
+    # Fine-grained (partial) hash hits: Mamba and attention blocks of four
+    # hash blocks, a sliding-window group at the hash block size.
+    manager = make_manager(
+        64, free_dead=True, block_size=4 * MANAGER_BLOCK_SIZE, sliding_window=40
+    )
+    assert manager.coordinator.enable_partial_hash_hits
+    tracker = manager.dead_tracker
+    assert tracker is not None and tracker.fine_grained
+    assert tracker.attn_block_units == {ATTN_GROUP: 4}
+    assert tracker.swa_window_blocks == {ATTN_GROUP + 1: 3}
+    assert tracker.ghost_lookup == (ATTN_GROUP,)
+    # A sliding-window block larger than the hash block turns partial hits
+    # off, and blocks are then not hashed at their size: unsupported.
+    manager = KVCacheManager(
+        hybrid_config(64, block_size=4 * MANAGER_BLOCK_SIZE, sliding_window=40),
+        max_model_len=8192,
+        scheduler_block_size=4 * MANAGER_BLOCK_SIZE,
+        hash_block_size=MANAGER_BLOCK_SIZE,
+        enable_caching=True,
+        free_dead_prefix_entries=True,
+    )
+    assert not manager.coordinator.enable_partial_hash_hits
     assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
 
 
@@ -793,3 +839,328 @@ def test_eagle_keeps_the_next_block_of_a_usable_state():
     tracker.drain()
     assert not any(cached(pool, request, i, g) for i in range(6) for g in (ATTN, draft))
     assert not tracker.parent
+
+
+# ---- fine-grained (partial) hash hits --------------------------------------
+# Hashes every BLOCK_SIZE tokens (a unit); attention and Mamba blocks span
+# UNITS of them, so a hit can end inside a block.
+
+UNITS = 4
+FINE_BLOCK = UNITS * BLOCK_SIZE
+
+
+def make_fine_pool(eagle: bool = False):
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=BLOCK_SIZE)
+    tracker = DeadEntryTracker(
+        pool,
+        ATTN,
+        (STATE,),
+        eagle_group_ids=(ATTN,) if eagle else (),
+        attn_block_units={ATTN: UNITS},
+        ghost_lookup_group_ids=(ATTN,),
+    )
+    pool.dead_tracker = tracker
+    return pool, tracker
+
+
+def fine_attn(pool, request, num_blocks):
+    """Full attention blocks ``0 .. num_blocks - 1``."""
+    blocks = pool.get_new_blocks(num_blocks)
+    pool.cache_full_blocks(request, blocks, 0, num_blocks, FINE_BLOCK, ATTN)
+    return blocks
+
+
+def fine_entry(pool, request, unit, group=ATTN, block=None):
+    """An entry ending at ``unit``: a partial attention block or a state."""
+    block = block or pool.get_new_blocks(1)[0]
+    pool.cache_partial_block(request, block, (unit + 1) * BLOCK_SIZE, group, FINE_BLOCK)
+    return block
+
+
+def release(pool, tracker, blocks):
+    pool.free_blocks(reversed(blocks))
+    tracker.drain()
+
+
+def fine_cached(pool, request, units, group=ATTN):
+    return [cached(pool, request, u, group) for u in units]
+
+
+def test_fine_full_and_partial_entries_a_state_needs():
+    """A state inside block 2 needs full blocks 0-2 (or a partial entry at or
+    past it in block 2); a partial entry in block 3 serves no state."""
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(5 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 3)
+    blocks.append(fine_entry(pool, request, 13))
+    blocks.append(fine_entry(pool, request, 9, STATE))
+    release(pool, tracker, blocks)
+    assert fine_cached(pool, request, (3, 7, 11, 13)) == [True, True, True, False]
+    assert cached(pool, request, 9, STATE)
+    assert tracker.num_freed == [1, 0, 0]
+    # The freed entry still extends the junction: full blocks 0-2, then the
+    # partial entry at unit 13.
+    assert tracker.ghost_attention_hit(request.block_hashes, 5 * FINE_BLOCK) == (
+        14 * BLOCK_SIZE
+    )
+    assert tracker.ghost_attention_hit(request.block_hashes, 13 * BLOCK_SIZE) == (
+        12 * BLOCK_SIZE
+    )
+
+
+@pytest.mark.parametrize("state_unit,kept", [(9, True), (10, True), (11, False)])
+def test_fine_partial_entry_serves_states_up_to_it(state_unit, kept):
+    """A partial entry at unit 10 serves hits up to it inside its block; a
+    state past it needs the full block (or a later partial entry), which
+    usually arrives later, so the state stays."""
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 2)
+    blocks.append(fine_entry(pool, request, 10))
+    state = fine_entry(pool, request, state_unit, STATE)
+    release(pool, tracker, blocks + [state])
+    assert fine_cached(pool, request, (3, 7, 10)) == [True, True, kept]
+    assert cached(pool, request, state_unit, STATE)
+    # Without the state nothing of the chain can hit.
+    pool.evict_blocks({state.block_id})
+    tracker.drain()
+    assert fine_cached(pool, request, (3, 7, 10)) == [False] * 3
+    assert not tracker.parent
+
+
+def test_fine_losing_a_partial_entry_kills_nothing():
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 2)
+    partial = fine_entry(pool, request, 10)
+    state = fine_entry(pool, request, 9, STATE)
+    release(pool, tracker, blocks + [partial, state])
+    pool.evict_blocks({partial.block_id})
+    tracker.drain()
+    assert fine_cached(pool, request, (3, 7)) == [True, True]
+    assert cached(pool, request, 9, STATE)
+    assert tracker.num_freed == [0, 0, 0]
+
+
+def test_fine_losing_a_full_block_kills_below_it():
+    """Losing full block 1 kills the state in block 2 and block 2; the state
+    inside block 1 stays (a partial entry or the full block may return)."""
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 3)
+    states = [fine_entry(pool, request, u, STATE) for u in (5, 9)]
+    release(pool, tracker, blocks + states)
+    assert fine_cached(pool, request, (3, 7, 11)) == [True] * 3
+    pool.evict_blocks({blocks[1].block_id})
+    tracker.drain()
+    assert fine_cached(pool, request, (3, 7, 11)) == [True, False, False]
+    assert cached(pool, request, 5, STATE)
+    assert not cached(pool, request, 9, STATE)
+
+
+def test_fine_promotion_is_not_an_eviction():
+    """A running request's partial tail block is re-keyed as a full block
+    once it fills: the states it served stay, nothing is freed."""
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 2) + pool.get_new_blocks(1)
+    fine_entry(pool, request, 9, block=blocks[2])
+    state = fine_entry(pool, request, 9, STATE)
+    tracker.drain()
+    # Block 2 fills: partial (unit 9) -> full (unit 11).
+    pool.cache_full_blocks(request, blocks, 2, 3, FINE_BLOCK, ATTN)
+    release(pool, tracker, blocks + [state])
+    assert fine_cached(pool, request, (3, 7, 9, 11)) == [True, True, False, True]
+    assert cached(pool, request, 9, STATE)
+    assert tracker.num_freed == [0, 0, 0]
+
+
+def test_fine_block_keyed_twice_is_freed_with_its_last_entry():
+    """A full block also keyed at a partial boundary inside it (a request
+    whose prompt ends there hit it): freeing the dead partial entry would
+    evict the needed full one, so the block stays until both are dead."""
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 3)
+    fine_entry(pool, request, 9, block=blocks[2])
+    state = fine_entry(pool, request, 11, STATE)
+    release(pool, tracker, blocks + [state])
+    assert fine_cached(pool, request, (9, 11)) == [True, True]
+    pool.evict_blocks({state.block_id})
+    tracker.drain()
+    assert fine_cached(pool, request, (3, 7, 9, 11)) == [False] * 4
+    assert not tracker.parent
+
+
+def test_fine_eagle_needs_the_next_unit():
+    """An EAGLE group matches one unit past the hit: a hit at unit 9 needs
+    unit 10 covered, so the partial entry at 10 is kept and the one at 9 is
+    not; a state at the end of block 1 keeps entries in block 2."""
+    pool, tracker = make_fine_pool(eagle=True)
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 2)
+    partials = [fine_entry(pool, request, u) for u in (9, 10)]
+    state = fine_entry(pool, request, 9, STATE)
+    release(pool, tracker, blocks + partials + [state])
+    assert fine_cached(pool, request, (3, 7, 9, 10)) == [True, True, False, True]
+    assert tracker.ghost_attention_hit(request.block_hashes, 4 * FINE_BLOCK) == (
+        10 * BLOCK_SIZE
+    )
+
+    pool, tracker = make_fine_pool(eagle=True)
+    blocks = fine_attn(pool, request, 2)
+    partials = [fine_entry(pool, request, u) for u in (8, 10)]
+    state = fine_entry(pool, request, 7, STATE)
+    release(pool, tracker, blocks + partials + [state])
+    assert fine_cached(pool, request, (3, 7, 8, 10)) == [True] * 4
+
+
+PARTIAL_BLOCK_SIZE = 4 * MANAGER_BLOCK_SIZE
+
+
+def _split_stub(manager: KVCacheManager, eagle: bool, chunk_tokens: int):
+    """``self`` for the real ``Scheduler._mamba_block_aligned_split``."""
+    partial = manager.coordinator.enable_partial_hash_hits
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=PARTIAL_BLOCK_SIZE),
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        max_num_scheduled_tokens=chunk_tokens,
+        use_eagle=eagle,
+        use_eagle_block_drop=eagle,
+        num_hash_lookahead_tokens=0,
+        hash_block_size=MANAGER_BLOCK_SIZE,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_partial_cache_hit=partial,
+        mamba_shared_prefix_checkpoint=(
+            partial and manager.mamba_shared_prefix_checkpoint
+        ),
+    )
+
+
+def _partial_trace(
+    manager: KVCacheManager, seed: int, chunk_tokens: int, split: bool, eagle: bool
+) -> list:
+    """``_chunked_trace`` for fine-grained hits: prefill in chunks of
+    ``chunk_tokens``, ended where the scheduler's Mamba split ends them
+    (``split``) or exactly there (inside a block); the junction is handed to
+    the request as the scheduler does, and half of the turns decode before
+    the next one (filling and re-keying partial blocks)."""
+    stub = _split_stub(manager, eagle, chunk_tokens)
+    rng = random.Random(seed)
+    out: list = []
+    histories: dict[int, list[int]] = {}
+
+    def step_done():
+        _, retained = manager.take_kv_cache_block_copies()
+        manager.block_pool.free_blocks(retained)
+        manager.new_step_starts()
+
+    for step in range(80):
+        session = rng.randrange(5)
+        history = histories.get(session, [session * 100_000])
+        if rng.random() < 0.25 and len(history) > 2 * PARTIAL_BLOCK_SIZE:
+            history = history[: rng.randrange(MANAGER_BLOCK_SIZE, len(history))]
+        history = history + [
+            rng.randrange(50_000) for _ in range(rng.randrange(8, 150))
+        ]
+        request = make_request(str(step), history, MANAGER_BLOCK_SIZE)
+        blocks, num_hit, boundary = manager.get_computed_blocks(request)
+        request.shared_prefix_boundary = boundary
+        out.append((num_hit, boundary))
+        first = True
+        while request.num_computed_tokens < request.num_tokens:
+            hit = num_hit if first else 0
+            start = request.num_computed_tokens + hit
+            if start >= request.num_tokens:
+                break
+            n = min(chunk_tokens, request.num_tokens - start)
+            if split:
+                n = Scheduler._mamba_block_aligned_split(stub, request, n, hit)
+            assert n > 0
+            assert (
+                manager.allocate_slots(
+                    request,
+                    n,
+                    num_new_computed_tokens=hit,
+                    new_computed_blocks=blocks if first else None,
+                )
+                is not None
+            )
+            request.num_computed_tokens = start + n
+            step_done()
+            first = False
+        if rng.random() < 0.5:
+            for _ in range(rng.randrange(1, 100)):
+                request.append_output_token_ids(rng.randrange(50_000))
+                assert manager.allocate_slots(request, 1) is not None
+                request.num_computed_tokens += 1
+                step_done()
+            history = list(request.all_token_ids)
+        histories[session] = history
+        manager.free(request)
+    return out
+
+
+def _forbid_lru_eviction(manager: KVCacheManager) -> None:
+    queue = manager.block_pool.free_block_queue
+    popleft_n = queue.popleft_n
+
+    def checked(n):
+        blocks = popleft_n(n)
+        assert all(b.block_hash is None for b in blocks), "LRU evicted"
+        return blocks
+
+    queue.popleft_n = checked  # type: ignore[method-assign]
+
+
+PARTIAL_LAYOUTS = {
+    "mamba+attn": dict(),
+    "+swa": dict(sliding_window=40),
+    "eagle-attn": dict(eagle="attn"),
+    "eagle-draft": dict(eagle="draft"),
+    "eagle-swa": dict(sliding_window=40, eagle="swa"),
+    "attn-at-hash-size": dict(attn_block_size=MANAGER_BLOCK_SIZE),
+}
+
+
+@pytest.mark.parametrize("layout", PARTIAL_LAYOUTS)
+@pytest.mark.parametrize(
+    "chunk_tokens,split",
+    [
+        # Chunks ending inside blocks (states and partial entries there).
+        (3 * MANAGER_BLOCK_SIZE, False),
+        (7 * MANAGER_BLOCK_SIZE, False),
+        # The scheduler's chunk ends: block boundaries, the prompt's last hash
+        # boundary and the junction.
+        (40, True),
+    ],
+)
+def test_never_frees_an_entry_that_could_hit_partial(layout, chunk_tokens, split):
+    """``test_never_frees_an_entry_that_could_hit`` with fine-grained hits:
+    hash blocks of 16 tokens, Mamba (and attention) blocks of 64."""
+    kwargs = dict(
+        PARTIAL_LAYOUTS[layout],
+        block_size=PARTIAL_BLOCK_SIZE,
+        enable_kv_cache_events=True,
+    )
+    eagle = "eagle" in kwargs
+    off = make_manager(20_000, free_dead=False, **kwargs)
+    on = make_manager(20_000, free_dead=True, **kwargs)
+    assert on.coordinator.enable_partial_hash_hits
+    assert on.dead_tracker is not None and on.dead_tracker.fine_grained
+    # (Partial entries are re-keyed, so BlockRemoved events do not show LRU
+    # evictions here.)
+    _forbid_lru_eviction(off)
+    trace_off = _partial_trace(off, 1, chunk_tokens, split, eagle)
+    trace_on = _partial_trace(on, 1, chunk_tokens, split, eagle)
+    assert trace_on == trace_off
+    # Sanity: hits end inside blocks, and with EAGLE the junction is used.
+    assert any(hit % PARTIAL_BLOCK_SIZE for hit, _ in trace_off)
+    if eagle:
+        assert any(boundary for _, boundary in trace_off)
+    freed = on.dead_tracker.num_freed
+    if not split:
+        # Attention past the last state (chunk ends inside blocks cache no
+        # state there), and window blocks.
+        assert freed[0] > 0
+    assert (freed[2] > 0) == ("sliding_window" in kwargs)

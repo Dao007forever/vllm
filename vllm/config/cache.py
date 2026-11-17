@@ -328,12 +328,13 @@ class CacheConfig:
     block size."""
     free_dead_prefix_entries: bool = False
     """Free prefix-cache entries that can no longer serve a hit as soon as they
-    appear, instead of waiting for LRU to reach them: a Mamba state whose
+    appear, instead of waiting for LRU to reach them: e.g. a Mamba state whose
     full-attention prefix lost a block, and a full-attention block with no
-    cached state at or below it. Applies to hybrid models with one
-    full-attention group and one or more Mamba groups in "align" mode, all
-    hashed at their block size; other models run without it (with a
-    warning)."""
+    cached state at or below it. Applies to hybrid models with full-attention
+    groups, one or more Mamba groups in "align" mode and optionally
+    sliding-window groups (EAGLE drops on attention groups only), hashed at
+    their block size or with fine-grained (partial) prefix-cache hits; other
+    models run without it (with a warning)."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton standard decode
     uses B physical rows; FlashInfer and Triton speculative decoding use B+T,

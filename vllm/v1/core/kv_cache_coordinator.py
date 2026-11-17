@@ -732,7 +732,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """A tracker for models with full-attention groups, one or more Mamba
         groups in align mode and optionally sliding-window groups (EAGLE block
         drops on attention groups allowed), all in one block pool and hashed
-        at their block size; None (with a warning) otherwise."""
+        at their block size, or with fine-grained (partial) hash hits on
+        (full-attention and Mamba blocks a multiple of the hash block size,
+        no context parallelism); None (with a warning) otherwise."""
         groups = self.kv_cache_config.kv_cache_groups
         managers = self.single_type_managers
         # Plain full attention and sliding window only: subclasses (sinks,
@@ -747,11 +749,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for i, g in enumerate(groups)
             if g.prefix_cacheable and i not in attn + swa + state
         ]
+        fine_grained = self.enable_partial_hash_hits
+        # With partial hits, full-attention and Mamba blocks may span several
+        # hash blocks (sliding window cannot: it turns partial hits off).
+        hashed_at_block_size = swa if fine_grained else attn + swa + state
         if (
             not attn
             or not state
             or others
-            or self.enable_partial_hash_hits
             # Draft layers are attention layers; a Mamba group never drops.
             or not self._eagle_lookup_group_ids() <= set(attn + swa)
             or any(
@@ -760,26 +765,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             or any(
                 managers[i].block_pool is not managers[attn[0]].block_pool
-                or managers[i].block_size != self.hash_block_size
                 for i in attn + swa + state
+            )
+            or any(
+                managers[i].block_size != self.hash_block_size
+                for i in hashed_at_block_size
+            )
+            or (
+                fine_grained
+                and any(m.dcp_world_size > 1 or m.pcp_world_size > 1 for m in managers)
             )
         ):
             logger.warning(
                 "free_dead_prefix_entries supports full-attention, Mamba (align "
-                "mode) and sliding-window groups in one block pool, all hashed at "
-                "their block size, with EAGLE drops on attention groups only; "
-                "disabled for this "
-                "model (attention groups %s, sliding-window groups %s, state "
-                "groups %s, other cacheable groups %s, partial hash hits %s, "
-                "EAGLE drop groups %s, block sizes %s, hash block size %d).",
+                "mode) and sliding-window groups in one block pool, hashed at "
+                "their block size or with fine-grained (partial) hash hits "
+                "without context parallelism, with EAGLE drops on attention "
+                "groups only; disabled for this model (attention groups %s, "
+                "sliding-window groups %s, state groups %s, other cacheable "
+                "groups %s, partial hash hits %s, EAGLE drop groups %s, block "
+                "sizes %s, hash block size %d, DCP/PCP sizes %s).",
                 attn,
                 swa,
                 state,
                 others,
-                self.enable_partial_hash_hits,
+                fine_grained,
                 sorted(self._eagle_lookup_group_ids()),
                 [m.block_size for m in managers],
                 self.hash_block_size,
+                sorted({(m.dcp_world_size, m.pcp_world_size) for m in managers}),
             )
             return None
         swa_window_blocks = {}
@@ -791,15 +805,36 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
         block_pool = managers[attn[0]].block_pool
         eagle = self._eagle_lookup_group_ids()
-        tracker = DeadEntryTracker(block_pool, attn, state, swa_window_blocks, eagle)
+        attn_block_units = None
+        ghost_lookup: list[int] = []
+        if fine_grained:
+            attn_block_units = {
+                i: managers[i].block_size // self.hash_block_size for i in attn
+            }
+            # The junction is the longest hit of the first lookup, which is
+            # full attention (sorted first).
+            first = self.attention_groups[0]
+            assert first.manager_cls is FullAttentionManager
+            ghost_lookup = list(first.group_ids)
+        tracker = DeadEntryTracker(
+            block_pool,
+            attn,
+            state,
+            swa_window_blocks,
+            eagle,
+            attn_block_units=attn_block_units,
+            ghost_lookup_group_ids=ghost_lookup,
+        )
         block_pool.dead_tracker = tracker
         logger.info(
             "Freeing dead prefix-cache entries (attention groups %s, state groups "
-            "%s, sliding-window groups %s, EAGLE drop groups %s)",
+            "%s, sliding-window groups %s, EAGLE drop groups %s, attention block "
+            "sizes in hash blocks %s)",
             attn,
             state,
             swa_window_blocks,
             sorted(eagle),
+            attn_block_units,
         )
         return tracker
 
@@ -1032,7 +1067,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
 
-        if self.dead_tracker is not None:
+        if self.dead_tracker is not None and self.dead_tracker.fine_grained:
+            # Attention entries freed as dead still mark a shared prefix: the
+            # first (full-attention) lookup sets ``longest_hit_length``.
+            longest_hit_length = max(
+                longest_hit_length,
+                self.dead_tracker.ghost_attention_hit(
+                    block_hashes, max_cache_hit_length
+                ),
+            )
+        elif self.dead_tracker is not None:
             # Attention blocks freed as dead still mark a shared prefix.
             # Full attention matches as far as it would have, then drops a
             # block for EAGLE if every full-attention group drops one (the
