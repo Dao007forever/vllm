@@ -3,6 +3,7 @@
 """Freeing prefix-cache entries that can no longer hit (DeadEntryTracker)."""
 
 import random
+from dataclasses import replace
 
 import pytest
 import torch
@@ -282,11 +283,15 @@ def hybrid_config(
     sliding_window: int | None = None,
     num_attn_groups: int = 1,
     chunked_local: bool = False,
+    eagle: str | None = None,
 ):
     """Three Mamba groups (align mode) and one full-attention group, the
     layout vLLM gives Qwen3-Next; optionally more full-attention groups, a
     sliding-window group of ``sliding_window`` tokens, or a chunked-local
-    group (a layout the tracker does not support)."""
+    group (a layout the tracker does not support). ``eagle`` marks the
+    groups holding EAGLE draft layers: "attn" (the target's attention group,
+    as with an MTP layer), "draft" (an extra full-attention group), "swa"
+    (the sliding-window group) or "mamba" (unsupported)."""
     attn = AttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
@@ -309,6 +314,16 @@ def hybrid_config(
         groups.append(
             new_kv_cache_group(["local"], chunked_local_layer(attn, 4 * block_size))
         )
+    if eagle == "draft":
+        groups.append(new_kv_cache_group(["draft"], full_layer(attn)))
+    if eagle is not None:
+        index = {
+            "attn": NUM_STATE_GROUPS,
+            "draft": len(groups) - 1,
+            "swa": len(groups) - 1,
+            "mamba": 0,
+        }[eagle]
+        groups[index] = replace(groups[index], is_eagle_group=True)
     return KVCacheConfig(
         num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
     )
@@ -323,14 +338,18 @@ def make_manager(
     sliding_window: int | None = None,
     num_attn_groups: int = 1,
     chunked_local: bool = False,
+    eagle: str | None = None,
     **kwargs,
 ) -> KVCacheManager:
+    if eagle is not None:
+        kwargs["use_eagle"] = True
     return KVCacheManager(
         hybrid_config(
             num_blocks,
             sliding_window=sliding_window,
             num_attn_groups=num_attn_groups,
             chunked_local=chunked_local,
+            eagle=eagle,
         ),
         max_model_len=8192,
         scheduler_block_size=MANAGER_BLOCK_SIZE,
@@ -410,6 +429,16 @@ def test_flag_attaches_tracker_only_for_supported_layouts():
     assert tracker.attn == (ATTN_GROUP, ATTN_GROUP + 1)
     # cdiv(2 * 16 - 1, 16) blocks before a hit.
     assert tracker.swa_window_blocks == {ATTN_GROUP + 2: 2}
+
+    # EAGLE drops on attention groups: supported.
+    manager = make_manager(
+        64, free_dead=True, sliding_window=2 * MANAGER_BLOCK_SIZE, eagle="swa"
+    )
+    assert manager.dead_tracker is not None
+    assert manager.dead_tracker.eagle == {ATTN_GROUP + 1}
+    # On a Mamba group (draft models have none): unsupported.
+    manager = make_manager(64, free_dead=True, eagle="mamba")
+    assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
 
     # A chunked-local group: unsupported, runs without the tracker.
     manager = make_manager(64, free_dead=True, chunked_local=True)
@@ -703,10 +732,19 @@ def _chunked_trace(manager: KVCacheManager, seed: int, chunk_blocks: int = 3) ->
 
 
 @pytest.mark.parametrize(
-    "sliding_window,num_attn_groups",
-    [(None, 2), (2 * MANAGER_BLOCK_SIZE, 1), (3 * MANAGER_BLOCK_SIZE + 5, 2)],
+    "sliding_window,num_attn_groups,eagle",
+    [
+        (None, 2, None),
+        (2 * MANAGER_BLOCK_SIZE, 1, None),
+        (3 * MANAGER_BLOCK_SIZE + 5, 2, None),
+        # EAGLE: an MTP layer in the target's attention group, a separate
+        # full-attention draft, a sliding-window draft.
+        (None, 1, "attn"),
+        (None, 1, "draft"),
+        (2 * MANAGER_BLOCK_SIZE, 1, "swa"),
+    ],
 )
-def test_never_frees_an_entry_that_could_hit(sliding_window, num_attn_groups):
+def test_never_frees_an_entry_that_could_hit(sliding_window, num_attn_groups, eagle):
     """Without memory pressure LRU never evicts, so every entry the tracker
     frees is one LRU would have kept: if any of them could serve a hit, a
     later request would hit less (or find another junction) than with the
@@ -714,6 +752,7 @@ def test_never_frees_an_entry_that_could_hit(sliding_window, num_attn_groups):
     kwargs = dict(
         sliding_window=sliding_window,
         num_attn_groups=num_attn_groups,
+        eagle=eagle,
         enable_kv_cache_events=True,
     )
     off = make_manager(20_000, free_dead=False, **kwargs)
@@ -730,3 +769,27 @@ def test_never_frees_an_entry_that_could_hit(sliding_window, num_attn_groups):
     freed = on.dead_tracker.num_freed
     assert freed[0] > 0
     assert (freed[2] > 0) == (sliding_window is not None)
+
+
+def test_eagle_keeps_the_next_block_of_a_usable_state():
+    """With EAGLE, a hit at a state also needs its next block in the eagle
+    groups; that block is kept with no state below it, until the state goes."""
+    draft = 3
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=BLOCK_SIZE)
+    tracker = DeadEntryTracker(pool, (ATTN, draft), (STATE,), eagle_group_ids=(draft,))
+    pool.dead_tracker = tracker
+    request = make_request("a", list(range(6 * BLOCK_SIZE)))
+    attn = {g: cache_chain(pool, request, 6, g) for g in (ATTN, draft)}
+    state = cache_state(pool, request, 3)
+    for blocks in attn.values():
+        pool.free_blocks(reversed(blocks))
+    pool.free_blocks([state])
+    tracker.drain()
+    assert [cached(pool, request, i, ATTN) for i in range(6)] == [True] * 4 + [
+        False
+    ] * 2
+    assert [cached(pool, request, i, draft) for i in range(6)] == [True] * 5 + [False]
+    pool.evict_blocks({state.block_id})
+    tracker.drain()
+    assert not any(cached(pool, request, i, g) for i in range(6) for g in (ATTN, draft))
+    assert not tracker.parent

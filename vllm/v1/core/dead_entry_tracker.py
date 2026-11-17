@@ -21,6 +21,14 @@ Three kinds of cached entries can therefore never hit:
 * an A block with no usable state at or below it on its chain, and
 * a W block outside the window of every usable state below it.
 
+With EAGLE, the groups holding draft layers (eagle groups, A or W) match one
+block past the hit and drop it, so a hit at p also needs p's next block in
+every eagle group. That block is usually cached later than the state: the
+state at the end of a turn ends inside a partial block, and the next turn of
+the conversation caches the block after it. A missing next block therefore
+does not make a state dead. Instead, the eagle groups' blocks at the children
+of a usable state are kept, even with no usable state below them.
+
 LRU frees them only when it reaches them, and until then they take the place
 of entries that could still hit. This tracker keeps the prefix tree of cached
 blocks and the states hanging off it, and frees dead entries as soon as they
@@ -63,14 +71,19 @@ class DeadEntryTracker:
         attn_group_ids: int | Iterable[int],
         state_group_ids: int | Iterable[int],
         swa_window_blocks: dict[int, int] | None = None,
+        eagle_group_ids: Iterable[int] = (),
     ):
-        """Args:
-        block_pool: The pool all tracked groups allocate from.
-        attn_group_ids: Full-attention groups.
-        state_group_ids: Mamba groups (align mode).
-        swa_window_blocks: Sliding-window groups, each with the number of
-            contiguous blocks a hit needs (``cdiv(window - 1,
-            block_size)``).
+        """Track the given groups of ``block_pool``.
+
+        Args:
+            block_pool: The pool all tracked groups allocate from.
+            attn_group_ids: Full-attention groups.
+            state_group_ids: Mamba groups (align mode).
+            swa_window_blocks: Sliding-window groups, each with the number of
+                contiguous blocks a hit needs (``cdiv(window - 1,
+                block_size)``).
+            eagle_group_ids: Full-attention or sliding-window groups that
+                drop one matched block for EAGLE.
 
         """
         self.block_pool = block_pool
@@ -79,6 +92,8 @@ class DeadEntryTracker:
         self.swa_window_blocks = dict(swa_window_blocks or {})
         assert self.attn and self.states
         assert all(n >= 1 for n in self.swa_window_blocks.values())
+        self.eagle = frozenset(eagle_group_ids)
+        assert self.eagle <= set(self.attn) | set(self.swa_window_blocks)
         # The longest window, in blocks.
         self._max_window = max(self.swa_window_blocks.values(), default=1)
         # Prefix tree over the block hashes of every tracked group.
@@ -184,7 +199,11 @@ class DeadEntryTracker:
 
     def reset(self):
         self.__init__(  # type: ignore[misc]
-            self.block_pool, self.attn, self.states, self.swa_window_blocks
+            self.block_pool,
+            self.attn,
+            self.states,
+            self.swa_window_blocks,
+            self.eagle,
         )
 
     # ---- tree helpers ----------------------------------------------------
@@ -206,6 +225,21 @@ class DeadEntryTracker:
 
     def _holds_anything(self, node: BlockHash) -> bool:
         return self._any_attn(node) or self._any_state(node) or self._any_swa(node)
+
+    def _is_eagle_child(self, node: BlockHash) -> bool:
+        """``node`` is the next block a hit at its parent's usable state
+        needs: it is cached in every eagle group."""
+        if not self.eagle:
+            return False
+        parent = self.parent.get(node)
+        if parent is None or parent not in self.counted:
+            return False
+        return all(
+            (self.attn_count[g] if g in self.attn_count else self.swa_count[g]).get(
+                node
+            )
+            for g in self.eagle
+        )
 
     def _window_complete(self, node: BlockHash) -> bool:
         """Every W group has the blocks of the window ending at ``node``:
@@ -239,11 +273,15 @@ class DeadEntryTracker:
         elif not usable and node in self.counted:
             self.counted.discard(node)
             self._add_live(node, -1)
-            # Its states are now dead, and so may be its A prefix and the W
-            # blocks of its window.
+            # Its states are now dead, and so may be its A prefix, the W
+            # blocks of its window and its children's eagle blocks.
             self._unsupported.append(node)
             if self.swa_window_blocks:
                 self._swa_check.extend(self._ancestors(node, self._max_window))
+            if self.eagle:
+                children = self.children.get(node, ())
+                self._unsupported.extend(children)
+                self._swa_check.extend(children)
 
     def _ancestors(self, node: BlockHash, n: int) -> list[BlockHash]:
         """``node`` and up to ``n - 1`` of its ancestors."""
@@ -267,7 +305,10 @@ class DeadEntryTracker:
         return out
 
     def _swa_needed(self, node: BlockHash, group_id: int) -> bool:
-        """A usable state has ``node`` in its window of ``group_id``."""
+        """A usable state has ``node`` in its window of ``group_id``, or
+        needs it as its next block (eagle groups)."""
+        if group_id in self.eagle and self._is_eagle_child(node):
+            return True
         return any(
             owner in self.counted
             for owner in self._window_owners(node, self.swa_window_blocks[group_id])
@@ -278,14 +319,14 @@ class DeadEntryTracker:
             if counts.get(node):
                 self._free(g, node)
 
-    def _free_attn(self, node: BlockHash) -> None:
+    def _free_attn(self, node: BlockHash, keep_eagle: bool = False) -> None:
         for g, counts in self.attn_count.items():
-            if counts.get(node):
+            if counts.get(node) and not (keep_eagle and g in self.eagle):
                 self._free(g, node)
 
-    def _free_swa(self, node: BlockHash) -> None:
+    def _free_swa(self, node: BlockHash, keep_eagle: bool = False) -> None:
         for g, counts in self.swa_count.items():
-            if counts.get(node):
+            if counts.get(node) and not (keep_eagle and g in self.eagle):
                 self._free(g, node)
 
     def _add_live(self, node: BlockHash | None, delta: int):
@@ -379,8 +420,10 @@ class DeadEntryTracker:
         the W blocks above it whose windows reached into it."""
         for node in nodes:
             self._free_states(node)
-            self._free_attn(node)
-            self._free_swa(node)
+            # A usable parent's hit still needs this block in the eagle groups.
+            keep_eagle = self._is_eagle_child(node)
+            self._free_attn(node, keep_eagle)
+            self._free_swa(node, keep_eagle)
         parent = self.parent.get(top)
         self._prune(nodes)
         if parent is not None and parent in self.parent:

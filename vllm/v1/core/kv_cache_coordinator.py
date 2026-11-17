@@ -730,9 +730,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def _make_dead_tracker(self) -> DeadEntryTracker | None:
         """A tracker for models with full-attention groups, one or more Mamba
-        groups in align mode and optionally sliding-window groups, all in one
-        block pool and hashed at their block size; None (with a warning)
-        otherwise."""
+        groups in align mode and optionally sliding-window groups (EAGLE block
+        drops on attention groups allowed), all in one block pool and hashed
+        at their block size; None (with a warning) otherwise."""
         groups = self.kv_cache_config.kv_cache_groups
         managers = self.single_type_managers
         # Plain full attention and sliding window only: subclasses (sinks,
@@ -752,8 +752,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             or not state
             or others
             or self.enable_partial_hash_hits
-            # EAGLE drops a matched block, which moves the window a hit needs.
-            or self.drop_eagle_group_ids
+            # Draft layers are attention layers; a Mamba group never drops.
+            or not self._eagle_lookup_group_ids() <= set(attn + swa)
             or any(
                 isinstance(m, MambaManager) and m.mamba_cache_mode != "align"
                 for m in managers
@@ -767,7 +767,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             logger.warning(
                 "free_dead_prefix_entries supports full-attention, Mamba (align "
                 "mode) and sliding-window groups in one block pool, all hashed at "
-                "their block size, without EAGLE block drops; disabled for this "
+                "their block size, with EAGLE drops on attention groups only; "
+                "disabled for this "
                 "model (attention groups %s, sliding-window groups %s, state "
                 "groups %s, other cacheable groups %s, partial hash hits %s, "
                 "EAGLE drop groups %s, block sizes %s, hash block size %d).",
@@ -776,7 +777,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 state,
                 others,
                 self.enable_partial_hash_hits,
-                sorted(self.drop_eagle_group_ids),
+                sorted(self._eagle_lookup_group_ids()),
                 [m.block_size for m in managers],
                 self.hash_block_size,
             )
@@ -789,16 +790,28 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 manager.sliding_window, manager.block_size, False
             )
         block_pool = managers[attn[0]].block_pool
-        tracker = DeadEntryTracker(block_pool, attn, state, swa_window_blocks)
+        eagle = self._eagle_lookup_group_ids()
+        tracker = DeadEntryTracker(block_pool, attn, state, swa_window_blocks, eagle)
         block_pool.dead_tracker = tracker
         logger.info(
             "Freeing dead prefix-cache entries (attention groups %s, state groups "
-            "%s, sliding-window groups %s)",
+            "%s, sliding-window groups %s, EAGLE drop groups %s)",
             attn,
             state,
             swa_window_blocks,
+            sorted(eagle),
         )
         return tracker
+
+    def _eagle_lookup_group_ids(self) -> set[int]:
+        """Groups whose hit lookup drops a block for EAGLE: every group looked
+        up together with one holding draft layers."""
+        return {
+            i
+            for group in self.attention_groups
+            if group.use_eagle
+            for i in group.group_ids
+        }
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -1021,14 +1034,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         if self.dead_tracker is not None:
             # Attention blocks freed as dead still mark a shared prefix.
+            # Full attention matches as far as it would have, then drops a
+            # block for EAGLE if every full-attention group drops one (the
+            # finder may match one block past ``max_cache_hit_length`` first).
+            all_drop = all(
+                group.use_eagle
+                for group in self.attention_groups
+                if issubclass(group.manager_cls, FullAttentionManager)
+            )
+            max_blocks = max_cache_hit_length // self.hash_block_size
+            if all_drop:
+                max_blocks = min(max_blocks + 1, len(block_hashes))
+            ghost_blocks = self.dead_tracker.extend_with_ghosts(
+                block_hashes, longest_hit_length // self.hash_block_size, max_blocks
+            )
+            if all_drop:
+                ghost_blocks = max(ghost_blocks - 1, 0)
             longest_hit_length = max(
-                longest_hit_length,
-                self.dead_tracker.extend_with_ghosts(
-                    block_hashes,
-                    longest_hit_length // self.hash_block_size,
-                    max_cache_hit_length // self.hash_block_size,
-                )
-                * self.hash_block_size,
+                longest_hit_length, ghost_blocks * self.hash_block_size
             )
         # Uncached shared prefix detection: if any attn. group cached a longer
         # prefix than the reconciled hit, it is an uncached common prefix across
