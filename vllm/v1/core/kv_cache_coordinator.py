@@ -653,6 +653,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
         free_dead_prefix_entries: bool = False,
+        kv_connector_completes_hybrid_hits: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -726,15 +727,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
         if free_dead_prefix_entries:
-            self.dead_tracker = self._make_dead_tracker()
+            self.dead_tracker = self._make_dead_tracker(
+                kv_connector_completes_hybrid_hits
+            )
 
-    def _make_dead_tracker(self) -> DeadEntryTracker | None:
+    def _make_dead_tracker(
+        self, kv_connector_completes_hybrid_hits: bool
+    ) -> DeadEntryTracker | None:
         """A tracker for models with full-attention groups, one or more Mamba
         groups in align mode and optionally sliding-window groups (EAGLE block
         drops on attention groups allowed), all in one block pool and hashed
         at their block size, or with fine-grained (partial) hash hits on
         (full-attention and Mamba blocks a multiple of the hash block size,
         no context parallelism); None (with a warning) otherwise."""
+        if kv_connector_completes_hybrid_hits:
+            # The connector loads the Mamba state of a full-attention-only
+            # local hit, so attention past the last local state can hit.
+            logger.warning(
+                "free_dead_prefix_entries is disabled: the KV connector can "
+                "complete full-attention-only local hits on this node."
+            )
+            return None
         groups = self.kv_cache_config.kv_cache_groups
         managers = self.single_type_managers
         # Plain full attention and sliding window only: subclasses (sinks,
@@ -775,6 +788,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 fine_grained
                 and any(m.dcp_world_size > 1 or m.pcp_world_size > 1 for m in managers)
             )
+            # With partial hits, a later full-attention lookup is capped
+            # inside a block by the first one's match, so it needs its partial
+            # entry there even when its full block is cached.
+            or (
+                fine_grained
+                and sum(
+                    g.manager_cls is FullAttentionManager for g in self.attention_groups
+                )
+                > 1
+            )
         ):
             logger.warning(
                 "free_dead_prefix_entries supports full-attention, Mamba (align "
@@ -806,16 +829,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         block_pool = managers[attn[0]].block_pool
         eagle = self._eagle_lookup_group_ids()
         attn_block_units = None
-        ghost_lookup: list[int] = []
         if fine_grained:
             attn_block_units = {
                 i: managers[i].block_size // self.hash_block_size for i in attn
             }
-            # The junction is the longest hit of the first lookup, which is
-            # full attention (sorted first).
-            first = self.attention_groups[0]
-            assert first.manager_cls is FullAttentionManager
-            ghost_lookup = list(first.group_ids)
+        # The junction is the longest hit of the first lookup, which is full
+        # attention (sorted first; later lookups are bounded by it).
+        first = self.attention_groups[0]
+        assert first.manager_cls is FullAttentionManager
+        ghost_lookup = list(first.group_ids)
         tracker = DeadEntryTracker(
             block_pool,
             attn,
@@ -1067,7 +1089,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
 
-        if self.dead_tracker is not None and self.dead_tracker.fine_grained:
+        if self.dead_tracker is not None:
             # Attention entries freed as dead still mark a shared prefix: the
             # first (full-attention) lookup sets ``longest_hit_length``.
             longest_hit_length = max(
@@ -1075,27 +1097,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 self.dead_tracker.ghost_attention_hit(
                     block_hashes, max_cache_hit_length
                 ),
-            )
-        elif self.dead_tracker is not None:
-            # Attention blocks freed as dead still mark a shared prefix.
-            # Full attention matches as far as it would have, then drops a
-            # block for EAGLE if every full-attention group drops one (the
-            # finder may match one block past ``max_cache_hit_length`` first).
-            all_drop = all(
-                group.use_eagle
-                for group in self.attention_groups
-                if issubclass(group.manager_cls, FullAttentionManager)
-            )
-            max_blocks = max_cache_hit_length // self.hash_block_size
-            if all_drop:
-                max_blocks = min(max_blocks + 1, len(block_hashes))
-            ghost_blocks = self.dead_tracker.extend_with_ghosts(
-                block_hashes, longest_hit_length // self.hash_block_size, max_blocks
-            )
-            if all_drop:
-                ghost_blocks = max(ghost_blocks - 1, 0)
-            longest_hit_length = max(
-                longest_hit_length, ghost_blocks * self.hash_block_size
             )
         # Uncached shared prefix detection: if any attn. group cached a longer
         # prefix than the reconciled hit, it is an uncached common prefix across
@@ -1175,6 +1176,7 @@ def get_kv_cache_coordinator(
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
     free_dead_prefix_entries: bool = False,
+    kv_connector_completes_hybrid_hits: bool = False,
 ) -> KVCacheCoordinator:
     if free_dead_prefix_entries and (
         not enable_caching or len(kv_cache_config.kv_cache_groups) == 1
@@ -1230,4 +1232,5 @@ def get_kv_cache_coordinator(
         num_prefill_lookahead=num_prefill_lookahead,
         allow_partial_hash_hits=allow_partial_hash_hits,
         free_dead_prefix_entries=free_dead_prefix_entries,
+        kv_connector_completes_hybrid_hits=kv_connector_completes_hybrid_hits,
     )

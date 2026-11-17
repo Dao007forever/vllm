@@ -34,21 +34,37 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
-def _drain_dead_entries_after(
-    method: Callable[Concatenate["KVCacheManager", _P], _R],
-) -> Callable[Concatenate["KVCacheManager", _P], _R]:
-    """Free the dead prefix-cache entries that the call's evictions and
-    releases created (--free-dead-prefix-entries)."""
+def _drains_dead_entries(
+    before: bool = False,
+) -> Callable[
+    [Callable[Concatenate["KVCacheManager", _P], _R]],
+    Callable[Concatenate["KVCacheManager", _P], _R],
+]:
+    """Make a method a safe point for --free-dead-prefix-entries: free the
+    dead prefix-cache entries recorded so far after the call (mutations: what
+    its evictions and releases killed), or before it (lookups: what was freed
+    outside this manager, e.g. by the scheduler's deferred frees). Never
+    between a lookup and the allocation that takes its hit."""
 
-    @functools.wraps(method)
-    def wrapper(self: "KVCacheManager", *args: _P.args, **kwargs: _P.kwargs) -> _R:
-        try:
-            return method(self, *args, **kwargs)
-        finally:
-            if self.dead_tracker is not None:
-                self.dead_tracker.drain()
+    def decorator(
+        method: Callable[Concatenate["KVCacheManager", _P], _R],
+    ) -> Callable[Concatenate["KVCacheManager", _P], _R]:
+        @functools.wraps(method)
+        def wrapper(self: "KVCacheManager", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+            tracker = self.dead_tracker
+            if tracker is None:
+                return method(self, *args, **kwargs)
+            if before:
+                tracker.drain()
+                return method(self, *args, **kwargs)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                tracker.drain()
 
-    return wrapper
+        return wrapper
+
+    return decorator
 
 
 @dataclass
@@ -168,6 +184,7 @@ class KVCacheManager:
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
         free_dead_prefix_entries: bool = False,
+        kv_connector_completes_hybrid_hits: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -201,6 +218,7 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
             free_dead_prefix_entries=free_dead_prefix_entries,
+            kv_connector_completes_hybrid_hits=kv_connector_completes_hybrid_hits,
         )
         self.dead_tracker = self.coordinator.dead_tracker
         # One predicate, read by both sides of the feature, so the scheduler
@@ -308,6 +326,7 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
+    @_drains_dead_entries(before=True)
     def get_computed_blocks(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int]:
@@ -337,9 +356,6 @@ class KVCacheManager:
         # or calls a pooling model with all pooling).
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
-        if self.dead_tracker is not None:
-            # Blocks freed outside this manager (e.g. by a KV connector).
-            self.dead_tracker.drain()
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
@@ -375,6 +391,7 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
+    @_drains_dead_entries(before=True)
     def get_computed_blocks_for_connector(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -407,8 +424,6 @@ class KVCacheManager:
 
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0, False
-        if self.dead_tracker is not None:
-            self.dead_tracker.drain()
 
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         fa_group_id = coordinator.full_attention_group_id
@@ -426,7 +441,7 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
-    @_drain_dead_entries_after
+    @_drains_dead_entries()
     def allocate_slots(
         self,
         request: Request,
@@ -677,6 +692,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    @_drains_dead_entries()
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -687,8 +703,6 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
-        if self.dead_tracker is not None:
-            self.dead_tracker.drain()
 
     def remove_skipped_blocks(
         self,
@@ -724,6 +738,7 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
+    @_drains_dead_entries()
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
@@ -732,8 +747,6 @@ class KVCacheManager:
 
         """
         self.block_pool.evict_blocks(block_ids)
-        if self.dead_tracker is not None:
-            self.dead_tracker.drain()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

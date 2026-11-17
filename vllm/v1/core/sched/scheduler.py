@@ -86,6 +86,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def connector_completes_hybrid_hits(connector, kv_transfer_config) -> bool:
+    """Whether the KV connector can turn a full-attention-only local hit of a
+    hybrid model into a hit, by loading the missing recurrent state: it
+    supports divergent local hybrid hits and this node consumes KV."""
+    return (
+        connector is not None
+        and kv_transfer_config is not None
+        and connector.supports_divergent_local_hybrid_hits
+        and kv_transfer_config.is_kv_consumer
+    )
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -370,6 +382,9 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
             free_dead_prefix_entries=self.cache_config.free_dead_prefix_entries,
+            kv_connector_completes_hybrid_hits=connector_completes_hybrid_hits(
+                self.connector, kv_transfer_config
+            ),
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (

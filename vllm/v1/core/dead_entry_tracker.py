@@ -38,8 +38,18 @@ usable state below an A block kills that block, and W blocks no usable state
 needs are freed. Freed blocks go to the front of the free queue, so they are
 reused before any live entry is evicted.
 
-A blocks freed this way stay in a bounded hash-only list so that junction
-detection (an A prefix deeper than the hybrid hit) still sees them.
+A entries freed this way stay in a hash-only list (per group) so that
+junction detection (an A prefix deeper than the hybrid hit) still sees them:
+the junction is the coordinator's first full-attention lookup replayed over
+cached and freed entries. The list holds as many entries as the pool has
+blocks, so a freed entry is forgotten about when LRU would have reused its
+block.
+
+An A block can lose its entry while a running request holds it and blocks
+below it (a KV connector reporting it invalid). Nothing below it can hit any
+more, but the held blocks cannot be freed yet: the subtree is marked broken,
+its states stop counting, and its blocks are freed when released -- unless
+the lost block is cached again first.
 
 Fine-grained (partial) hash hits
 --------------------------------
@@ -62,18 +72,18 @@ absence does not make the state dead, as with the eagle next block. Hence an
 A entry ending at unit ``x`` of block ``k`` is kept while a usable state needs
 it: one at a unit in ``[start(k), x]`` on its chain (one unit earlier for
 eagle groups), or, for a full block, anywhere below it. Losing a full A block
-kills everything below it; losing a partial entry kills nothing. Freed A
-entries stay in the hash-only list per group, and the junction is the
-full-attention lookup over cached and freed entries.
+kills everything below it; losing a partial entry kills nothing.
 
 Hooks are called by BlockPool while it mutates its queues, so they only record
 work (and update counts); ``drain`` frees the dead entries at a safe point.
 """
 
+import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     get_block_hash,
@@ -84,7 +94,10 @@ from vllm.v1.core.kv_cache_utils import (
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
 
-_GHOST_CAPACITY = 1 << 20
+logger = init_logger(__name__)
+
+# Seconds between two log lines with the freed counts.
+_LOG_INTERVAL_S = 60.0
 
 # Indices into ``DeadEntryTracker.num_freed``.
 FREED_ATTN, FREED_STATE, FREED_SWA = 0, 1, 2
@@ -103,7 +116,8 @@ class DeadEntryTracker:
         swa_window_blocks: dict[int, int] | None = None,
         eagle_group_ids: Iterable[int] = (),
         attn_block_units: dict[int, int] | None = None,
-        ghost_lookup_group_ids: Iterable[int] = (),
+        ghost_lookup_group_ids: Iterable[int] | None = None,
+        ghost_capacity: int | None = None,
     ):
         """Track the given groups of ``block_pool``.
 
@@ -120,9 +134,12 @@ class DeadEntryTracker:
                 of every full-attention group in hash blocks (units). Sliding-
                 window groups then hash at their block size. None: every
                 group hashes at its block size and hits are block-aligned.
-            ghost_lookup_group_ids: Fine-grained only: the full-attention
-                groups the coordinator looks up first, whose match sets the
-                shared-prefix junction (``ghost_attention_hit``).
+            ghost_lookup_group_ids: The full-attention groups the
+                coordinator looks up first, whose match sets the shared-prefix
+                junction (``ghost_attention_hit``); defaults to every
+                full-attention group.
+            ghost_capacity: Freed A entries kept for junction detection;
+                defaults to the pool's number of blocks.
 
         """
         self.block_pool = block_pool
@@ -135,11 +152,13 @@ class DeadEntryTracker:
         assert self.eagle <= set(self.attn) | set(self.swa_window_blocks)
         self.fine_grained = attn_block_units is not None
         self.attn_block_units = dict(attn_block_units or {})
-        self.ghost_lookup = tuple(ghost_lookup_group_ids)
+        self.ghost_lookup = tuple(
+            self.attn if ghost_lookup_group_ids is None else ghost_lookup_group_ids
+        )
+        assert self.ghost_lookup and set(self.ghost_lookup) <= set(self.attn)
         if self.fine_grained:
             assert set(self.attn_block_units) == set(self.attn)
             assert all(n >= 1 for n in self.attn_block_units.values())
-            assert self.ghost_lookup and set(self.ghost_lookup) <= set(self.attn)
         # Units below a state whose A entries it may need (its block, or with
         # eagle the block of the next unit): bounds the recheck when it goes.
         self._max_block_units = max(self.attn_block_units.values(), default=1)
@@ -165,21 +184,29 @@ class DeadEntryTracker:
         self.counted: set[BlockHash] = set()
         # Usable states in the subtree of a node, the node included.
         self.live_below: defaultdict[BlockHash, int] = defaultdict(int)
-        # Work recorded by the hooks.
-        self._killed: deque[BlockHash] = deque()
+        # Work recorded by the hooks. ``_killed``: (node, group) of full A
+        # blocks lost.
+        self._killed: deque[tuple[BlockHash, int]] = deque()
         self._unsupported: deque[BlockHash] = deque()
         self._released: list[BlockHash] = []
         # W blocks to check against the windows of the usable states.
         self._swa_check: deque[BlockHash] = deque()
-        # Fine-grained only: full A blocks lost per group, and nodes whose A
-        # entries to check against the usable states.
-        self._killed_full: deque[tuple[BlockHash, int]] = deque()
+        # Fine-grained only: nodes whose A entries to check against the
+        # usable states.
         self._attn_check: deque[BlockHash] = deque()
         self._draining = False
-        # A hashes freed as dead, for junction detection (fine-grained: with
-        # their group id).
+        # Nodes that lost an A block (in the given groups) while blocks below
+        # them were held: nothing at or below them can hit until it is cached
+        # again.
+        self.broken: dict[BlockHash, set[int]] = {}
+        # A entries (hash with group id) freed as dead, for junction detection.
         self.ghost: OrderedDict[BlockHash, None] = OrderedDict()
+        self.ghost_capacity = (
+            block_pool.num_gpu_blocks if ghost_capacity is None else ghost_capacity
+        )
         self.num_freed = [0, 0, 0]  # [attention blocks, states, W blocks]
+        self._num_logged = [0, 0, 0]
+        self._last_log = time.monotonic()
 
     # ---- hooks (record only) -------------------------------------------
     def on_insert(self, group_id: int, block_hashes: Sequence[BlockHash], unit: int):
@@ -209,8 +236,7 @@ class DeadEntryTracker:
                 self._add_live(block_hash, below)
         if group_id in self.attn_count:
             self.attn_count[group_id][block_hash] += 1
-            if self._has_attn(block_hash):
-                self.ghost.pop(block_hash, None)
+            self._maybe_repair(block_hash, group_id)
         elif group_id in self.state_count:
             self.state_count[group_id][block_hash] += 1
             self._recount(block_hash)
@@ -235,7 +261,12 @@ class DeadEntryTracker:
             counts[block_hash] -= 1
             if counts[block_hash] <= 0:
                 del counts[block_hash]
-                self._killed.append(block_hash)
+                # The hash no longer marks a shared prefix. (A freed copy is
+                # added back by ``_free``.)
+                self.ghost.pop(
+                    make_block_hash_with_group_id(block_hash, group_id), None
+                )
+                self._killed.append((block_hash, group_id))
         elif group_id in self.state_count:
             counts = self.state_count[group_id]
             counts[block_hash] -= 1
@@ -264,6 +295,8 @@ class DeadEntryTracker:
             self._released.append(block_hash)
             if self.fine_grained:
                 self._attn_check.append(block_hash)
+        elif group_id in self.state_count:
+            self._released.append(block_hash)
         elif group_id in self.swa_count:
             self._swa_check.append(block_hash)
 
@@ -276,6 +309,7 @@ class DeadEntryTracker:
             self.eagle,
             self.attn_block_units if self.fine_grained else None,
             self.ghost_lookup,
+            self.ghost_capacity,
         )
 
     # ---- fine-grained hooks ------------------------------------------------
@@ -297,6 +331,7 @@ class DeadEntryTracker:
         block_hash = block_hashes[unit]
         if group_id in self.attn_count:
             self.attn_count[group_id][block_hash] += 1
+            self._maybe_repair(block_hash, group_id)
         elif group_id in self.state_count:
             self.state_count[group_id][block_hash] += 1
             self._recount(block_hash)
@@ -322,7 +357,7 @@ class DeadEntryTracker:
                 )
             if self._is_full(block_hash, group_id):
                 # Nothing below a lost full A block can hit.
-                self._killed_full.append((block_hash, group_id))
+                self._killed.append((block_hash, group_id))
             else:
                 # A partial entry: the hits it served can still come from the
                 # full block or another partial entry; nothing else depends on
@@ -403,7 +438,41 @@ class DeadEntryTracker:
 
     def _usable(self, node: BlockHash) -> bool:
         """A hit can end at ``node`` (given its A prefix)."""
-        return self._has_state(node) and self._window_complete(node)
+        return (
+            self._has_state(node)
+            and self._window_complete(node)
+            and not (self.broken and self._under_broken(node))
+        )
+
+    def _under_broken(self, node: BlockHash | None) -> bool:
+        while node is not None and node in self.parent:
+            if node in self.broken:
+                return True
+            node = self.parent[node]
+        return False
+
+    def _break(self, root: BlockHash, group_id: int, nodes: list[BlockHash]) -> None:
+        """``root`` lost its A block in ``group_id``: the states at and below
+        it stop counting, so their blocks are freed once released."""
+        self.counted.difference_update(nodes)
+        num_live = self.live_below.get(root, 0)
+        if num_live:
+            for node in nodes:
+                self.live_below.pop(node, None)
+            self._add_live(self.parent[root], -num_live)
+        self.broken.setdefault(root, set()).add(group_id)
+
+    def _maybe_repair(self, node: BlockHash, group_id: int) -> None:
+        """An A block of ``group_id`` was cached at ``node``: if that is the
+        last one it lost, its subtree can hit again."""
+        lost = self.broken.get(node)
+        if lost is None:
+            return
+        lost.discard(group_id)
+        if not lost:
+            del self.broken[node]
+            for child in self._subtree(node):
+                self._recount(child)
 
     def _recount(self, node: BlockHash) -> None:
         usable = node in self.parent and self._usable(node)
@@ -536,6 +605,7 @@ class DeadEntryTracker:
         self.children.pop(node, None)
         self.live_below.pop(node, None)
         self.counted.discard(node)
+        self.broken.pop(node, None)
         if parent is not None and parent in self.children:
             self.children[parent].discard(node)
             if not self.children[parent]:
@@ -569,12 +639,6 @@ class DeadEntryTracker:
             ):
                 continue
             self._detach(node)
-        if nodes:
-            parent = self.parent.get(nodes[0])
-            if parent is not None:
-                self._drop_node_if_empty(parent)
-        if nodes and nodes[0] in self.parent:
-            self._drop_node_if_empty(nodes[0])
 
     # ---- freeing -----------------------------------------------------------
     def _free(self, group_id: int, block_hash: BlockHash) -> None:
@@ -586,9 +650,7 @@ class DeadEntryTracker:
             if self.block_pool.drop_cached_block(block):
                 if group_id in self.attn_count:
                     self.num_freed[FREED_ATTN] += 1
-                    self.ghost[block_hash] = None
-                    if len(self.ghost) > _GHOST_CAPACITY:
-                        self.ghost.popitem(last=False)
+                    self._add_ghosts([key])
                 elif group_id in self.state_count:
                     self.num_freed[FREED_STATE] += 1
                 else:
@@ -611,15 +673,18 @@ class DeadEntryTracker:
                 continue
             if group_id in self.attn_count:
                 self.num_freed[FREED_ATTN] += 1
-                for other in keys:
-                    self.ghost[other] = None
-                    self.ghost.move_to_end(other)
-                while len(self.ghost) > _GHOST_CAPACITY:
-                    self.ghost.popitem(last=False)
+                self._add_ghosts(keys)
             elif group_id in self.state_count:
                 self.num_freed[FREED_STATE] += 1
             else:
                 self.num_freed[FREED_SWA] += 1
+
+    def _add_ghosts(self, keys: Iterable[BlockHash]) -> None:
+        for key in keys:
+            self.ghost[key] = None
+            self.ghost.move_to_end(key)
+        while len(self.ghost) > self.ghost_capacity:
+            self.ghost.popitem(last=False)
 
     def _needed(self, group_id: int, node: BlockHash) -> bool:
         """Fine-grained: a usable state needs the entry."""
@@ -686,25 +751,19 @@ class DeadEntryTracker:
             seen_released: set[BlockHash] = set()
             while (
                 self._killed
-                or self._killed_full
                 or self._unsupported
                 or self._released
                 or self._attn_check
                 or self._swa_check
             ):
-                if self._killed_full:
-                    # Fine-grained: a full A block is gone (and was not cached
-                    # again since): nothing below it can hit.
-                    root, group_id = self._killed_full.popleft()
-                    if root in self.parent and not self.attn_count[group_id].get(root):
-                        self._free_subtree(root, list(self._subtree(root)))
-                    continue
                 if self._killed:
-                    # An A block is gone: nothing at or below it can hit.
-                    root = self._killed.popleft()
-                    if root not in self.parent:
-                        continue
-                    self._free_subtree(root, list(self._subtree(root)))
+                    # A full A block is gone (and was not cached again since):
+                    # nothing below it can hit.
+                    root, group_id = self._killed.popleft()
+                    if root in self.parent and not self.attn_count[group_id].get(root):
+                        nodes = list(self._subtree(root))
+                        self._break(root, group_id, nodes)
+                        self._free_subtree(root, nodes)
                     continue
                 if self._unsupported or self._released:
                     if self._unsupported:
@@ -741,17 +800,32 @@ class DeadEntryTracker:
                 self._drop_node_if_empty(node)
         finally:
             self._draining = False
+        self._maybe_log()
+
+    def _maybe_log(self) -> None:
+        if self.num_freed == self._num_logged:
+            return
+        now = time.monotonic()
+        if now - self._last_log < _LOG_INTERVAL_S:
+            return
+        self._last_log = now
+        self._num_logged = list(self.num_freed)
+        logger.info(
+            "Freed dead prefix-cache entries so far: %d attention blocks, "
+            "%d Mamba states, %d sliding-window blocks.",
+            *self.num_freed,
+        )
 
     def ghost_attention_hit(
         self, block_hashes: Sequence[BlockHash], max_length: int
     ) -> int:
-        """Fine-grained: tokens the coordinator's first full-attention lookup
+        """Tokens the coordinator's first full-attention lookup
         (``FullAttentionManager.find_longest_cache_hit``) would match had dead
         A entries not been freed, counting cached and freed entries."""
         if not self.ghost:
             return 0
         hash_block_size = self.block_pool.hash_block_size
-        units = self.attn_block_units[self.ghost_lookup[0]]
+        units = self.attn_block_units.get(self.ghost_lookup[0], 1)
         eagle = self.ghost_lookup[0] in self.eagle
         num_units = len(block_hashes)
         if eagle:
@@ -781,18 +855,3 @@ class DeadEntryTracker:
         if eagle and hit:
             hit -= 1
         return hit * hash_block_size
-
-    def extend_with_ghosts(
-        self, block_hashes: list[BlockHash], start_block: int, max_blocks: int
-    ) -> int:
-        """Blocks past ``start_block`` an A prefix would have reached had dead
-        A blocks not been freed (cached or recently freed as dead)."""
-        if not self.ghost:
-            return start_block
-        idx = start_block
-        while idx < max_blocks:
-            block_hash = block_hashes[idx]
-            if block_hash not in self.ghost and not self._has_attn(block_hash):
-                break
-            idx += 1
-        return idx

@@ -114,7 +114,8 @@ def test_attention_past_the_last_state_is_freed_at_release():
     # The freed blocks are reused first.
     assert set(free_queue_head(pool, 2)) == {attn[4].block_id, attn[5].block_id}
     # The freed blocks are junction hints.
-    assert request.block_hashes[4] in tracker.ghost
+    key = make_block_hash_with_group_id(request.block_hashes[4], ATTN)
+    assert key in tracker.ghost
 
 
 def test_evicting_the_state_frees_its_attention_prefix():
@@ -288,6 +289,7 @@ def hybrid_config(
     eagle: str | None = None,
     attn_block_size: int | None = None,
     swa_block_size: int | None = None,
+    distinct_attn: bool = False,
 ):
     """Three Mamba groups (align mode) and one full-attention group, the
     layout vLLM gives Qwen3-Next; optionally more full-attention groups, a
@@ -296,7 +298,10 @@ def hybrid_config(
     groups holding EAGLE draft layers: "attn" (the target's attention group,
     as with an MTP layer), "draft" (an extra full-attention group), "swa"
     (the sliding-window group) or "mamba" (unsupported). Full-attention and
-    sliding-window groups use ``block_size`` unless given their own."""
+    sliding-window groups use ``block_size`` unless given their own. With
+    ``distinct_attn`` the extra full-attention groups have another layout, so
+    they are looked up separately from the first one (and do not share its
+    EAGLE drop)."""
     attn = AttentionSpec(
         block_size=attn_block_size or block_size,
         num_kv_heads=1,
@@ -318,8 +323,9 @@ def hybrid_config(
         for i in range(NUM_STATE_GROUPS)
     ]
     groups.append(new_kv_cache_group(["attn"], full_layer(attn)))
+    other_attn = replace(attn, head_size=2) if distinct_attn else attn
     for i in range(1, num_attn_groups):
-        groups.append(new_kv_cache_group([f"attn{i}"], full_layer(attn)))
+        groups.append(new_kv_cache_group([f"attn{i}"], full_layer(other_attn)))
     if sliding_window is not None:
         groups.append(
             new_kv_cache_group(["swa"], sliding_window_layer(swa, sliding_window))
@@ -355,6 +361,7 @@ def make_manager(
     eagle: str | None = None,
     block_size: int = MANAGER_BLOCK_SIZE,
     attn_block_size: int | None = None,
+    distinct_attn: bool = False,
     **kwargs,
 ) -> KVCacheManager:
     """Hashes at ``MANAGER_BLOCK_SIZE``: a larger Mamba ``block_size`` turns on
@@ -372,6 +379,7 @@ def make_manager(
             eagle=eagle,
             attn_block_size=attn_block_size,
             swa_block_size=MANAGER_BLOCK_SIZE,
+            distinct_attn=distinct_attn,
         ),
         max_model_len=8192,
         scheduler_block_size=block_size,
@@ -488,6 +496,18 @@ def test_flag_attaches_tracker_only_for_supported_layouts():
         free_dead_prefix_entries=True,
     )
     assert not manager.coordinator.enable_partial_hash_hits
+    assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
+    # Fine-grained with full attention looked up twice (two layouts): a later
+    # lookup is capped inside a block by the first one's match, which the
+    # tracker does not model.
+    manager = make_manager(
+        64,
+        free_dead=True,
+        block_size=4 * MANAGER_BLOCK_SIZE,
+        num_attn_groups=2,
+        distinct_attn=True,
+    )
+    assert manager.coordinator.enable_partial_hash_hits
     assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
 
 
@@ -741,10 +761,18 @@ def test_window_reaching_the_start_of_the_sequence():
     ] * 2
 
 
-def _chunked_trace(manager: KVCacheManager, seed: int, chunk_blocks: int = 3) -> list:
+def _chunked_trace(
+    manager: KVCacheManager,
+    seed: int,
+    chunk_blocks: int = 3,
+    connector_lookup: bool = False,
+) -> list:
     """A random multi-turn workload with branches and chunked prefill (so
     sliding-window blocks are released while requests run); returns the hit
-    and shared-prefix junction of every request."""
+    and shared-prefix junction of every request. With ``connector_lookup``,
+    also the full-attention-only hit a KV connector with divergent local
+    hybrid hits would be offered (the request then runs from the reconciled
+    hit, as with no external tokens)."""
     rng = random.Random(seed)
     out: list = []
     histories: dict[int, list[int]] = {}
@@ -758,6 +786,8 @@ def _chunked_trace(manager: KVCacheManager, seed: int, chunk_blocks: int = 3) ->
         ]
         histories[session] = history
         request = make_request(str(step), history, MANAGER_BLOCK_SIZE)
+        if connector_lookup:
+            out.append(manager.get_computed_blocks_for_connector(request)[1:])
         blocks, num_hit, boundary = manager.get_computed_blocks(request)
         out.append((num_hit, boundary))
         computed = num_hit
@@ -777,42 +807,61 @@ def _chunked_trace(manager: KVCacheManager, seed: int, chunk_blocks: int = 3) ->
     return out
 
 
-@pytest.mark.parametrize(
-    "sliding_window,num_attn_groups,eagle",
-    [
-        (None, 2, None),
-        (2 * MANAGER_BLOCK_SIZE, 1, None),
-        (3 * MANAGER_BLOCK_SIZE + 5, 2, None),
-        # EAGLE: an MTP layer in the target's attention group, a separate
-        # full-attention draft, a sliding-window draft.
-        (None, 1, "attn"),
-        (None, 1, "draft"),
-        (2 * MANAGER_BLOCK_SIZE, 1, "swa"),
-    ],
-)
-def test_never_frees_an_entry_that_could_hit(sliding_window, num_attn_groups, eagle):
+# Block-aligned layouts the tracker supports: (sliding_window,
+# num_attn_groups, eagle, distinct_attn).
+SUPPORTED_LAYOUTS = [
+    (None, 2, None, False),
+    (2 * MANAGER_BLOCK_SIZE, 1, None, False),
+    (3 * MANAGER_BLOCK_SIZE + 5, 2, None, False),
+    # EAGLE: an MTP layer in the target's attention group, a separate
+    # full-attention draft, a sliding-window draft.
+    (None, 1, "attn", False),
+    (None, 1, "draft", False),
+    (2 * MANAGER_BLOCK_SIZE, 1, "swa", False),
+    # The first full-attention lookup drops a block for EAGLE, a second one
+    # (another layout) does not.
+    (None, 2, "attn", True),
+]
+
+
+def assert_never_frees_an_entry_that_could_hit(
+    seed: int, chunk_blocks: int, sliding_window, num_attn_groups, eagle, distinct_attn
+) -> list[int]:
     """Without memory pressure LRU never evicts, so every entry the tracker
     frees is one LRU would have kept: if any of them could serve a hit, a
     later request would hit less (or find another junction) than with the
-    flag off."""
+    flag off. Returns the tracker's freed counts."""
     kwargs = dict(
         sliding_window=sliding_window,
         num_attn_groups=num_attn_groups,
         eagle=eagle,
+        distinct_attn=distinct_attn,
         enable_kv_cache_events=True,
     )
     off = make_manager(20_000, free_dead=False, **kwargs)
     on = make_manager(20_000, free_dead=True, **kwargs)
-    trace_off = _chunked_trace(off, seed=1)
+    trace_off = _chunked_trace(off, seed, chunk_blocks)
     assert not any(isinstance(e, BlockRemoved) for e in off.take_events())
-    trace_on = _chunked_trace(on, seed=1)
+    trace_on = _chunked_trace(on, seed, chunk_blocks)
     assert trace_on == trace_off
-    # Sanity: the workload hits and branches, and the tracker had dead
-    # entries to free (attention past the last state; window blocks).
+    # Sanity: the workload hits and branches.
     assert sum(hit for hit, _ in trace_off) > 0
     assert any(boundary for _, boundary in trace_off)
     assert on.dead_tracker is not None
-    freed = on.dead_tracker.num_freed
+    return on.dead_tracker.num_freed
+
+
+@pytest.mark.parametrize(
+    "sliding_window,num_attn_groups,eagle,distinct_attn", SUPPORTED_LAYOUTS
+)
+def test_never_frees_an_entry_that_could_hit(
+    sliding_window, num_attn_groups, eagle, distinct_attn
+):
+    freed = assert_never_frees_an_entry_that_could_hit(
+        1, 3, sliding_window, num_attn_groups, eagle, distinct_attn
+    )
+    # The tracker had dead entries to free (attention past the last state;
+    # window blocks).
     assert freed[0] > 0
     assert (freed[2] > 0) == (sliding_window is not None)
 
@@ -1136,8 +1185,15 @@ PARTIAL_LAYOUTS = {
     ],
 )
 def test_never_frees_an_entry_that_could_hit_partial(layout, chunk_tokens, split):
+    assert_never_frees_an_entry_that_could_hit_partial(1, layout, chunk_tokens, split)
+
+
+def assert_never_frees_an_entry_that_could_hit_partial(
+    seed: int, layout: str, chunk_tokens: int, split: bool
+) -> list[int]:
     """``test_never_frees_an_entry_that_could_hit`` with fine-grained hits:
-    hash blocks of 16 tokens, Mamba (and attention) blocks of 64."""
+    hash blocks of 16 tokens, Mamba (and attention) blocks of 64. Returns the
+    tracker's freed counts."""
     kwargs = dict(
         PARTIAL_LAYOUTS[layout],
         block_size=PARTIAL_BLOCK_SIZE,
@@ -1151,8 +1207,8 @@ def test_never_frees_an_entry_that_could_hit_partial(layout, chunk_tokens, split
     # (Partial entries are re-keyed, so BlockRemoved events do not show LRU
     # evictions here.)
     _forbid_lru_eviction(off)
-    trace_off = _partial_trace(off, 1, chunk_tokens, split, eagle)
-    trace_on = _partial_trace(on, 1, chunk_tokens, split, eagle)
+    trace_off = _partial_trace(off, seed, chunk_tokens, split, eagle)
+    trace_on = _partial_trace(on, seed, chunk_tokens, split, eagle)
     assert trace_on == trace_off
     # Sanity: hits end inside blocks, and with EAGLE the junction is used.
     assert any(hit % PARTIAL_BLOCK_SIZE for hit, _ in trace_off)
@@ -1164,3 +1220,181 @@ def test_never_frees_an_entry_that_could_hit_partial(layout, chunk_tokens, split
         # state there), and window blocks.
         assert freed[0] > 0
     assert (freed[2] > 0) == ("sliding_window" in kwargs)
+    return freed
+
+
+# ---- review fixes ----------------------------------------------------------
+
+
+def test_tracker_would_shorten_full_attention_only_hits():
+    """Why a KV connector that completes full-attention-only local hits rules
+    the tracker out: it frees attention past the last local state, which such
+    a connector turns into a hit by loading the missing state."""
+    off = make_manager(20_000, free_dead=False)
+    on = make_manager(20_000, free_dead=True)
+    assert _chunked_trace(on, 1, connector_lookup=True) != _chunked_trace(
+        off, 1, connector_lookup=True
+    )
+
+
+def test_not_attached_when_a_connector_completes_hybrid_hits():
+    manager = make_manager(64, free_dead=True, kv_connector_completes_hybrid_hits=True)
+    assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
+    off = make_manager(20_000, free_dead=False)
+    on = make_manager(20_000, free_dead=True, kv_connector_completes_hybrid_hits=True)
+    assert _chunked_trace(on, 1, connector_lookup=True) == _chunked_trace(
+        off, 1, connector_lookup=True
+    )
+
+
+@pytest.mark.parametrize(
+    "divergent,role,completes",
+    [
+        (True, "kv_consumer", True),
+        (True, "kv_both", True),
+        # A producer gets no external tokens: it falls back to the
+        # reconciled hybrid hit.
+        (True, "kv_producer", False),
+        (False, "kv_consumer", False),
+    ],
+)
+def test_connector_completes_hybrid_hits(divergent, role, completes):
+    from vllm.config import KVTransferConfig
+    from vllm.v1.core.sched.scheduler import connector_completes_hybrid_hits
+
+    connector = SimpleNamespace(supports_divergent_local_hybrid_hits=divergent)
+    config = KVTransferConfig(kv_connector="NixlConnector", kv_role=role)
+    assert connector_completes_hybrid_hits(connector, config) == completes
+    assert not connector_completes_hybrid_hits(None, None)
+
+
+def test_ghost_list_is_bounded_by_the_pool_size():
+    """Freed attention entries are forgotten about when LRU would have reused
+    their blocks: the list holds as many entries as the pool has blocks."""
+    pool, tracker = make_pool(num_blocks=16)
+    assert tracker.ghost_capacity == 16
+    requests = [
+        make_request(str(i), list(range(i * 1000, i * 1000 + 3 * BLOCK_SIZE)))
+        for i in range(12)
+    ]
+    for request in requests:
+        # Two dead attention blocks per request.
+        run(pool, tracker, request, 3, state_at=[0])
+    assert tracker.num_freed[0] == 24
+    assert len(tracker.ghost) == 16
+
+    def ghost(request, idx):
+        key = make_block_hash_with_group_id(request.block_hashes[idx], ATTN)
+        return key in tracker.ghost
+
+    assert ghost(requests[-1], 2) and not ghost(requests[0], 1)
+
+
+def _hold_chain_and_lose_block(pool, tracker, request, lost: int):
+    """A running request holds six attention blocks and a state at 4; a KV
+    connector reports attention block ``lost`` invalid."""
+    attn = pool.get_new_blocks(6)
+    pool.cache_full_blocks(request, attn, 0, 6, BLOCK_SIZE, ATTN)
+    state = cache_state(pool, request, 4)
+    tracker.drain()
+    pool.evict_blocks({attn[lost].block_id})
+    tracker.drain()
+    return attn, state
+
+
+@pytest.mark.parametrize("states_first", [False, True])
+def test_held_chain_below_a_lost_block_is_freed_at_release(states_first):
+    """A state held when an attention block above it is evicted can never
+    hit: it must stop keeping its prefix alive, and be freed (with the
+    blocks below the lost one) when released."""
+    pool, tracker = make_pool()
+    request = make_request("a", list(range(6 * BLOCK_SIZE)))
+    attn, state = _hold_chain_and_lose_block(pool, tracker, request, lost=2)
+    # Still held: nothing is freed yet.
+    assert cached(pool, request, 4, STATE)
+    assert all(cached(pool, request, i, ATTN) for i in (0, 1, 3, 4, 5))
+    if states_first:
+        pool.free_blocks([state])
+        tracker.drain()
+        assert not cached(pool, request, 4, STATE)
+    pool.free_blocks(reversed(attn))
+    pool.free_blocks([state])
+    tracker.drain()
+    assert not any(cached(pool, request, i, ATTN) for i in range(6))
+    assert not cached(pool, request, 4, STATE)
+    assert not tracker.parent and not tracker.live_below and not tracker.broken
+
+
+def test_recaching_a_lost_block_revives_the_held_chain():
+    """If another request caches the lost block again, the held chain below
+    it can hit again and must stay."""
+    pool, tracker = make_pool()
+    request = make_request("a", list(range(6 * BLOCK_SIZE)))
+    attn, state = _hold_chain_and_lose_block(pool, tracker, request, lost=2)
+    # Another request recomputes the first three blocks.
+    other = make_request("b", list(range(3 * BLOCK_SIZE)))
+    pool.touch(attn[:2])
+    again = attn[:2] + pool.get_new_blocks(1)
+    pool.cache_full_blocks(other, again, 2, 3, BLOCK_SIZE, ATTN)
+    tracker.drain()
+    assert not tracker.broken
+    pool.free_blocks(reversed(again))
+    pool.free_blocks(reversed(attn))
+    pool.free_blocks([state])
+    tracker.drain()
+    assert all(cached(pool, request, i, ATTN) for i in range(5))
+    assert not cached(pool, request, 5, ATTN)
+    assert cached(pool, request, 4, STATE)
+
+
+def test_fine_held_chain_below_a_lost_full_block_is_freed_at_release():
+    pool, tracker = make_fine_pool()
+    request = make_request("a", list(range(4 * FINE_BLOCK)))
+    blocks = fine_attn(pool, request, 4)
+    state = fine_entry(pool, request, 13, STATE)
+    tracker.drain()
+    pool.evict_blocks({blocks[1].block_id})
+    tracker.drain()
+    assert cached(pool, request, 13, STATE)
+    release(pool, tracker, blocks + [state])
+    assert fine_cached(pool, request, (3, 7, 11, 15)) == [False] * 4
+    assert not cached(pool, request, 13, STATE)
+    assert not tracker.parent and not tracker.broken
+
+
+def test_freed_counts_are_logged(monkeypatch):
+    import vllm.v1.core.dead_entry_tracker as module
+
+    lines = []
+    monkeypatch.setattr(module, "_LOG_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        module.logger, "info", lambda msg, *args: lines.append(msg % args)
+    )
+    pool, tracker = make_pool()
+    request = make_request("a", list(range(6 * BLOCK_SIZE)))
+    run(pool, tracker, request, 6, state_at=[3])
+    assert lines == [
+        (
+            "Freed dead prefix-cache entries so far: 2 attention blocks, "
+            "0 Mamba states, 0 sliding-window blocks."
+        )
+    ]
+    # Nothing new freed: no new line.
+    tracker.drain()
+    assert len(lines) == 1
+
+
+def test_every_entry_point_is_a_safe_point(monkeypatch):
+    """Lookups free what was recorded before them; mutations free what they
+    recorded."""
+    manager = make_manager(64, free_dead=True)
+    calls = []
+    monkeypatch.setattr(manager.dead_tracker, "drain", lambda: calls.append(1))
+    request = make_request("a", tokens(1, 3), MANAGER_BLOCK_SIZE)
+    blocks, num_hit, _ = manager.get_computed_blocks(request)
+    manager.get_computed_blocks_for_connector(request)
+    assert manager.allocate_slots(request, request.num_tokens, 0, blocks) is not None
+    request.num_computed_tokens = request.num_tokens
+    manager.evict_blocks(set())
+    manager.free(request)
+    assert len(calls) == 5
