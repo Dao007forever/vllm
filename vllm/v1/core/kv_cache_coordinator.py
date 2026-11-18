@@ -3,8 +3,10 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.dead_entry_tracker import DeadEntryTracker
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -14,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    DFlashSlidingWindowManager,
     FullAttentionManager,
     MambaManager,
     SlidingWindowManager,
@@ -25,6 +28,8 @@ from vllm.v1.kv_cache_interface import (
     prefix_lookup_groups,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -93,6 +98,9 @@ class KVCacheCoordinator(ABC):
     """Coordinate the KV cache of different KV cache groups."""
 
     enable_partial_hash_hits = False
+    # Frees prefix-cache entries that can no longer hit
+    # (--free-dead-prefix-entries); only HybridKVCacheCoordinator sets it.
+    dead_tracker: DeadEntryTracker | None = None
 
     def __init__(
         self,
@@ -645,6 +653,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_hash_lookahead_tokens: int = 0,
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
+        free_dead_prefix_entries: bool = False,
+        kv_connector_completes_hybrid_hits: bool = False,
     ):
         super().__init__(
             kv_cache_config,
@@ -717,6 +727,191 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        if free_dead_prefix_entries:
+            self.dead_tracker = self._make_dead_tracker(
+                kv_connector_completes_hybrid_hits
+            )
+
+    def _make_dead_tracker(
+        self, kv_connector_completes_hybrid_hits: bool
+    ) -> DeadEntryTracker | None:
+        """A tracker for models with full-attention groups, one or more Mamba
+        groups in align mode and optionally sliding-window groups (EAGLE block
+        drops on attention groups allowed), all in one block pool and hashed
+        at their block size, or with fine-grained (partial) hash hits on
+        (full-attention and Mamba blocks a multiple of the hash block size,
+        no context parallelism); None (with a warning) otherwise."""
+        if kv_connector_completes_hybrid_hits:
+            # The connector loads the Mamba state of a full-attention-only
+            # local hit, so attention past the last local state can hit.
+            logger.warning(
+                "free_dead_prefix_entries is disabled: the KV connector can "
+                "complete full-attention-only local hits on this node."
+            )
+            return None
+        groups = self.kv_cache_config.kv_cache_groups
+        managers = self.single_type_managers
+        # Plain full attention and sliding window only: subclasses (sinks,
+        # R-SWA, ...) hit differently.
+        attn = [
+            i for i, g in enumerate(groups) if g.manager_cls is FullAttentionManager
+        ]
+        swa = [i for i, g in enumerate(groups) if g.manager_cls is SlidingWindowManager]
+        state = [i for i, m in enumerate(managers) if isinstance(m, MambaManager)]
+        others = [
+            i
+            for i, g in enumerate(groups)
+            if g.prefix_cacheable and i not in attn + swa + state
+        ]
+        fine_grained = self.enable_partial_hash_hits
+        # With partial hits, full-attention and Mamba blocks may span several
+        # hash blocks (sliding window cannot: it turns partial hits off).
+        hashed_at_block_size = swa if fine_grained else attn + swa + state
+        reasons = self._dead_tracker_unsupported_reasons(
+            attn, swa, state, others, hashed_at_block_size
+        )
+        if reasons:
+            logger.warning(
+                "free_dead_prefix_entries is disabled for this model: %s. "
+                "(Attention groups %s, sliding-window groups %s, state groups "
+                "%s, other cacheable groups %s, block sizes %s, hash block "
+                "size %d.)",
+                "; ".join(reasons),
+                attn,
+                swa,
+                state,
+                others,
+                [m.block_size for m in managers],
+                self.hash_block_size,
+            )
+            return None
+        swa_window_blocks = {}
+        for i in swa:
+            manager = managers[i]
+            assert isinstance(manager, SlidingWindowManager)
+            swa_window_blocks[i] = SlidingWindowManager._contiguous_blocks_for_hit(
+                manager.manager_config.params.sliding_window,
+                manager.block_size,
+                False,
+            )
+        block_pool = managers[attn[0]].block_pool
+        eagle = self._eagle_lookup_group_ids()
+        attn_block_units = None
+        if fine_grained:
+            attn_block_units = {
+                i: managers[i].block_size // self.hash_block_size for i in attn
+            }
+        # The junction is the longest hit of the first lookup, which is full
+        # attention (sorted first; later lookups are bounded by it).
+        first = self.attention_groups[0]
+        assert first.manager_cls is FullAttentionManager
+        ghost_lookup = list(first.group_ids)
+        tracker = DeadEntryTracker(
+            block_pool,
+            attn,
+            state,
+            swa_window_blocks,
+            eagle,
+            attn_block_units=attn_block_units,
+            ghost_lookup_group_ids=ghost_lookup,
+        )
+        block_pool.dead_tracker = tracker
+        logger.info(
+            "Freeing dead prefix-cache entries (attention groups %s, state groups "
+            "%s, sliding-window groups %s, EAGLE drop groups %s, attention block "
+            "sizes in hash blocks %s)",
+            attn,
+            state,
+            swa_window_blocks,
+            sorted(eagle),
+            attn_block_units,
+        )
+        return tracker
+
+    def _dead_tracker_unsupported_reasons(
+        self,
+        attn: list[int],
+        swa: list[int],
+        state: list[int],
+        others: list[int],
+        hashed_at_block_size: list[int],
+    ) -> list[str]:
+        """Why the dead-entry tracker cannot model this layout (empty if it can)."""
+        groups = self.kv_cache_config.kv_cache_groups
+        managers = self.single_type_managers
+        fine_grained = self.enable_partial_hash_hits
+        reasons: list[str] = []
+        if not state:
+            reasons.append(
+                "no Mamba state groups (without a recurrent state every cached "
+                "attention prefix can serve a hit, so nothing becomes dead)"
+            )
+        if not attn:
+            reasons.append("no plain full-attention group")
+        drafter = [
+            i
+            for i in others
+            if issubclass(groups[i].manager_cls, DFlashSlidingWindowManager)
+        ]
+        if drafter:
+            reasons.append(
+                f"the DFlash/DSpark drafter's sliding-window cache (groups "
+                f"{drafter}) is not modelled"
+            )
+        if rest := [i for i in others if i not in drafter]:
+            names = sorted({groups[i].manager_cls.__name__ for i in rest})
+            reasons.append(
+                f"other prefix-cacheable groups {rest} ({', '.join(names)}) are not "
+                "modelled"
+            )
+        if not self._eagle_lookup_group_ids() <= set(attn + swa):
+            # Draft layers are attention layers; a Mamba group never drops.
+            reasons.append("an EAGLE block drop on a non-attention group")
+        if any(
+            isinstance(m, MambaManager) and m.mamba_cache_mode != "align"
+            for m in managers
+        ):
+            reasons.append("Mamba prefix caching is not in align mode")
+        if attn and any(
+            managers[i].block_pool is not managers[attn[0]].block_pool
+            for i in attn + swa + state
+        ):
+            reasons.append("the groups use more than one block pool")
+        if any(
+            managers[i].block_size != self.hash_block_size for i in hashed_at_block_size
+        ):
+            reasons.append(
+                "a block size differs from the hash block size"
+                + ("" if fine_grained else " and partial hash hits are off")
+            )
+        if fine_grained and any(
+            m.dcp_world_size > 1 or m.pcp_world_size > 1 for m in managers
+        ):
+            reasons.append("partial hash hits with context parallelism (DCP/PCP)")
+        if (
+            fine_grained
+            and sum(
+                g.manager_cls is FullAttentionManager for g in self.attention_groups
+            )
+            > 1
+        ):
+            # A later full-attention lookup is capped inside a block by the
+            # first one's match, so it needs its partial entry there even when
+            # its full block is cached.
+            reasons.append(
+                "partial hash hits with full attention split over several lookups"
+            )
+        return reasons
+
+    def _eagle_lookup_group_ids(self) -> set[int]:
+        """Groups whose hit lookup drops a block for EAGLE: every group looked
+        up together with one holding draft layers."""
+        return {
+            i
+            for group in self.attention_groups
+            if group.use_eagle
+            for i in group.group_ids
+        }
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -937,6 +1132,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
 
+        if self.dead_tracker is not None:
+            # Attention entries freed as dead still mark a shared prefix: the
+            # first (full-attention) lookup sets ``longest_hit_length``.
+            longest_hit_length = max(
+                longest_hit_length,
+                self.dead_tracker.ghost_attention_hit(
+                    block_hashes, max_cache_hit_length
+                ),
+            )
         # Uncached shared prefix detection: if any attn. group cached a longer
         # prefix than the reconciled hit, it is an uncached common prefix across
         # requests that a sparse-retention group hasn't cached yet.
@@ -1014,7 +1218,16 @@ def get_kv_cache_coordinator(
     num_hash_lookahead_tokens: int = 0,
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
+    free_dead_prefix_entries: bool = False,
+    kv_connector_completes_hybrid_hits: bool = False,
 ) -> KVCacheCoordinator:
+    if free_dead_prefix_entries and (
+        not enable_caching or len(kv_cache_config.kv_cache_groups) == 1
+    ):
+        logger.warning(
+            "free_dead_prefix_entries only applies to hybrid models with "
+            "prefix caching enabled; ignored."
+        )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
@@ -1061,4 +1274,6 @@ def get_kv_cache_coordinator(
         num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         num_prefill_lookahead=num_prefill_lookahead,
         allow_partial_hash_hits=allow_partial_hash_hits,
+        free_dead_prefix_entries=free_dead_prefix_entries,
+        kv_connector_completes_hybrid_hits=kv_connector_completes_hybrid_hits,
     )

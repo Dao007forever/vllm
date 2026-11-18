@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Concatenate, Literal, ParamSpec, TypeVar, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -28,6 +29,42 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _drains_dead_entries(
+    before: bool = False,
+) -> Callable[
+    [Callable[Concatenate["KVCacheManager", _P], _R]],
+    Callable[Concatenate["KVCacheManager", _P], _R],
+]:
+    """Make a method a safe point for --free-dead-prefix-entries: free the
+    dead prefix-cache entries recorded so far after the call (mutations: what
+    its evictions and releases killed), or before it (lookups: what was freed
+    outside this manager, e.g. by the scheduler's deferred frees). Never
+    between a lookup and the allocation that takes its hit."""
+
+    def decorator(
+        method: Callable[Concatenate["KVCacheManager", _P], _R],
+    ) -> Callable[Concatenate["KVCacheManager", _P], _R]:
+        @functools.wraps(method)
+        def wrapper(self: "KVCacheManager", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+            tracker = self.dead_tracker
+            if tracker is None:
+                return method(self, *args, **kwargs)
+            if before:
+                tracker.drain()
+                return method(self, *args, **kwargs)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                tracker.drain()
+
+        return wrapper
+
+    return decorator
 
 
 @dataclass
@@ -146,6 +183,8 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        free_dead_prefix_entries: bool = False,
+        kv_connector_completes_hybrid_hits: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -178,7 +217,10 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            free_dead_prefix_entries=free_dead_prefix_entries,
+            kv_connector_completes_hybrid_hits=kv_connector_completes_hybrid_hits,
         )
+        self.dead_tracker = self.coordinator.dead_tracker
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
         # junction costs a forward pass and displaces the block-boundary stop.
@@ -284,6 +326,7 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
+    @_drains_dead_entries(before=True)
     def get_computed_blocks(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int]:
@@ -348,6 +391,7 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
+    @_drains_dead_entries(before=True)
     def get_computed_blocks_for_connector(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -397,6 +441,7 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    @_drains_dead_entries()
     def allocate_slots(
         self,
         request: Request,
@@ -647,6 +692,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    @_drains_dead_entries()
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -692,6 +738,7 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
+    @_drains_dead_entries()
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 

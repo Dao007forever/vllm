@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import weakref
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -31,6 +31,9 @@ from vllm.v1.core.kv_cache_utils import (
     to_event_extra_keys,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.dead_entry_tracker import DeadEntryTracker
 
 logger = init_logger(__name__)
 
@@ -95,6 +98,14 @@ class BlockHashToBlockMap:
             if len(dup_ids) == 1:
                 del self._dup_ids[key]
         return self._blocks[block_id]
+
+    def get_all_blocks(self, key: BlockHashWithGroupId) -> list[KVCacheBlock]:
+        """All blocks cached under the given block hash key."""
+        dup_ids = self._dup_ids.get(key)
+        if dup_ids is not None:
+            return [self._blocks[block_id] for block_id in dup_ids]
+        block_id = self._cache.get(key)
+        return [] if block_id is None else [self._blocks[block_id]]
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -171,6 +182,11 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # Optional DeadEntryTracker (--free-dead-prefix-entries), set by the
+        # KV cache coordinator. Its hooks only record events.
+        self.dead_tracker: DeadEntryTracker | None = None
+        # Set while cache entries move between blocks (not an eviction).
+        self._suppress_tracker = False
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -267,13 +283,20 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
-                removed_hashes = self._remove_cached_block_hashes(blk)
+                removed_hashes = self._remove_cached_block_hashes(blk, rekey=True)
                 self._emit_block_removed_events(removed_hashes)
-            self._insert_block_hash(
+            inserted = self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if inserted and self.dead_tracker is not None:
+                # Keyed by the hash of its last hash block.
+                self.dead_tracker.on_insert(
+                    kv_cache_group_id,
+                    request.block_hashes,
+                    num_hash_tokens // self.hash_block_size - 1,
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -524,13 +547,19 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
-            removed_hashes = self._remove_cached_block_hashes(block)
+            removed_hashes = self._remove_cached_block_hashes(block, rekey=True)
             self._emit_block_removed_events(removed_hashes)
-        self._insert_block_hash(
+        inserted = self._insert_block_hash(
             block_hash_with_group_id,
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if inserted and self.dead_tracker is not None:
+            # At a hash-block boundary, a partial entry keys the same chain
+            # hash a full block there would.
+            self.dead_tracker.on_insert(
+                kv_cache_group_id, request.block_hashes, num_hash_blocks - 1
+            )
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -605,6 +634,7 @@ class BlockPool:
     def _remove_cached_block_hashes(
         self,
         block: KVCacheBlock,
+        rekey: bool = False,
     ) -> list[BlockHashWithGroupId]:
         # A block only has secondary hashes alongside a primary one.
         if block.block_hash is None:
@@ -620,6 +650,10 @@ class BlockPool:
                 is not None
             ):
                 removed_hashes.append(block_hash)
+                if self.dead_tracker is not None and not self._suppress_tracker:
+                    self.dead_tracker.on_remove(
+                        get_group_id(block_hash), get_block_hash(block_hash), rekey
+                    )
         block.reset_hash()
         return removed_hashes
 
@@ -643,7 +677,9 @@ class BlockPool:
         block_hash_with_group_id: BlockHashWithGroupId,
         block: KVCacheBlock,
         num_tokens: int | None,
-    ) -> None:
+    ) -> bool:
+        """Key ``block`` under ``block_hash_with_group_id``. Returns False if
+        it already was."""
         if block.block_hash is None:
             # A block without a hash has no entries in the cache yet.
             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
@@ -653,12 +689,13 @@ class BlockPool:
                 block_hash_with_group_id, block.block_id
             )
         ):
-            return
+            return False
         else:
             self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        return True
 
     def move_block_hashes(
         self,
@@ -674,7 +711,13 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
-        for block_hash in self._remove_cached_block_hashes(src_block):
+        # The entries move, they are not evicted.
+        self._suppress_tracker = True
+        try:
+            removed = self._remove_cached_block_hashes(src_block)
+        finally:
+            self._suppress_tracker = False
+        for block_hash in removed:
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
@@ -823,6 +866,12 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
+                if self.dead_tracker is not None and block.block_hash is not None:
+                    # Every entry of the block (a partial one can share it).
+                    for key in self.cached_block_keys(block):
+                        self.dead_tracker.on_release(
+                            get_group_id(key), get_block_hash(key)
+                        )
                 if block.block_hash is None or not self.enable_caching or evict_first:
                     # LIFO reuse of non-cached blocks for better GPU locality,
                     # and of cached ones when asked to evict them first.
@@ -837,6 +886,39 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks, evict_first=evict_first)
+
+    def cached_blocks_for(self, key: BlockHashWithGroupId) -> list[KVCacheBlock]:
+        """Blocks cached under ``key`` (usually one)."""
+        return self.cached_block_hash_to_block.get_all_blocks(key)
+
+    def cached_block_keys(self, block: KVCacheBlock) -> list[BlockHashWithGroupId]:
+        """Every key ``block`` is cached under (a partial entry can share a
+        block with its full one)."""
+        if block.block_hash is None:
+            return []
+        return [
+            block.block_hash,
+            *self.cached_block_hashes_by_block.get(block.block_id, ()),
+        ]
+
+    def drop_cached_block(self, block: KVCacheBlock) -> bool:
+        """Evict a cached block that no request holds and move it to the
+        front of the free queue, so it is reused before any other cached
+        block is evicted. Used by the DeadEntryTracker for entries that can
+        no longer serve a hit.
+
+        Returns False (and does nothing) if the block is in use or uncached.
+        """
+        if block.ref_cnt != 0 or block.block_hash is None or block.is_null:
+            return False
+        # Emits BlockRemoved events and closes the block's residency metrics,
+        # as an LRU eviction would.
+        self._maybe_evict_cached_block(block)
+        if block.block_id not in self._reuse_watchers:
+            # Blocks still being read (``unpin_blocks``) keep their place.
+            self.free_block_queue.remove(block)
+            self.free_block_queue.prepend_n([block])
+        return True
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -892,6 +974,8 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+        if self.dead_tracker is not None:
+            self.dead_tracker.reset()
 
         logger.info("Successfully reset prefix cache")
 
