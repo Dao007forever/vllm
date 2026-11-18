@@ -1398,3 +1398,49 @@ def test_every_entry_point_is_a_safe_point(monkeypatch):
     manager.evict_blocks(set())
     manager.free(request)
     assert len(calls) == 5
+
+
+def test_declines_attention_only_models_with_a_dspark_drafter(monkeypatch):
+    """MiniMax-M3.1 with its DSpark draft: full attention plus the drafter's
+    sliding-window cache, and no Mamba state. Every cached attention prefix can
+    serve a hit, and the drafter's cache is not modelled, so the tracker stays
+    off and says why."""
+    import vllm.v1.core.kv_cache_coordinator as coordinator_module
+    from vllm.v1.core.single_type_kv_cache_manager import DFlashSlidingWindowManager
+
+    lines: list[str] = []
+    monkeypatch.setattr(
+        coordinator_module.logger,
+        "warning",
+        lambda msg, *args: lines.append(msg % args),
+    )
+    attn = AttentionSpec(
+        block_size=MANAGER_BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            new_kv_cache_group(["attn"], full_layer(attn)),
+            new_kv_cache_group(
+                ["draft"],
+                DFlashSlidingWindowManager.layer_config(
+                    attn,
+                    sliding_window=4 * MANAGER_BLOCK_SIZE,
+                    num_speculative_tokens=3,
+                ),
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=8192,
+        scheduler_block_size=MANAGER_BLOCK_SIZE,
+        hash_block_size=MANAGER_BLOCK_SIZE,
+        enable_caching=True,
+        free_dead_prefix_entries=True,
+    )
+    assert manager.dead_tracker is None and manager.block_pool.dead_tracker is None
+    [line] = [line for line in lines if "free_dead_prefix_entries" in line]
+    assert "no Mamba state groups" in line
+    assert "DFlash/DSpark drafter" in line

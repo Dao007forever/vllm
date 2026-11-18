@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    DFlashSlidingWindowManager,
     FullAttentionManager,
     MambaManager,
     SlidingWindowManager,
@@ -766,57 +767,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # With partial hits, full-attention and Mamba blocks may span several
         # hash blocks (sliding window cannot: it turns partial hits off).
         hashed_at_block_size = swa if fine_grained else attn + swa + state
-        if (
-            not attn
-            or not state
-            or others
-            # Draft layers are attention layers; a Mamba group never drops.
-            or not self._eagle_lookup_group_ids() <= set(attn + swa)
-            or any(
-                isinstance(m, MambaManager) and m.mamba_cache_mode != "align"
-                for m in managers
-            )
-            or any(
-                managers[i].block_pool is not managers[attn[0]].block_pool
-                for i in attn + swa + state
-            )
-            or any(
-                managers[i].block_size != self.hash_block_size
-                for i in hashed_at_block_size
-            )
-            or (
-                fine_grained
-                and any(m.dcp_world_size > 1 or m.pcp_world_size > 1 for m in managers)
-            )
-            # With partial hits, a later full-attention lookup is capped
-            # inside a block by the first one's match, so it needs its partial
-            # entry there even when its full block is cached.
-            or (
-                fine_grained
-                and sum(
-                    g.manager_cls is FullAttentionManager for g in self.attention_groups
-                )
-                > 1
-            )
-        ):
+        reasons = self._dead_tracker_unsupported_reasons(
+            attn, swa, state, others, hashed_at_block_size
+        )
+        if reasons:
             logger.warning(
-                "free_dead_prefix_entries supports full-attention, Mamba (align "
-                "mode) and sliding-window groups in one block pool, hashed at "
-                "their block size or with fine-grained (partial) hash hits "
-                "without context parallelism, with EAGLE drops on attention "
-                "groups only; disabled for this model (attention groups %s, "
-                "sliding-window groups %s, state groups %s, other cacheable "
-                "groups %s, partial hash hits %s, EAGLE drop groups %s, block "
-                "sizes %s, hash block size %d, DCP/PCP sizes %s).",
+                "free_dead_prefix_entries is disabled for this model: %s. "
+                "(Attention groups %s, sliding-window groups %s, state groups "
+                "%s, other cacheable groups %s, block sizes %s, hash block "
+                "size %d.)",
+                "; ".join(reasons),
                 attn,
                 swa,
                 state,
                 others,
-                fine_grained,
-                sorted(self._eagle_lookup_group_ids()),
                 [m.block_size for m in managers],
                 self.hash_block_size,
-                sorted({(m.dcp_world_size, m.pcp_world_size) for m in managers}),
             )
             return None
         swa_window_blocks = {}
@@ -824,7 +790,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             manager = managers[i]
             assert isinstance(manager, SlidingWindowManager)
             swa_window_blocks[i] = SlidingWindowManager._contiguous_blocks_for_hit(
-                manager.sliding_window, manager.block_size, False
+                manager.manager_config.params.sliding_window,
+                manager.block_size,
+                False,
             )
         block_pool = managers[attn[0]].block_pool
         eagle = self._eagle_lookup_group_ids()
@@ -859,6 +827,81 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             attn_block_units,
         )
         return tracker
+
+    def _dead_tracker_unsupported_reasons(
+        self,
+        attn: list[int],
+        swa: list[int],
+        state: list[int],
+        others: list[int],
+        hashed_at_block_size: list[int],
+    ) -> list[str]:
+        """Why the dead-entry tracker cannot model this layout (empty if it can)."""
+        groups = self.kv_cache_config.kv_cache_groups
+        managers = self.single_type_managers
+        fine_grained = self.enable_partial_hash_hits
+        reasons: list[str] = []
+        if not state:
+            reasons.append(
+                "no Mamba state groups (without a recurrent state every cached "
+                "attention prefix can serve a hit, so nothing becomes dead)"
+            )
+        if not attn:
+            reasons.append("no plain full-attention group")
+        drafter = [
+            i
+            for i in others
+            if issubclass(groups[i].manager_cls, DFlashSlidingWindowManager)
+        ]
+        if drafter:
+            reasons.append(
+                f"the DFlash/DSpark drafter's sliding-window cache (groups "
+                f"{drafter}) is not modelled"
+            )
+        if rest := [i for i in others if i not in drafter]:
+            names = sorted({groups[i].manager_cls.__name__ for i in rest})
+            reasons.append(
+                f"other prefix-cacheable groups {rest} ({', '.join(names)}) are not "
+                "modelled"
+            )
+        if not self._eagle_lookup_group_ids() <= set(attn + swa):
+            # Draft layers are attention layers; a Mamba group never drops.
+            reasons.append("an EAGLE block drop on a non-attention group")
+        if any(
+            isinstance(m, MambaManager) and m.mamba_cache_mode != "align"
+            for m in managers
+        ):
+            reasons.append("Mamba prefix caching is not in align mode")
+        if attn and any(
+            managers[i].block_pool is not managers[attn[0]].block_pool
+            for i in attn + swa + state
+        ):
+            reasons.append("the groups use more than one block pool")
+        if any(
+            managers[i].block_size != self.hash_block_size for i in hashed_at_block_size
+        ):
+            reasons.append(
+                "a block size differs from the hash block size"
+                + ("" if fine_grained else " and partial hash hits are off")
+            )
+        if fine_grained and any(
+            m.dcp_world_size > 1 or m.pcp_world_size > 1 for m in managers
+        ):
+            reasons.append("partial hash hits with context parallelism (DCP/PCP)")
+        if (
+            fine_grained
+            and sum(
+                g.manager_cls is FullAttentionManager for g in self.attention_groups
+            )
+            > 1
+        ):
+            # A later full-attention lookup is capped inside a block by the
+            # first one's match, so it needs its partial entry there even when
+            # its full block is cached.
+            reasons.append(
+                "partial hash hits with full attention split over several lookups"
+            )
+        return reasons
 
     def _eagle_lookup_group_ids(self) -> set[int]:
         """Groups whose hit lookup drops a block for EAGLE: every group looked
