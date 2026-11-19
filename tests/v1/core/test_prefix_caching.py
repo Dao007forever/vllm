@@ -2900,6 +2900,77 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+@pytest.mark.parametrize("group_by_position", [True, False])
+def test_mamba_align_free_queues_states_next_to_their_attention(
+    group_by_position: bool,
+):
+    """Align mode releases a cached boundary state as soon as the request
+    moves past it, long before the request's attention blocks. On free, each
+    state must be queued right before the attention block ending at the same
+    position, tail first, so LRU evicts a state with the attention it needs.
+    Without the request's hashes, blocks are freed group by group as before."""
+    block_size = 16
+    num_full_blocks = 4
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 32, ["mamba", "full"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    mamba_gid, full_gid = 0, 1
+    num_tokens = num_full_blocks * block_size
+    req = make_request("0", list(range(num_tokens)), block_size, sha256)
+    for end in range(block_size, num_tokens + 1, block_size):
+        assert manager.allocate_slots(req, block_size) is not None
+        req.num_computed_tokens = end
+        manager.remove_skipped_blocks(req.request_id, end, num_tokens)
+        manager.new_step_starts()
+
+    pool = manager.block_pool
+    position = {h: i + 1 for i, h in enumerate(req.block_hashes)}
+
+    def queued() -> list[tuple[int, int]]:
+        """(group id, end block) of the cached free blocks, front to back."""
+        out = []
+        queue = pool.free_block_queue
+        node = queue.fake_free_list_head.next_free_block
+        while node is not None and node is not queue.fake_free_list_tail:
+            if node.block_hash is not None:
+                out.append(
+                    (
+                        get_group_id(node.block_hash),
+                        position[get_block_hash(node.block_hash)],
+                    )
+                )
+            node = node.next_free_block
+        return out
+
+    # The scenario: earlier states are already free while the request runs.
+    released_early = [g for g, _ in queued()]
+    assert released_early.count(mamba_gid) >= num_full_blocks - 2
+    assert full_gid not in released_early
+
+    if group_by_position:
+        manager.free(req)
+    else:
+        manager.coordinator.free(req.request_id)
+    after = queued()
+    states = sorted(pos for g, pos in after if g == mamba_gid)
+    attention = [(full_gid, pos) for pos in range(num_full_blocks, 0, -1)]
+    if group_by_position:
+        expected = sorted(
+            [(mamba_gid, pos) for pos in states] + attention,
+            key=lambda e: (-e[1], e[0] != mamba_gid),
+        )
+        assert after == expected
+    else:
+        # Every state ahead of every attention block.
+        assert [g for g, _ in after] == [mamba_gid] * len(states) + [full_gid] * len(
+            attention
+        )
+    assert sum(b.ref_cnt for b in pool.blocks if not b.is_null) == 0
+
+
 def test_hybrid_cache_mamba_align_shared_prefix_detection():
     """Test shared prefix detection heuristic for mamba align cache mode
 

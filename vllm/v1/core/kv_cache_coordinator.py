@@ -8,6 +8,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashListWithBlockSize,
     KVCacheBlock,
     eagle_proof_margin,
     partial_hash_hits_enabled,
@@ -414,15 +415,97 @@ class KVCacheCoordinator(ABC):
         )
         return all([pool.reset_prefix_cache() for pool in pools])
 
-    def free(self, request_id: str) -> None:
+    def free(
+        self, request_id: str, block_hashes: Sequence[BlockHash] | None = None
+    ) -> None:
         """Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            block_hashes: The request's block hashes. When given and a group
+                caches Mamba states in "align" mode, the request's states are
+                queued next to the attention blocks they need (see
+                `_free_grouping_states`).
 
         """
+        if block_hashes is not None and self._align_state_managers():
+            self._free_grouping_states(request_id, block_hashes)
+            return
         for manager in self.single_type_managers:
             manager.free(request_id)
+
+    def _align_state_managers(self) -> list[MambaManager]:
+        """Managers that cache Mamba states for prefix caching ("align")."""
+        if not self.block_pool.enable_caching:
+            return []
+        return [
+            m
+            for m in self.single_type_managers
+            if isinstance(m, MambaManager) and m.mamba_cache_mode == "align"
+        ]
+
+    def _free_grouping_states(
+        self, request_id: str, block_hashes: Sequence[BlockHash]
+    ) -> None:
+        """Free the request's blocks so that each cached state is queued next
+        to the blocks of the other groups that end at the same position.
+
+        A prefix hit of a hybrid model needs a state and every attention block
+        up to it. In align mode, the Mamba manager releases a cached boundary
+        state as soon as the request moves past it, while the attention blocks
+        stay held until the request finishes. Freeing group by group therefore
+        leaves each state far ahead of its attention in the LRU queue: LRU
+        evicts the state first, and the attention behind it can no longer be
+        hit but stays cached, while other requests' live blocks are evicted.
+
+        Here every block of the request, held ones and its cached states that
+        are already free, is (re)queued tail first by the position where it
+        ends, a state before the attention block ending at the same position.
+        LRU then evicts a state together with the attention between it and the
+        previous state, and a later request can still hit the shorter prefix.
+        """
+        state_managers = self._align_state_managers()
+        hash_block_size = self.block_pool.hash_block_size
+        # (end token, is not a state, block, held by this request)
+        entries: list[tuple[int, bool, KVCacheBlock, bool]] = []
+        for manager in self.single_type_managers:
+            block_size = manager.block_size
+            table = list(manager.req_to_blocks.get(request_id, ()))
+            manager.pop_blocks_for_free(request_id)
+            is_state = manager in state_managers
+            for i, block in enumerate(table):
+                if not block.is_null:
+                    entries.append(((i + 1) * block_size, not is_state, block, True))
+            if not is_state:
+                continue
+            hashes: Sequence[BlockHash] = (
+                block_hashes
+                if block_size == hash_block_size
+                else BlockHashListWithBlockSize(
+                    list(block_hashes), hash_block_size, block_size
+                )
+            )
+            for i in range(len(hashes)):
+                if i < len(table) and not table[i].is_null:
+                    continue
+                cached = manager.block_pool.get_cached_block(
+                    hashes[i], [manager.kv_cache_group_id]
+                )
+                if cached and cached[0].ref_cnt == 0:
+                    entries.append(((i + 1) * block_size, False, cached[0], False))
+        # Tail first; at the same position, the state first.
+        entries.sort(key=lambda e: (-e[0], e[1]))
+        held: list[KVCacheBlock] = []
+        for _, _, block, is_held in entries:
+            if is_held:
+                held.append(block)
+                continue
+            if held:
+                self.block_pool.free_blocks(held)
+                held = []
+            self.block_pool.requeue_free_cached_block(block)
+        if held:
+            self.block_pool.free_blocks(held)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping from all single-type managers and
