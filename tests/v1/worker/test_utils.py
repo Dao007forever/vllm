@@ -591,16 +591,17 @@ def test_copy_kv_cache_blocks_inplace_cuda_unaligned_blocks():
     torch.testing.assert_close(cache, expected)
 
 
-def test_copy_kv_cache_blocks_applies_only_its_pools_copies():
-    """Block IDs are per pool: a copy applies only to the pool it names."""
+def test_copy_kv_cache_blocks_applies_only_its_groups_copies():
+    """A group with its own blocks has its own block IDs: a copy applies only
+    to the shared pool, or to the group it names."""
     backing = torch.zeros((6, 2))
     shared, pool1 = backing[:4], backing[4:]
     shared[1] = 7
     pool1[1] = 11
-    copies = [KVCacheBlockCopy(1, 2), KVCacheBlockCopy(1, 0, pool_id=1)]
+    copies = [KVCacheBlockCopy(1, 2), KVCacheBlockCopy(1, 0, private_group_id=1)]
 
     copy_kv_cache_blocks_inplace([shared], 4, copies)
-    copy_kv_cache_blocks_inplace([pool1], 2, copies, pool_id=1)
+    copy_kv_cache_blocks_inplace([pool1], 2, copies, private_group_id=1)
 
     assert shared[:, 0].tolist() == [0, 7, 7, 0]
     assert pool1[:, 0].tolist() == [11, 11]

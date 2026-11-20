@@ -422,14 +422,13 @@ def test_private_pool_groups_are_not_zeroed(monkeypatch):
         new_kv_cache_group(["target.attn"], target),
         new_kv_cache_group(["target.mamba"], mamba),
         new_kv_cache_group(
-            ["draft.attn"], sliding_window_layer(drafter, 16), pool_id=1
+            ["draft.attn"], sliding_window_layer(drafter, 16), num_blocks=5
         ),
     ]
     config = KVCacheConfig(
         num_blocks=64,
         kv_cache_tensors=[],
         kv_cache_groups=groups,
-        pool_num_blocks={1: 5},
     )
     assert config.needs_kv_cache_zeroing
     assert not config.has_mixed_precision_kv_cache

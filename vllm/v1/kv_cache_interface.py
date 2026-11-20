@@ -652,7 +652,6 @@ class KVCacheTensor:
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
     host_resident: bool = False
-    pool_id: int = 0  # the device block pool whose block IDs index this tensor
 
 
 class KVCacheGroupRole(StrEnum):
@@ -708,10 +707,10 @@ class KVCacheGroup:
     # source group after a connector load.
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
-    # Device block pool of this group: 0 is the shared pool, whose blocks are
-    # as large as its widest group's; others are private pools of their own
-    # groups' blocks, sized by `KVCacheConfig.pool_num_blocks`.
-    pool_id: int = 0
+    # Blocks of the group's own tensors, which its block IDs then index. None
+    # shares `KVCacheConfig.num_blocks` blocks, each as large as the widest
+    # group's, with the other groups.
+    num_blocks: int | None = None
     # The whole group's distinct specs, set on a group projected onto a
     # pipeline stage.
     unprojected_specs: tuple[KVCacheSpec, ...] = field(default=(), compare=False)
@@ -880,9 +879,6 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
-    pool_num_blocks: dict[int, int] = field(default_factory=dict)
-    """Block counts of the device pools other than pool 0 (`num_blocks`)."""
-
     needs_kv_cache_zeroing: bool = field(init=False)
     """Whether newly allocated attention blocks must be zeroed before use.
 
@@ -958,21 +954,17 @@ class KVCacheConfig:
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing `tensor`."""
         if not tensor.host_resident:
-            return self.num_blocks_of_pool(tensor.pool_id)
+            return self.num_blocks
         assert self.hisparse_host_num_blocks is not None
         return self.hisparse_host_num_blocks
 
-    def num_blocks_of_pool(self, pool_id: int) -> int:
-        """Number of blocks of device pool `pool_id`."""
-        return self.pool_num_blocks[pool_id] if pool_id else self.num_blocks
-
     def num_blocks_of_group(self, group_id: int) -> int:
-        """Number of blocks of the pool backing cache group `group_id`."""
+        """Number of blocks cache group `group_id`'s block IDs index."""
         group = self.kv_cache_groups[group_id]
         if group.host_resident:
             assert self.hisparse_host_num_blocks is not None
             return self.hisparse_host_num_blocks
-        return self.num_blocks_of_pool(group.pool_id)
+        return group.num_blocks or self.num_blocks
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -987,8 +979,8 @@ class KVCacheConfig:
         """Whether device attention caches use more than one precision."""
         kv_cache_precisions: set[tuple[torch.dtype, KVQuantMode]] = set()
         for group in self.kv_cache_groups:
-            # A private pool's blocks are never reused by another group.
-            if group.host_resident or group.pool_id:
+            # A group's own blocks are never reused by another group.
+            if group.host_resident or group.num_blocks:
                 continue
             kv_cache_precisions.update(
                 (spec.dtype, spec.kv_quant_mode)

@@ -406,7 +406,6 @@ def test_private_pool_regions_hold_their_pools_blocks(layout):
                 layer_stride=page if block_outer else page * num_pool_blocks,
                 block_stride=2 * page if block_outer else page,
                 offset=shared_bytes,
-                pool_id=1,
             ),
         ],
         [
@@ -415,10 +414,9 @@ def test_private_pool_regions_hold_their_pools_blocks(layout):
                 ["draft.0", "draft.1"],
                 spec,
                 manager_config=DFlashSlidingWindowManager.config(sliding_window=32),
-                pool_id=1,
+                num_blocks=num_pool_blocks,
             ),
         ],
-        pool_num_blocks={1: num_pool_blocks},
     )
     caches = allocate_kv_cache(kv_cache_config, torch.device("cpu"), layout)
     config = create_vllm_config(block_size=block_size)
@@ -732,7 +730,6 @@ def _make_mla_hybrid_worker(
                 layers=["draft.0"],
                 layer_stride=num_draft_pool_blocks * draft_spec.page_size_bytes,
                 block_stride=draft_spec.page_size_bytes,
-                pool_id=1,
             )
         )
         kv_cache_config.kv_cache_groups.append(
@@ -742,10 +739,9 @@ def _make_mla_hybrid_worker(
                 manager_config=DFlashSlidingWindowManager.config(
                     sliding_window=2 * local_block_size
                 ),
-                pool_id=1,
+                num_blocks=num_draft_pool_blocks,
             )
         )
-        kv_cache_config.pool_num_blocks = {1: num_draft_pool_blocks}
 
     vllm_config = create_vllm_config(block_size=local_block_size)
     vllm_config.cache_config.enable_prefix_caching = False

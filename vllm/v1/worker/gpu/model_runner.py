@@ -871,19 +871,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
-        # Private pools keep the extensible cache off, so these views are never
-        # remapped; without them, block copies use the current `kv_caches`.
-        self.kv_caches_by_pool: dict[int, list[torch.Tensor]] = {}
-        if kv_cache_config.pool_num_blocks:
-            pool_of_layer = {
-                layer_name: group.pool_id
-                for group in kv_cache_config.kv_cache_groups
-                for layer_name in group.layer_names
-            }
+        # Caches by the group whose own blocks they hold
+        # (`KVCacheGroup.num_blocks`), None for the shared pool's. Such groups
+        # keep the extensible cache off, so these views are never remapped;
+        # without them, block copies use the current `kv_caches`.
+        self.kv_caches_by_private_group: dict[int | None, list[torch.Tensor]] = {}
+        private_group_of_layer = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.num_blocks
+            for layer_name in group.layer_names
+        }
+        if private_group_of_layer:
             for layer_name, cache in kv_caches_dict.items():
                 if cache.device == self.device:
-                    pool_id = pool_of_layer.get(layer_name, 0)
-                    self.kv_caches_by_pool.setdefault(pool_id, []).append(cache)
+                    group_id = private_group_of_layer.get(layer_name)
+                    self.kv_caches_by_private_group.setdefault(group_id, []).append(
+                        cache
+                    )
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
             self.compilation_config.static_forward_context
@@ -908,12 +913,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
-            # Private pools hold one precision and no Mamba state.
+            # A group's own blocks hold one precision and no Mamba state.
             attn_groups_iter=(
                 g
                 for groups in self.attn_groups
                 for g in groups
-                if not kv_cache_groups[g.kv_cache_group_id].pool_id
+                if not kv_cache_groups[g.kv_cache_group_id].num_blocks
             ),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
@@ -1414,15 +1419,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
-            kv_caches_by_pool = self.kv_caches_by_pool or {0: self.kv_caches}
-            for pool_id, kv_caches in kv_caches_by_pool.items():
-                if not pool_id:
+            kv_cache_config = self.kv_cache_config
+            kv_caches_by_group = self.kv_caches_by_private_group or {
+                None: self.kv_caches
+            }
+            for group_id, kv_caches in kv_caches_by_group.items():
+                if group_id is None:
                     kv_caches = [*kv_caches, *self.replayssm_block_copy_tensors]
+                    num_blocks = kv_cache_config.num_blocks
+                else:
+                    num_blocks = kv_cache_config.num_blocks_of_group(group_id)
                 copy_kv_cache_blocks_inplace(
                     kv_caches,
-                    self.kv_cache_config.num_blocks_of_pool(pool_id),
+                    num_blocks,
                     scheduler_output.kv_cache_block_copies,
-                    pool_id,
+                    group_id,
                 )
 
     def gather_batch_req_state(
@@ -2589,8 +2600,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.replayssm_block_copy_tensors.clear()
         if hasattr(self, "kv_caches_by_layer"):
             self.kv_caches_by_layer.clear()
-        if hasattr(self, "kv_caches_by_pool"):
-            self.kv_caches_by_pool.clear()
+        if hasattr(self, "kv_caches_by_private_group"):
+            self.kv_caches_by_private_group.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):

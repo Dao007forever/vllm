@@ -5363,9 +5363,9 @@ def test_dflash_drafter_hit_needs_cached_drafter_kv_only_in_its_window(
 
 
 def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
-    """A group with pool_id 1 draws from its own block pool: running it out
-    blocks admission while the shared pool has room, and a reservation of its
-    blocks is checked against it alone."""
+    """A group with its own blocks draws from its own block pool: running it out
+    holds back admission while the shared pool has room, and the reported
+    usage is the fullest pool's."""
     block_size = 4
     kv_cache_config = KVCacheConfig(
         num_blocks=64,
@@ -5390,11 +5390,10 @@ def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
                     head_size=1,
                     dtype=torch.float32,
                 ),
-                pool_id=1,
+                # The null block plus one 40-token prefill's 3-block tail.
+                num_blocks=4,
             ),
         ],
-        # The null block plus one 40-token prefill's 3-block tail.
-        pool_num_blocks={1: 4},
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
@@ -5402,7 +5401,8 @@ def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
         enable_caching=True,
         hash_block_size=block_size,
     )
-    shared_pool, draft_pool = manager.coordinator.block_pools
+    shared_pool = manager.coordinator.block_pool
+    (draft_pool,) = manager.coordinator.private_block_pools.values()
 
     req0 = make_request("0", list(range(40)), block_size, sha256)
     blocks = manager.allocate_slots(req0, 40)
@@ -5410,17 +5410,14 @@ def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
     _, draft_ids = blocks.get_block_ids()
     assert draft_ids == [0] * 7 + [1, 2, 3]
     assert draft_pool.get_num_free_blocks() == 0
-    assert manager.pool_usages == [shared_pool.get_usage(), 1.0]
+    assert manager.usage == 1.0
 
     req1 = make_request("1", list(range(100, 140)), block_size, sha256)
     assert shared_pool.get_num_free_blocks() > 10
     assert manager.allocate_slots(req1, 40) is None
 
     manager.free(req0)
-    assert draft_pool.get_num_free_blocks() == 3
-    assert manager.allocate_slots(req1, 40, reserved_blocks=[0, 1]) is None
-    blocks = manager.allocate_slots(req1, 40, reserved_blocks=[0, 0])
-    assert blocks is not None
+    assert manager.allocate_slots(req1, 40) is not None
 
 
 def test_hybrid_cache_blocks_clamped_to_lcm():

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
-from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
@@ -113,26 +112,21 @@ def _warmup_block_counter(
 def _warmup_block_allocator(
     model_runner: GPUModelRunner,
 ) -> Callable[[Sequence[int]], tuple[list[int], ...]]:
-    """Hand out block IDs for each KV cache group from its pool, after the null
-    block. Shared-pool IDs stay distinct; a private pool's wrap around, since
-    warmup only needs valid IDs."""
-    kv_cache_config = model_runner.kv_cache_config
-    next_block_ids: defaultdict[int, int] = defaultdict(lambda: 1)
+    """Hand out distinct block IDs after the null block for each KV cache
+    group. Those of a group with its own blocks wrap around, since warmup only
+    needs valid IDs."""
+    kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
+    next_block_id = 1
 
     def alloc_blocks(num_blocks_per_group: Sequence[int]) -> tuple[list[int], ...]:
+        nonlocal next_block_id
         block_ids: list[list[int]] = []
-        for group, num_blocks in zip(
-            kv_cache_config.kv_cache_groups, num_blocks_per_group
-        ):
-            start = next_block_ids[group.pool_id]
-            next_block_ids[group.pool_id] += num_blocks
-            if group.pool_id:
-                num_usable = kv_cache_config.num_blocks_of_pool(group.pool_id) - 1
-                block_ids.append(
-                    [(start + i - 1) % num_usable + 1 for i in range(num_blocks)]
-                )
-            else:
-                block_ids.append(list(range(start, start + num_blocks)))
+        for group, num_blocks in zip(kv_cache_groups, num_blocks_per_group):
+            ids = list(range(next_block_id, next_block_id + num_blocks))
+            next_block_id += num_blocks
+            if group.num_blocks:
+                ids = [(i - 1) % (group.num_blocks - 1) + 1 for i in ids]
+            block_ids.append(ids)
         return tuple(block_ids)
 
     return alloc_blocks
