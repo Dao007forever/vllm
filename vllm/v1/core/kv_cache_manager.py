@@ -883,15 +883,15 @@ class KVCacheManager:
         """Drain pending copies and return their retained endpoints."""
         copies: list[KVCacheBlockCopy] = []
         retained_blocks: list[KVCacheBlock] = []
-        for mgr, group in zip(
-            self.coordinator.single_type_managers, self.kv_cache_config.kv_cache_groups
-        ):
+        coordinator = self.coordinator
+        for group_id, mgr in enumerate(coordinator.single_type_managers):
+            private = group_id in coordinator.private_block_pools
             for source_block, cow_block in mgr.take_pending_cow_copies():
                 copies.append(
                     KVCacheBlockCopy(
                         src_block_id=source_block.block_id,
                         dst_block_id=cow_block.block_id,
-                        pool_id=group.pool_id,
+                        private_group_id=group_id if private else None,
                     )
                 )
                 retained_blocks += (source_block, cow_block)

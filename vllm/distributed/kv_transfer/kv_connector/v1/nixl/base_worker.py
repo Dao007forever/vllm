@@ -1168,9 +1168,11 @@ class NixlBaseConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
-        # Private block pools (--draft-kv-pool) have their own block counts,
-        # which each region carries.
-        self._has_private_pools = bool(kv_cache_config.pool_num_blocks)
+        # Groups with their own blocks (--draft-kv-pool) have their own block
+        # counts, which each region carries.
+        self._has_private_pools = any(
+            group.num_blocks for group in kv_cache_config.kv_cache_groups
+        )
         if self._has_private_pools and self.use_host_buffer:
             raise NotImplementedError(
                 "NIXL with --draft-kv-pool does not support a host transfer buffer."
@@ -1763,9 +1765,7 @@ class NixlBaseConnectorWorker:
                 logical_num_blocks = self.kv_cache_config.hisparse_host_num_blocks
                 assert logical_num_blocks is not None
             else:
-                logical_num_blocks = self.kv_cache_config.num_blocks_of_pool(
-                    group.pool_id
-                )
+                logical_num_blocks = group.num_blocks or self.kv_cache_config.num_blocks
             group_id = group_index
             num_blocks = (
                 logical_num_blocks
@@ -2012,7 +2012,7 @@ class NixlBaseConnectorWorker:
             transfer_groups = self.kv_cache_config.transfer_groups
             self.region_num_blocks = [
                 count
-                if all(transfer_groups[group].pool_id for group in groups)
+                if all(transfer_groups[group].num_blocks for group in groups)
                 else self.num_blocks
                 for count, groups in zip(self.region_num_blocks, region_groups)
             ]

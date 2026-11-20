@@ -272,14 +272,14 @@ def _pool_bytes_per_block(
     """Bytes consumed by one block in the worker's shared KV cache pool, mirroring
     the divisor used by `get_kv_cache_config_from_groups` to convert
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
-    capacity once `num_gpu_blocks_override` is applied. Groups with a private
-    pool (`pool_id`) are excluded.
+    capacity once `num_gpu_blocks_override` is applied. Groups with their own
+    blocks (`KVCacheGroup.num_blocks`) are excluded.
     """
     return _get_kv_cache_bytes_per_block(
         [
             group
             for group in kv_cache_groups
-            if not group.host_resident and not group.pool_id
+            if not group.host_resident and not group.num_blocks
         ],
         vllm_config.cache_config.get_resolved_kv_cache_layout(),
     )
@@ -298,9 +298,9 @@ def _pool_bytes_per_block_from_builder(
     keeps the pure computation, since probing its placement would check the host
     pool against `max_model_len` before auto-fit shortens it.
     `num_gpu_blocks_override` is suppressed so it cannot inflate the probe.
-    Groups with a private pool (`pool_id`) are excluded.
+    Groups with their own blocks (`KVCacheGroup.num_blocks`) are excluded.
     """
-    kv_cache_groups = [group for group in kv_cache_groups if not group.pool_id]
+    kv_cache_groups = [group for group in kv_cache_groups if not group.num_blocks]
     if not kv_cache_groups:
         return 0
     if vllm_config.attention_config.hisparse_config is not None:
@@ -629,7 +629,7 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
-    if any(group.pool_id for group in kv_cache_groups):
+    if any(group.num_blocks for group in kv_cache_groups):
         return _get_draft_kv_pool_config(vllm_config, kv_cache_groups, available_memory)
 
     if vllm_config.attention_config.hisparse_config is not None:
@@ -663,9 +663,8 @@ def _place_kv_cache_tensors(
     num_blocks: int,
     bytes_per_block: int,
     base_offset: int = 0,
-    pool_id: int = 0,
 ) -> list[KVCacheTensor]:
-    """Place the groups of one block pool starting at byte `base_offset`."""
+    """Place groups sharing `num_blocks` blocks from byte `base_offset`."""
     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
     size = base_offset + bytes_per_block * num_blocks
 
@@ -708,7 +707,6 @@ def _place_kv_cache_tensors(
                     layer_stride=layer_stride,
                     block_stride=block_stride,
                     offset=base_offset + byte_offset,
-                    pool_id=pool_id,
                 )
             )
             # Block-outer layers share each block; layer-outer ones own regions.
@@ -725,8 +723,8 @@ def _draft_kv_pool_num_blocks(vllm_config: VllmConfig, group: KVCacheGroup) -> i
     `max_num_seqs` running and `max_num_inflight_kv_loads` holding blocks for
     an async KV load, so admission never waits on the pool for them.
 
-    Sized from specs alone, so every worker, and the scheduler, agrees on it
-    whether or not it holds the pool's layers.
+    Set once on the global group, so every worker, and the scheduler, agrees
+    on it whether or not it holds the pool's layers.
     """
     scheduler_config = vllm_config.scheduler_config
     max_seqs = scheduler_config.max_num_seqs + (
@@ -741,15 +739,13 @@ def _draft_kv_pool_bytes(
     vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroup]
 ) -> int:
     """Bytes of the drafter's pool on a worker, 0 without its layers."""
-    if not kv_cache_groups or not kv_cache_groups[-1].pool_id:
+    if not kv_cache_groups:
         return 0
     group = kv_cache_groups[-1]
-    if not group.layer_names:
+    if not group.num_blocks or not group.layer_names:
         return 0
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    return _get_kv_cache_bytes_per_block([group], layout) * _draft_kv_pool_num_blocks(
-        vllm_config, group
-    )
+    return _get_kv_cache_bytes_per_block([group], layout) * group.num_blocks
 
 
 def _get_draft_kv_pool_config(
@@ -760,11 +756,12 @@ def _get_draft_kv_pool_config(
     """Lay out the shared pool in `available_memory`, then the drafter's pool,
     the last group, after it in the same backing allocation."""
     *shared_groups, draft_group = kv_cache_groups
-    assert not any(group.pool_id for group in shared_groups)
+    assert not any(group.num_blocks for group in shared_groups)
     config = get_kv_cache_config_from_groups(
         vllm_config, shared_groups, available_memory
     )
-    num_blocks = _draft_kv_pool_num_blocks(vllm_config, draft_group)
+    num_blocks = draft_group.num_blocks
+    assert num_blocks is not None
     tensors = config.kv_cache_tensors
     if draft_group.layer_names:
         layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -782,7 +779,6 @@ def _get_draft_kv_pool_config(
                     num_blocks,
                     bytes_per_block,
                     offset,
-                    draft_group.pool_id,
                 ),
             ]
         ]
@@ -796,12 +792,7 @@ def _get_draft_kv_pool_config(
             shared_blocks,
             shared_blocks * shared_groups[0].block_size,
         )
-    return replace(
-        config,
-        kv_cache_tensors=tensors,
-        kv_cache_groups=kv_cache_groups,
-        pool_num_blocks={draft_group.pool_id: num_blocks},
-    )
+    return replace(config, kv_cache_tensors=tensors, kv_cache_groups=kv_cache_groups)
 
 
 def _is_local_attention(layer_config: KVCacheLayerConfig) -> bool:
@@ -1324,7 +1315,7 @@ def _max_memory_usage_bytes_from_groups(
     kv_cache_groups = [
         group
         for group in kv_cache_groups
-        if not group.host_resident and not group.pool_id
+        if not group.host_resident and not group.num_blocks
     ]
     if not kv_cache_groups:
         return 0
@@ -1719,9 +1710,6 @@ def get_kv_cache_configs(
     return kv_cache_configs
 
 
-DRAFT_KV_POOL_ID = 1
-
-
 def _pop_draft_kv_pool_layers(
     vllm_config: VllmConfig,
     layer_configs: dict[str, KVCacheLayerConfig],
@@ -1827,8 +1815,12 @@ def get_global_kv_cache_groups(
         builder, vllm_config, merged_layer_configs
     )
     if draft_pool_layers:
+        draft_group = KVCacheGroup.from_layers(draft_pool_layers)
         global_kv_cache_groups.append(
-            KVCacheGroup.from_layers(draft_pool_layers, pool_id=DRAFT_KV_POOL_ID)
+            replace(
+                draft_group,
+                num_blocks=_draft_kv_pool_num_blocks(vllm_config, draft_group),
+            )
         )
         merged_layer_configs.update(draft_pool_layers)
     spec_config = vllm_config.speculative_config

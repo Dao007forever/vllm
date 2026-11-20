@@ -130,17 +130,17 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
-        # Pools of the groups whose block IDs index their own tensors, by group.
+        # Pools of the groups with their own blocks, by group.
         self.private_block_pools: dict[int, BlockPool] = {
             i: SharedEventQueueBlockPool(
-                num_gpu_blocks=kv_cache_config.num_blocks_of_group(i),
+                num_gpu_blocks=group.num_blocks,
                 enable_caching=enable_caching,
                 hash_block_size=hash_block_size,
                 enable_kv_cache_events=enable_kv_cache_events,
                 event_owner=self.block_pool,
             )
             for i, group in enumerate(kv_cache_config.kv_cache_groups)
-            if group.pool_id
+            if group.num_blocks
         }
 
         # KV cache group indices that get the EAGLE last-block drop.

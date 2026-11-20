@@ -2358,7 +2358,7 @@ def _draft_kv_pool_layers() -> dict[str, KVCacheLayerConfig]:
 
 @pytest.mark.parametrize("max_loads", [None, 4])
 def test_draft_kv_pool_places_the_drafter_after_the_shared_pool(max_loads):
-    """--draft-kv-pool groups the drafter's layers on their own in pool 1, sized
+    """--draft-kv-pool groups the drafter's layers on their own blocks, sized
     for max_num_seqs requests plus --max-num-inflight-kv-loads async loads at
     their admission cap plus the cache fraction, and laid out after the shared
     pool, which gets the memory left."""
@@ -2370,13 +2370,12 @@ def test_draft_kv_pool_places_the_drafter_after_the_shared_pool(max_loads):
 
     *shared_groups, draft_group = kv_cache_config.kv_cache_groups
     assert draft_group.layer_names == ["draft.0", "draft.1"]
-    assert draft_group.pool_id == 1
     assert draft_group.manager_cls is DFlashSlidingWindowManager
-    assert not any(group.pool_id for group in shared_groups)
+    assert not any(group.num_blocks for group in shared_groups)
 
     cap = draft_group.max_allocated_blocks_per_request(config)
     num_pool_blocks = 1 + math.ceil((8 + (max_loads or 0)) * cap * 1.5)
-    assert kv_cache_config.pool_num_blocks == {1: num_pool_blocks}
+    assert draft_group.num_blocks == num_pool_blocks
 
     shared_bytes_per_block = kv_cache_planning._pool_bytes_per_block(
         config, kv_cache_config.kv_cache_groups
@@ -2388,7 +2387,7 @@ def test_draft_kv_pool_places_the_drafter_after_the_shared_pool(max_loads):
     assert {t.size for t in kv_cache_config.kv_cache_tensors} == {
         shared_bytes + pool_bytes
     }
-    (pool_tensor,) = [t for t in kv_cache_config.kv_cache_tensors if t.pool_id]
+    pool_tensor = kv_cache_config.kv_cache_tensors[-1]
     assert pool_tensor.layers == ["draft.0", "draft.1"]
     assert pool_tensor.offset == shared_bytes
     assert pool_tensor.block_stride == pool_bytes_per_block
@@ -2405,12 +2404,12 @@ def test_draft_kv_pool_sizes_agree_across_pp_stages():
     ]
     first, last = get_kv_cache_configs(config, stages, [2**30, 2**30])
 
-    assert first.pool_num_blocks == last.pool_num_blocks
+    assert first.kv_cache_groups[-1].num_blocks == last.kv_cache_groups[-1].num_blocks
     assert first.num_blocks == last.num_blocks
-    assert not any(t.pool_id for t in first.kv_cache_tensors)
-    assert any(t.pool_id for t in last.kv_cache_tensors)
+    assert not any("draft.0" in t.layers for t in first.kv_cache_tensors)
+    assert any("draft.0" in t.layers for t in last.kv_cache_tensors)
     scheduler_config = generate_scheduler_kv_cache_config([first, last])
-    assert scheduler_config.kv_cache_groups[-1].pool_id == 1
+    assert scheduler_config.kv_cache_groups[-1].num_blocks
 
 
 @pytest.mark.parametrize(

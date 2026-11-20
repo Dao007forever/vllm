@@ -5363,7 +5363,7 @@ def test_dflash_drafter_hit_needs_cached_drafter_kv_only_in_its_window(
 
 
 def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
-    """A group with pool_id 1 draws from its own block pool: running it out
+    """A group with its own blocks draws from its own block pool: running it out
     holds back admission while the shared pool has room, and the reported
     usage is the fullest pool's."""
     block_size = 4
@@ -5390,11 +5390,10 @@ def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
                     head_size=1,
                     dtype=torch.float32,
                 ),
-                pool_id=1,
+                # The null block plus one 40-token prefill's 3-block tail.
+                num_blocks=4,
             ),
         ],
-        # The null block plus one 40-token prefill's 3-block tail.
-        pool_num_blocks={1: 4},
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,

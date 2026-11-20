@@ -630,7 +630,7 @@ def allocate_kv_cache(
         views = create_kv_cache_views(
             buf,
             spec,
-            kv_cache_config.num_blocks_of(tensor),
+            kv_cache_config.num_blocks_of_group(group_id),
             layout,
             tensor,
             kernel_block_size=layer_kernel_block_size(group_id, kernel_block_sizes),
@@ -1027,13 +1027,14 @@ def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
-    pool_id: int = 0,
+    private_group_id: int | None = None,
 ) -> None:
-    """Apply the copies of device pool `pool_id`, whose caches are `kv_caches`."""
+    """Apply the copies whose block IDs index `kv_caches`: the shared pool's,
+    or those of the group with its own blocks."""
     pairs = [
         (copy.src_block_id, copy.dst_block_id)
         for copy in kv_cache_block_copies
-        if copy.pool_id == pool_id
+        if copy.private_group_id == private_group_id
     ]
     if not pairs:
         return
